@@ -18,13 +18,13 @@
   "capabilities": {
     "channel": {
       "platform": "slack",
-      "ingress_modes": ["events_webhook"],
+      "ingress_modes": ["events_webhook", "polling"],
       "outbound_message_types": ["text"],
       "threading_model": "channel_or_thread",
       "attachment_support": true,
       "reply_verification_support": true,
       "account_scoped_config": true,
-      "allow_polling": false,
+      "allow_polling": true,
       "webhook_secret_support": true,
       "allowed_paths": ["/slack/events"],
       "delivery": {
@@ -37,6 +37,7 @@
   "requirements": {
     "optional_secrets": [
       "SLACK_BOT_TOKEN",
+      "SLACK_APP_TOKEN",
       "SLACK_SIGNING_SECRET",
       "SLACK_INCOMING_WEBHOOK_URL"
     ],

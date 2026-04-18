@@ -15,6 +15,8 @@ pub struct ChannelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bot_token_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_token_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_secret_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incoming_webhook_url_env: Option<String>,
@@ -36,6 +38,8 @@ pub struct ChannelConfig {
     pub allowed_sender_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dm_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_timeout_secs: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -60,7 +64,7 @@ pub fn capabilities() -> ChannelCapabilities {
     ChannelCapabilities {
         plugin_id: "slack".to_string(),
         platform: "slack".to_string(),
-        ingress_modes: vec![IngressMode::EventsWebhook],
+        ingress_modes: vec![IngressMode::EventsWebhook, IngressMode::Polling],
         outbound_message_types: vec!["text".to_string()],
         threading_model: ThreadingModel::ChannelOrThread,
         attachment_support: true,

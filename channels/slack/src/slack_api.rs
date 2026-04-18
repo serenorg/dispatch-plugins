@@ -1,13 +1,21 @@
 use anyhow::{Context, Result, anyhow, bail};
 use jiff::Timestamp;
+use serde::Deserialize;
 use serde_json::{Value, json};
-use std::io::Read;
+use std::{io::Read, net::TcpStream, time::Duration};
+use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
 
 const DEFAULT_API_BASE: &str = "https://slack.com/api";
 
 #[derive(Debug)]
 pub struct SlackClient {
     bot_token: String,
+    base_url: String,
+}
+
+#[derive(Debug)]
+pub struct SlackSocketModeClient {
+    app_token: String,
     base_url: String,
 }
 
@@ -33,13 +41,23 @@ pub struct SlackUpload {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlackSocketEnvelope {
+    #[serde(rename = "type")]
+    pub envelope_type: String,
+    #[serde(default)]
+    pub envelope_id: Option<String>,
+    #[serde(default)]
+    pub payload: Option<Value>,
+}
+
 impl SlackClient {
     pub fn from_env(bot_token_env: &str) -> Result<Self> {
         let bot_token = std::env::var(bot_token_env)
             .with_context(|| format!("{bot_token_env} is required for the slack channel"))?;
         Ok(Self {
             bot_token,
-            base_url: DEFAULT_API_BASE.to_string(),
+            base_url: slack_api_base_url(),
         })
     }
 
@@ -216,6 +234,102 @@ impl SlackClient {
     }
 }
 
+impl SlackSocketModeClient {
+    pub fn from_env(app_token_env: &str) -> Result<Self> {
+        let app_token = std::env::var(app_token_env)
+            .with_context(|| format!("{app_token_env} is required for Slack Socket Mode"))?;
+        Ok(Self {
+            app_token,
+            base_url: slack_api_base_url(),
+        })
+    }
+
+    pub fn receive_event(&self, timeout_secs: u16) -> Result<Option<SlackSocketEnvelope>> {
+        let websocket_url = self.open_connection_url()?;
+        let (mut socket, _) = tungstenite::connect(websocket_url.as_str()).with_context(|| {
+            format!("failed to connect Slack socket mode websocket: {websocket_url}")
+        })?;
+        configure_websocket_read_timeout(socket.get_mut(), timeout_secs)?;
+
+        loop {
+            match socket.read() {
+                Ok(Message::Text(text)) => {
+                    if let Some(envelope) =
+                        self.handle_socket_message(&mut socket, text.as_str())?
+                    {
+                        return Ok(Some(envelope));
+                    }
+                }
+                Ok(Message::Binary(bytes)) => {
+                    let text = std::str::from_utf8(bytes.as_ref())
+                        .context("Slack socket mode frame was not valid UTF-8")?;
+                    if let Some(envelope) = self.handle_socket_message(&mut socket, text)? {
+                        return Ok(Some(envelope));
+                    }
+                }
+                Ok(Message::Ping(payload)) => {
+                    socket.send(Message::Pong(payload))?;
+                }
+                Ok(Message::Pong(_)) => {}
+                Ok(Message::Close(_)) => return Ok(None),
+                Ok(Message::Frame(_)) => {}
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error).context("failed to read Slack socket mode frame"),
+            }
+        }
+    }
+
+    pub fn open_connection_url(&self) -> Result<String> {
+        let url = format!("{}/apps.connections.open", self.base_url);
+        let mut response = ureq::post(&url)
+            .header("Authorization", &format!("Bearer {}", self.app_token))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .send("")
+            .map_err(|error| anyhow!("failed to open Slack socket mode connection: {error}"))?;
+        let body = read_json_body(&mut response, "failed to open Slack socket mode connection")?;
+        body.get("url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| anyhow!("Slack apps.connections.open response missing url"))
+    }
+
+    fn handle_socket_message(
+        &self,
+        socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+        text: &str,
+    ) -> Result<Option<SlackSocketEnvelope>> {
+        let envelope: SlackSocketEnvelope =
+            serde_json::from_str(text).context("failed to parse Slack socket mode envelope")?;
+
+        match envelope.envelope_type.as_str() {
+            "hello" => Ok(None),
+            "disconnect" => Ok(None),
+            "events_api" => {
+                if let Some(envelope_id) = envelope.envelope_id.as_deref() {
+                    acknowledge_socket_envelope(socket, envelope_id)?;
+                }
+                Ok(Some(envelope))
+            }
+            _ => {
+                if let Some(envelope_id) = envelope.envelope_id.as_deref() {
+                    acknowledge_socket_envelope(socket, envelope_id)?;
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+
 pub fn send_incoming_webhook(url: &str, content: &str) -> Result<SlackMessage> {
     let mut response = ureq::post(url)
         .header("Content-Type", "application/json")
@@ -270,6 +384,33 @@ fn read_text_body(
     body.read_to_string(&mut text)
         .with_context(|| format!("{context}: failed to read response body"))?;
     Ok(text)
+}
+
+fn acknowledge_socket_envelope(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    envelope_id: &str,
+) -> Result<()> {
+    let ack = json!({ "envelope_id": envelope_id }).to_string();
+    socket
+        .send(Message::Text(ack.into()))
+        .context("failed to acknowledge Slack socket mode envelope")
+}
+
+fn configure_websocket_read_timeout(
+    stream: &mut MaybeTlsStream<TcpStream>,
+    timeout_secs: u16,
+) -> Result<()> {
+    let timeout = Some(Duration::from_secs(u64::from(timeout_secs.max(1)) + 1));
+    match stream {
+        MaybeTlsStream::Plain(stream) => stream
+            .set_read_timeout(timeout)
+            .context("failed to configure Slack socket mode read timeout"),
+        _ => Ok(()),
+    }
+}
+
+fn slack_api_base_url() -> String {
+    std::env::var("SLACK_API_BASE_URL").unwrap_or_else(|_| DEFAULT_API_BASE.to_string())
 }
 
 #[cfg(test)]

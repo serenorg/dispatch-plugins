@@ -21,10 +21,12 @@ use protocol::{
     StatusAcceptance, StatusFrame, StatusKind, capabilities, plugin_error,
 };
 use slack_api::{SlackClient, SlackUpload, send_incoming_webhook};
+use slack_api::{SlackSocketEnvelope, SlackSocketModeClient};
 
 const META_REASON: &str = "reason";
 const META_PLATFORM: &str = "platform";
 const META_BOT_TOKEN_ENV: &str = "bot_token_env";
+const META_APP_TOKEN_ENV: &str = "app_token_env";
 const META_DEFAULT_CHANNEL_ID: &str = "default_channel_id";
 const META_DEFAULT_THREAD_TS: &str = "default_thread_ts";
 const META_INGRESS_MODE: &str = "ingress_mode";
@@ -38,6 +40,7 @@ const META_MODE: &str = "mode";
 const META_HOST_ACTION: &str = "host_action";
 const META_SIGNING_SECRET: &str = "signing_secret";
 const META_BOT_USER_ID: &str = "bot_user_id";
+const META_POLL_TIMEOUT_SECS: &str = "poll_timeout_secs";
 const META_DELIVERY_MODE: &str = "delivery_mode";
 const META_CHANNEL_ID: &str = "channel_id";
 const META_THREAD_TS: &str = "thread_ts";
@@ -58,6 +61,7 @@ const PLATFORM_SLACK: &str = "slack";
 const MODE_INCOMING_WEBHOOK: &str = "incoming_webhook";
 const DELIVERY_MODE_CHAT_POST_MESSAGE: &str = "chat.postMessage";
 const TRANSPORT_EVENTS_WEBHOOK: &str = "events_webhook";
+const TRANSPORT_SOCKET_MODE: &str = "socket_mode";
 const MAX_SIGNATURE_AGE_SECS: i64 = 300;
 
 const ROUTE_CONVERSATION_ID: &str = "conversation_id";
@@ -118,10 +122,7 @@ fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
         PluginRequest::StopIngress { config, state } => Ok(PluginResponse::IngressStopped {
             state: stop_ingress(config, state.clone())?,
         }),
-        PluginRequest::PollIngress { .. } => Ok(plugin_error(
-            "polling_not_supported",
-            "slack uses webhook ingress; poll_ingress is not supported",
-        )),
+        PluginRequest::PollIngress { config, state } => handle_poll_ingress(config, state.as_ref()),
         PluginRequest::Deliver { config, message } => Ok(PluginResponse::Delivered {
             delivery: deliver(config, message)?,
         }),
@@ -146,6 +147,16 @@ fn configure(config: &ChannelConfig) -> Result<ConfiguredChannel> {
         metadata.insert(
             META_BOT_TOKEN_ENV.to_string(),
             bot_token_env(config).to_string(),
+        );
+    }
+    if has_optional_env(app_token_env(config)) {
+        metadata.insert(
+            META_APP_TOKEN_ENV.to_string(),
+            app_token_env(config).to_string(),
+        );
+        metadata.insert(
+            META_POLL_TIMEOUT_SECS.to_string(),
+            poll_timeout_secs(config).to_string(),
         );
     }
     if let Some(default_channel_id) = &config.default_channel_id {
@@ -229,6 +240,19 @@ fn health(config: &ChannelConfig) -> Result<HealthReport> {
         });
     }
 
+    if has_optional_env(app_token_env(config)) {
+        let client = SlackSocketModeClient::from_env(app_token_env(config))?;
+        client.open_connection_url()?;
+        metadata.insert(META_MODE.to_string(), TRANSPORT_SOCKET_MODE.to_string());
+        return Ok(HealthReport {
+            ok: true,
+            status: "configured".to_string(),
+            account_id: None,
+            display_name: Some("slack-socket-mode".to_string()),
+            metadata,
+        });
+    }
+
     if let Some(webhook_url) = resolved_incoming_webhook_url(config) {
         validate_url(&webhook_url, "incoming webhook url")?;
         metadata.insert(META_MODE.to_string(), MODE_INCOMING_WEBHOOK.to_string());
@@ -247,6 +271,10 @@ fn health(config: &ChannelConfig) -> Result<HealthReport> {
 }
 
 fn start_ingress(config: &ChannelConfig) -> Result<IngressState> {
+    if has_optional_env(app_token_env(config)) && resolved_endpoint(config).is_none() {
+        return polling_state(config, "configured", None);
+    }
+
     let endpoint = resolved_endpoint(config)
         .ok_or_else(|| anyhow!("slack ingress requires webhook_public_url"))?;
     validate_url(&endpoint, "slack events endpoint")?;
@@ -282,6 +310,18 @@ fn start_ingress(config: &ChannelConfig) -> Result<IngressState> {
 }
 
 fn stop_ingress(config: &ChannelConfig, state: Option<IngressState>) -> Result<IngressState> {
+    if has_optional_env(app_token_env(config)) && resolved_endpoint(config).is_none() {
+        let mut stopped = match state {
+            Some(state) => state,
+            None => polling_state(config, "running", None)?,
+        };
+        stopped.status = "stopped".to_string();
+        stopped
+            .metadata
+            .insert(META_PLATFORM.to_string(), PLATFORM_SLACK.to_string());
+        return Ok(stopped);
+    }
+
     if let Some(endpoint) = resolved_endpoint(config) {
         validate_url(&endpoint, "slack events endpoint")?;
     }
@@ -487,8 +527,14 @@ fn handle_ingress_event(
                 ));
             };
 
-            let Some(inbound_event) =
-                build_inbound_event(config, state, payload, &envelope, event)?
+            let Some(inbound_event) = build_inbound_event(
+                config,
+                state,
+                payload,
+                &envelope,
+                event,
+                TRANSPORT_EVENTS_WEBHOOK,
+            )?
             else {
                 return Ok(PluginResponse::IngressEventsReceived {
                     events: Vec::new(),
@@ -514,12 +560,95 @@ fn handle_ingress_event(
     }
 }
 
+fn handle_poll_ingress(
+    config: &ChannelConfig,
+    state: Option<&IngressState>,
+) -> Result<PluginResponse> {
+    if !has_optional_env(app_token_env(config)) {
+        return Ok(plugin_error(
+            "polling_not_supported",
+            "slack poll_ingress requires Slack Socket Mode with SLACK_APP_TOKEN",
+        ));
+    }
+
+    let client = SlackSocketModeClient::from_env(app_token_env(config))?;
+    let socket_envelope = client.receive_event(poll_timeout_secs(config))?;
+    let next_state = Some(polling_state(config, "running", state)?);
+
+    let Some(socket_envelope) = socket_envelope else {
+        return Ok(PluginResponse::IngressEventsReceived {
+            events: Vec::new(),
+            callback_reply: None,
+            state: next_state,
+            poll_after_ms: Some(1000),
+        });
+    };
+
+    let Some(inbound_event) = build_socket_mode_event(config, state, &socket_envelope)? else {
+        return Ok(PluginResponse::IngressEventsReceived {
+            events: Vec::new(),
+            callback_reply: None,
+            state: next_state,
+            poll_after_ms: Some(1000),
+        });
+    };
+
+    Ok(PluginResponse::IngressEventsReceived {
+        events: vec![inbound_event],
+        callback_reply: None,
+        state: next_state,
+        poll_after_ms: Some(1000),
+    })
+}
+
+fn build_socket_mode_event(
+    config: &ChannelConfig,
+    ingress_state: Option<&IngressState>,
+    socket_envelope: &SlackSocketEnvelope,
+) -> Result<Option<InboundEventEnvelope>> {
+    let Some(payload) = socket_envelope.payload.as_ref() else {
+        return Ok(None);
+    };
+
+    let envelope: SlackEventEnvelope = serde_json::from_value(payload.clone())
+        .context("invalid Slack Socket Mode event payload")?;
+    let synthetic_payload = IngressPayload {
+        endpoint_id: None,
+        method: "SOCKET".to_string(),
+        path: String::new(),
+        headers: BTreeMap::new(),
+        query: BTreeMap::new(),
+        raw_query: None,
+        body: String::new(),
+        trust_verified: true,
+        received_at: None,
+    };
+
+    match envelope.envelope_type.as_str() {
+        "event_callback" => {
+            let Some(event) = envelope.event.as_ref() else {
+                return Ok(None);
+            };
+            build_inbound_event(
+                config,
+                ingress_state,
+                &synthetic_payload,
+                &envelope,
+                event,
+                TRANSPORT_SOCKET_MODE,
+            )
+        }
+        _ => Ok(None),
+    }
+}
+
 fn build_inbound_event(
     config: &ChannelConfig,
     ingress_state: Option<&IngressState>,
     payload: &IngressPayload,
     envelope: &SlackEventEnvelope,
     event: &SlackEventPayload,
+    transport: &str,
 ) -> Result<Option<InboundEventEnvelope>> {
     if !supports_inbound_event(event) {
         return Ok(None);
@@ -563,10 +692,7 @@ fn build_inbound_event(
     let attachments = extract_attachments(event, &mut message_metadata);
 
     let mut event_metadata = BTreeMap::new();
-    event_metadata.insert(
-        META_TRANSPORT.to_string(),
-        TRANSPORT_EVENTS_WEBHOOK.to_string(),
-    );
+    event_metadata.insert(META_TRANSPORT.to_string(), transport.to_string());
     event_metadata.insert(META_EVENT_TYPE.to_string(), event.event_type.clone());
     if let Some(subtype) = &event.subtype {
         event_metadata.insert(META_EVENT_SUBTYPE.to_string(), subtype.clone());
@@ -987,6 +1113,10 @@ fn bot_token_env(config: &ChannelConfig) -> &str {
     config.bot_token_env.as_deref().unwrap_or("SLACK_BOT_TOKEN")
 }
 
+fn app_token_env(config: &ChannelConfig) -> &str {
+    config.app_token_env.as_deref().unwrap_or("SLACK_APP_TOKEN")
+}
+
 fn signing_secret_env(config: &ChannelConfig) -> &str {
     config
         .signing_secret_env
@@ -1003,6 +1133,57 @@ fn incoming_webhook_url_env(config: &ChannelConfig) -> &str {
 
 fn has_optional_env(name: &str) -> bool {
     std::env::var(name).is_ok()
+}
+
+fn poll_timeout_secs(config: &ChannelConfig) -> u16 {
+    config.poll_timeout_secs.unwrap_or(30).max(1)
+}
+
+fn polling_state(
+    config: &ChannelConfig,
+    status: &str,
+    prior_state: Option<&IngressState>,
+) -> Result<IngressState> {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(META_PLATFORM.to_string(), PLATFORM_SLACK.to_string());
+    metadata.insert(META_MODE.to_string(), TRANSPORT_SOCKET_MODE.to_string());
+    metadata.insert(
+        META_POLL_TIMEOUT_SECS.to_string(),
+        poll_timeout_secs(config).to_string(),
+    );
+    if has_optional_env(app_token_env(config)) {
+        metadata.insert(
+            META_APP_TOKEN_ENV.to_string(),
+            app_token_env(config).to_string(),
+        );
+    }
+    if has_optional_env(bot_token_env(config)) {
+        if let Some(existing_bot_user_id) =
+            prior_state.and_then(|state| state.metadata.get(META_BOT_USER_ID))
+        {
+            metadata.insert(META_BOT_USER_ID.to_string(), existing_bot_user_id.clone());
+        }
+        if let Some(existing_team_id) =
+            prior_state.and_then(|state| state.metadata.get(META_TEAM_ID))
+        {
+            metadata.insert(META_TEAM_ID.to_string(), existing_team_id.clone());
+        }
+        if !metadata.contains_key(META_BOT_USER_ID) {
+            let client = SlackClient::from_env(bot_token_env(config))?;
+            let identity = client.identity()?;
+            if let Some(team_id) = identity.team_id {
+                metadata.insert(META_TEAM_ID.to_string(), team_id);
+            }
+            metadata.insert(META_BOT_USER_ID.to_string(), identity.user_id);
+        }
+    }
+
+    Ok(IngressState {
+        mode: IngressMode::Polling,
+        status: status.to_string(),
+        endpoint: None,
+        metadata,
+    })
 }
 
 fn ingress_mode_name(mode: IngressMode) -> String {
