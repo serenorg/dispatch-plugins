@@ -47,7 +47,7 @@ Optional config fields:
 - `account` - sending account or linked Signal identity when the backend
   requires it
 - `default_recipient` - fallback recipient for `deliver`, `push`, and `status`
-- `poll_timeout_secs` - polling receive timeout in seconds, clamped to 1-30
+- `poll_timeout_secs` - polling receive timeout in seconds, minimum 1
 
 `config.account` is also required for polling ingress, because the Signal
 backend `receive` call is scoped to a specific account.
@@ -64,17 +64,18 @@ backend.
 Typical setup:
 
 1. Provision or link a Signal account with `signal-cli`.
-2. Start `signal-cli-rest-api` in `native` or `normal` mode so the published
-  `GET /v1/receive/{number}` polling endpoint is available.
+2. Start `signal-cli-rest-api` in one of its supported modes:
+  - `native` or `normal` for HTTP polling via `GET /v1/receive/{number}`
+  - `json-rpc` for websocket receive on `/v1/receive/{number}`
 3. Point the plugin at that service with `base_url` or `SIGNAL_RPC_URL`.
 4. Set `account` in the plugin config when the backend requires an explicit
   account selector for polling and sending.
 
 Notes:
 
-- `poll_ingress` requires `MODE=native` or `MODE=normal`. In upstream
-  `json-rpc` mode, `receive` is exposed as a websocket endpoint instead of a
-  polling GET request.
+- `poll_ingress` adapts to the upstream backend mode automatically:
+  - `native` and `normal` use the documented HTTP receive endpoint
+  - `json-rpc` uses the documented websocket receive endpoint
 - `deliver` and `status` target the upstream REST API routes documented by
   `signal-cli-rest-api`, not the older `/api/v1/rpc` wrapper contract.
 

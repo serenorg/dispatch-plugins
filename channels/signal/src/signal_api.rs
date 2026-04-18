@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use std::time::Duration;
+use tungstenite::Message;
+use tungstenite::stream::MaybeTlsStream;
 
 #[derive(Debug, Clone)]
 pub struct SignalClient {
@@ -29,6 +32,12 @@ pub struct SignalAttachmentPayload {
 pub struct SignalHealth {
     pub version: Option<String>,
     pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalReceiveTransport {
+    Polling,
+    Websocket,
 }
 
 impl SignalClient {
@@ -130,11 +139,14 @@ impl SignalClient {
         Ok(())
     }
 
-    pub fn receive_messages(&self, timeout_secs: u16) -> Result<Vec<Value>> {
+    pub fn receive_messages(
+        &self,
+        timeout_secs: u16,
+    ) -> Result<(Vec<Value>, SignalReceiveTransport)> {
         if matches!(self.api_mode()?.as_deref(), Some("json-rpc")) {
-            bail!(
-                "signal polling ingress requires signal-cli-rest-api MODE=native or MODE=normal; json-rpc receive uses websocket"
-            );
+            return self
+                .receive_messages_websocket(timeout_secs)
+                .map(|events| (events, SignalReceiveTransport::Websocket));
         }
 
         let account = self.resolved_account()?;
@@ -150,10 +162,59 @@ impl SignalClient {
             .read_to_string()
             .context("read signal receive body")?;
         if body.trim().is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), SignalReceiveTransport::Polling));
         }
         let result: Value = serde_json::from_str(&body).context("parse signal receive response")?;
-        Ok(normalize_receive_result(result))
+        Ok((
+            normalize_receive_result(result),
+            SignalReceiveTransport::Polling,
+        ))
+    }
+
+    fn receive_messages_websocket(&self, timeout_secs: u16) -> Result<Vec<Value>> {
+        let account = self.resolved_account()?;
+        let url = websocket_receive_url(&self.base_url, &account, timeout_secs)?;
+        let (mut socket, _) = tungstenite::connect(url.as_str())
+            .with_context(|| format!("signal websocket receive connect failed for {url}"))?;
+        configure_websocket_read_timeout(socket.get_mut(), timeout_secs)
+            .context("configure signal websocket read timeout")?;
+        let mut events = Vec::new();
+
+        loop {
+            match socket.read() {
+                Ok(Message::Text(frame)) => {
+                    let value: Value = serde_json::from_str(frame.as_str())
+                        .context("parse signal websocket receive frame")?;
+                    events.extend(normalize_receive_result(value));
+                }
+                Ok(Message::Binary(frame)) => {
+                    let value: Value = serde_json::from_slice(&frame)
+                        .context("parse binary signal websocket receive frame")?;
+                    events.extend(normalize_receive_result(value));
+                }
+                Ok(Message::Ping(payload)) => {
+                    socket
+                        .send(Message::Pong(payload))
+                        .context("reply to signal websocket ping")?;
+                }
+                Ok(Message::Pong(_)) => {}
+                Ok(Message::Close(_)) => break,
+                Ok(Message::Frame(_)) => {}
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break;
+                }
+                Err(tungstenite::Error::ConnectionClosed)
+                | Err(tungstenite::Error::AlreadyClosed) => break,
+                Err(error) => return Err(error).context("signal websocket receive failed"),
+            }
+        }
+
+        Ok(events)
     }
 
     fn resolved_account(&self) -> Result<String> {
@@ -221,6 +282,31 @@ fn attachment_data(attachment: &SignalAttachmentPayload) -> String {
         "data:application/octet-stream;filename={file_name};base64,{}",
         attachment.data_base64
     )
+}
+
+fn websocket_receive_url(base_url: &str, account: &str, timeout_secs: u16) -> Result<String> {
+    let scheme = if let Some(rest) = base_url.strip_prefix("http://") {
+        ("ws://", rest)
+    } else if let Some(rest) = base_url.strip_prefix("https://") {
+        ("wss://", rest)
+    } else {
+        bail!("signal base url `{base_url}` must start with http:// or https://");
+    };
+    Ok(format!(
+        "{}{}/v1/receive/{}?timeout={}",
+        scheme.0, scheme.1, account, timeout_secs
+    ))
+}
+
+fn configure_websocket_read_timeout(
+    stream: &mut MaybeTlsStream<std::net::TcpStream>,
+    timeout_secs: u16,
+) -> std::io::Result<()> {
+    let timeout = Some(Duration::from_secs(u64::from(timeout_secs).max(1) + 1));
+    match stream {
+        MaybeTlsStream::Plain(stream) => stream.set_read_timeout(timeout),
+        _ => Ok(()),
+    }
 }
 
 pub fn normalize_base_url(value: &str) -> Result<String> {
@@ -349,6 +435,18 @@ mod tests {
         assert_eq!(
             attachment_data(&attachment),
             "data:application/octet-stream;filename=hello.txt;base64,aGVsbG8="
+        );
+    }
+
+    #[test]
+    fn websocket_receive_url_rewrites_http_and_https() {
+        assert_eq!(
+            websocket_receive_url("http://127.0.0.1:8080", "+15551234567", 5).unwrap(),
+            "ws://127.0.0.1:8080/v1/receive/+15551234567?timeout=5"
+        );
+        assert_eq!(
+            websocket_receive_url("https://signal.example", "+15551234567", 2).unwrap(),
+            "wss://signal.example/v1/receive/+15551234567?timeout=2"
         );
     }
 }

@@ -16,7 +16,7 @@ use protocol::{
     PluginRequestEnvelope, PluginResponse, StatusAcceptance, StatusFrame, StatusKind, capabilities,
     plugin_error,
 };
-use signal_api::{SignalAttachmentPayload, SignalClient, parse_target};
+use signal_api::{SignalAttachmentPayload, SignalClient, SignalReceiveTransport, parse_target};
 
 const META_PLATFORM: &str = "platform";
 const META_BASE_URL: &str = "base_url";
@@ -35,6 +35,7 @@ const META_SIGNAL_SOURCE_UUID: &str = "signal_source_uuid";
 const META_SIGNAL_TIMESTAMP_MS: &str = "signal_timestamp_ms";
 const META_SIGNAL_CONTENT_ORIGIN: &str = "signal_content_origin";
 const META_TRANSPORT: &str = "transport";
+const TRANSPORT_WEBSOCKET: &str = "websocket";
 
 const ROUTE_CONVERSATION_ID: &str = "conversation_id";
 const PLATFORM_SIGNAL: &str = "signal";
@@ -188,10 +189,10 @@ fn stop_ingress(config: &ChannelConfig, state: Option<IngressState>) -> Result<I
 fn poll_ingress(config: &ChannelConfig) -> Result<PluginResponse> {
     let account = inbound_account(config)?;
     let client = signal_client(config)?;
-    let raw_messages = client.receive_messages(poll_timeout_secs(config))?;
+    let (raw_messages, receive_transport) = client.receive_messages(poll_timeout_secs(config))?;
     let mut events = Vec::new();
     for raw_message in &raw_messages {
-        if let Some(event) = build_inbound_event(raw_message, &account)? {
+        if let Some(event) = build_inbound_event(raw_message, &account, receive_transport)? {
             events.push(event);
         }
     }
@@ -295,7 +296,11 @@ fn send_status(config: &ChannelConfig, update: &StatusFrame) -> Result<StatusAcc
     })
 }
 
-fn build_inbound_event(raw_message: &Value, account: &str) -> Result<Option<InboundEventEnvelope>> {
+fn build_inbound_event(
+    raw_message: &Value,
+    account: &str,
+    receive_transport: SignalReceiveTransport,
+) -> Result<Option<InboundEventEnvelope>> {
     let envelope = raw_message.get("envelope").unwrap_or(raw_message);
     if envelope.get("receiptMessage").is_some()
         || envelope.get("typingMessage").is_some()
@@ -352,7 +357,10 @@ fn build_inbound_event(raw_message: &Value, account: &str) -> Result<Option<Inbo
 
     let mut event_metadata = BTreeMap::new();
     event_metadata.insert(META_PLATFORM.to_string(), PLATFORM_SIGNAL.to_string());
-    event_metadata.insert(META_TRANSPORT.to_string(), TRANSPORT_POLLING.to_string());
+    event_metadata.insert(
+        META_TRANSPORT.to_string(),
+        signal_transport_name(receive_transport).to_string(),
+    );
     event_metadata.insert(
         META_SIGNAL_TIMESTAMP_MS.to_string(),
         timestamp_ms.to_string(),
@@ -395,6 +403,13 @@ fn build_inbound_event(raw_message: &Value, account: &str) -> Result<Option<Inbo
     }))
 }
 
+fn signal_transport_name(transport: SignalReceiveTransport) -> &'static str {
+    match transport {
+        SignalReceiveTransport::Polling => TRANSPORT_POLLING,
+        SignalReceiveTransport::Websocket => TRANSPORT_WEBSOCKET,
+    }
+}
+
 fn signal_client(config: &ChannelConfig) -> Result<SignalClient> {
     Ok(SignalClient::new(
         client_base_url(config)?,
@@ -427,7 +442,7 @@ fn inbound_account(config: &ChannelConfig) -> Result<String> {
 }
 
 fn poll_timeout_secs(config: &ChannelConfig) -> u16 {
-    config.poll_timeout_secs.unwrap_or(5).clamp(1, 30)
+    config.poll_timeout_secs.unwrap_or(5).max(1)
 }
 
 fn polling_state(config: &ChannelConfig, status: &str) -> Result<IngressState> {
@@ -606,7 +621,7 @@ mod tests {
             }
         });
 
-        let event = build_inbound_event(&raw, "+15557654321")
+        let event = build_inbound_event(&raw, "+15557654321", SignalReceiveTransport::Polling)
             .expect("parse event")
             .expect("event present");
 
@@ -617,6 +632,10 @@ mod tests {
         assert_eq!(event.actor.display_name.as_deref(), Some("Alice"));
         assert_eq!(event.message.content, "hello from signal");
         assert_eq!(event.account_id.as_deref(), Some("+15557654321"));
+        assert_eq!(
+            event.metadata.get(META_TRANSPORT).map(String::as_str),
+            Some("polling")
+        );
     }
 
     #[test]
@@ -635,13 +654,36 @@ mod tests {
             }
         });
 
-        let event = build_inbound_event(&raw, "+15557654321")
+        let event = build_inbound_event(&raw, "+15557654321", SignalReceiveTransport::Polling)
             .expect("parse event")
             .expect("event present");
 
         assert_eq!(event.conversation.id, "group-1");
         assert_eq!(event.conversation.kind, "group");
         assert_eq!(event.actor.id, "+15551234567");
+    }
+
+    #[test]
+    fn build_inbound_event_marks_websocket_transport() {
+        let raw = json!({
+            "envelope": {
+                "sourceNumber": "+15551234567",
+                "timestamp": 1712880000123_i64,
+                "dataMessage": {
+                    "timestamp": 1712880000123_i64,
+                    "message": "hello websocket"
+                }
+            }
+        });
+
+        let event = build_inbound_event(&raw, "+15557654321", SignalReceiveTransport::Websocket)
+            .expect("parse event")
+            .expect("event present");
+
+        assert_eq!(
+            event.metadata.get(META_TRANSPORT).map(String::as_str),
+            Some("websocket")
+        );
     }
 
     #[test]
@@ -656,7 +698,7 @@ mod tests {
         });
 
         assert!(
-            build_inbound_event(&raw, "+15557654321")
+            build_inbound_event(&raw, "+15557654321", SignalReceiveTransport::Polling)
                 .expect("parse receipt")
                 .is_none()
         );
@@ -666,5 +708,24 @@ mod tests {
     fn start_ingress_requires_account() {
         let error = start_ingress(&ChannelConfig::default()).expect_err("missing account");
         assert!(error.to_string().contains("config.account"));
+    }
+
+    #[test]
+    fn polling_state_reports_configured_timeout_secs() {
+        let config = ChannelConfig {
+            account: Some("+15557654321".to_string()),
+            poll_timeout_secs: Some(60),
+            ..ChannelConfig::default()
+        };
+
+        let state = polling_state(&config, "running").expect("state");
+
+        assert_eq!(
+            state
+                .metadata
+                .get(META_POLL_TIMEOUT_SECS)
+                .map(String::as_str),
+            Some("60")
+        );
     }
 }

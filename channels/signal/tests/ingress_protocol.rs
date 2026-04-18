@@ -4,6 +4,10 @@ use std::process::{Command, Stdio};
 use std::thread;
 
 use serde_json::{Value, json};
+use tungstenite::{
+    Message, accept_hdr,
+    handshake::server::{Request, Response},
+};
 
 fn run_request(request: Value) -> Value {
     let binary = std::env::var("CARGO_BIN_EXE_channel-signal").expect("channel-signal binary path");
@@ -81,6 +85,56 @@ fn serve_signal_receive_once(response_body: String) -> String {
     format!("http://{}", addr)
 }
 
+fn serve_signal_websocket_receive_once(response_body: String) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind signal websocket test listener");
+    let addr = listener.local_addr().expect("listener addr");
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept about request");
+        let mut buffer = Vec::new();
+        let header_end;
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).expect("read about request");
+            assert!(
+                read > 0,
+                "signal websocket test server saw EOF before headers"
+            );
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                header_end = position + 4;
+                break;
+            }
+        }
+        let headers = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+        assert!(headers.contains("/v1/about"));
+        let about = json!({"mode": "json-rpc", "version": "0.98"}).to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            about.len(),
+            about
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write about response");
+
+        let (stream, _) = listener.accept().expect("accept websocket request");
+        let mut websocket = accept_hdr(stream, |request: &Request, response: Response| {
+            assert!(request.uri().path().contains("/v1/receive/"));
+            let uri = request.uri().to_string();
+            assert!(uri.contains("+15550001111") || uri.contains("%2B15550001111"));
+            Ok(response)
+        })
+        .expect("accept websocket");
+        websocket
+            .send(Message::Text(response_body.into()))
+            .expect("send websocket frame");
+        websocket.close(None).expect("close websocket");
+    });
+
+    format!("http://{}", addr)
+}
+
 #[test]
 fn poll_ingress_round_trips_signal_receive_messages() {
     let response_body = json!([{
@@ -137,4 +191,43 @@ fn poll_ingress_round_trips_signal_receive_messages() {
         "image/jpeg"
     );
     assert_eq!(event["metadata"]["transport"], "polling");
+}
+
+#[test]
+fn poll_ingress_round_trips_signal_websocket_messages() {
+    let response_body = json!([{
+        "envelope": {
+            "source": "+15553334444",
+            "sourceNumber": "+15553334444",
+            "sourceName": "Bob",
+            "sourceUuid": "7f6e5d4c",
+            "sourceDevice": 1,
+            "timestamp": 1712860000999_i64,
+            "dataMessage": {
+                "message": "hello from websocket"
+            }
+        }
+    }])
+    .to_string();
+    let base_url = serve_signal_websocket_receive_once(response_body);
+
+    let response = run_request(json!({
+        "protocol_version": 1,
+        "request": {
+            "kind": "poll_ingress",
+            "config": {
+                "base_url": base_url,
+                "account": "+15550001111"
+            }
+        }
+    }));
+
+    assert_eq!(response["kind"], "ingress_events_received");
+    let events = response["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event["platform"], "signal");
+    assert_eq!(event["actor"]["id"], "+15553334444");
+    assert_eq!(event["message"]["content"], "hello from websocket");
+    assert_eq!(event["metadata"]["transport"], "websocket");
 }
