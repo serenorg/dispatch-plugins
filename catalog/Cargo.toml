@@ -1,0 +1,19 @@
+[package]
+name = "dispatch-extension-catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local catalog helper for Dispatch extension repositories."
+repository.workspace = true
+keywords = ["dispatch", "extensions", "catalog", "plugins", "agents"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "dispatch-extension-catalog"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+channel-schema = { path = "../channels/schema" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

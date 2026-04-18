@@ -1,0 +1,24 @@
+[package]
+name = "channel-webhook"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dispatch channel plugin for generic webhooks."
+repository.workspace = true
+keywords = ["dispatch", "channel", "webhook", "agents"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "channel-webhook"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", rev = "f3354efba62f3af26fb0583482fd6f99f069c9a8", package = "dispatch-channel-protocol" }
+jiff = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["json"] }
+
+[dev-dependencies]
+channel-schema = { path = "../schema" }

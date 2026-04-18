@@ -1,0 +1,19 @@
+[package]
+name = "channel-schema"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared manifest and catalog schema for Dispatch channel plugins."
+repository.workspace = true
+keywords = ["dispatch", "channel", "schema", "catalog"]
+categories = ["api-bindings"]
+
+[lib]
+name = "channel_schema"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

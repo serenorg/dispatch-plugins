@@ -1,0 +1,120 @@
+# channel-twilio-sms
+
+A [Dispatch](https://github.com/serenorg/dispatch) channel plugin
+for Twilio SMS.
+
+## Scope
+
+Implemented:
+
+- `capabilities`
+- `configure`
+- `health`
+- `start_ingress`
+- `stop_ingress`
+- `ingress_event`
+- `deliver`
+- `push`
+
+Behavior:
+
+- outbound delivery uses the Twilio Messages API
+- outbound media uses Twilio MMS `MediaUrl` fields when attachment URLs are
+  supplied
+- health checks validate account credentials against the Twilio Accounts API
+- ingress verifies Twilio webhook signatures and parses inbound SMS webhooks
+- inbound status callbacks are acknowledged but not turned into Dispatch events
+
+Not implemented:
+
+- attachment upload from inline data or staged storage keys
+- status-frame delivery
+- delivery-status callback processing beyond acknowledgement
+- per-number provisioning or Twilio control-plane management
+
+## Build
+
+```bash
+cargo build --release
+```
+
+## Configuration
+
+Required env vars:
+
+- `TWILIO_ACCOUNT_SID`
+- `TWILIO_AUTH_TOKEN`
+
+Optional env vars:
+
+- `TWILIO_WEBHOOK_AUTH_TOKEN` - not sent by Twilio itself, but useful if your
+  host wants to require an additional shared token at the ingress edge
+
+Useful config fields:
+
+- `from_number` - source number for outbound SMS
+- `messaging_service_sid` - optional Twilio Messaging Service SID instead of a
+  direct source number
+- `webhook_public_url` - public base URL used for ingress declaration
+- `webhook_path` - ingress route path, default `/twilio/sms`
+
+## Protocol
+
+Requests are sent as JSONL on stdin:
+
+```json
+{"protocol_version":1,"request":{"kind":"capabilities"}}
+```
+
+Delivery example:
+
+```json
+{
+  "protocol_version": 1,
+  "request": {
+    "kind": "deliver",
+    "config": {
+      "from_number": "+15551234567"
+    },
+    "message": {
+      "to_number": "+15557654321",
+      "content": "Dispatch says hello from SMS."
+    }
+  }
+}
+```
+
+Push example:
+
+```json
+{
+  "protocol_version": 1,
+  "request": {
+    "kind": "push",
+    "config": {
+      "from_number": "+15551234567"
+    },
+    "message": {
+      "to_number": "+15557654321",
+      "content": "Dispatch scheduled update from SMS."
+    }
+  }
+}
+```
+
+## Notes on ingress
+
+Twilio does not have a webhook registration API shaped like Telegram's
+`setWebhook`. This plugin therefore treats `start_ingress` as a
+configuration handshake:
+
+1. validate Twilio credentials
+2. validate the declared public route
+3. report the endpoint and Twilio signature-verification requirement to the
+    host
+
+That keeps the plugin honest about what it can support.
+
+## License
+
+MIT

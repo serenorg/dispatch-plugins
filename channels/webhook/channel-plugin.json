@@ -1,0 +1,40 @@
+{
+  "schema": "https://serenorg.github.io/dispatch/schemas/extension.v1.json",
+  "kind": "channel",
+  "name": "channel-webhook",
+  "version": "0.1.0",
+  "protocol": "jsonl",
+  "protocol_version": 1,
+  "description": "Generic webhook channel plugin for Dispatch.",
+  "entrypoint": {
+    "command": "../../target/release/channel-webhook",
+    "args": []
+  },
+  "auth": {
+    "mode": "manual",
+    "provider": "HTTP Webhook"
+  },
+  "capabilities": {
+    "channel": {
+      "platform": "webhook",
+      "ingress_modes": ["webhook"],
+      "outbound_message_types": ["json", "text"],
+      "threading_model": "caller_defined",
+      "attachment_support": true,
+      "reply_verification_support": true,
+      "account_scoped_config": true,
+      "allow_polling": false,
+      "webhook_secret_support": true,
+      "allowed_paths": ["/webhook/inbound"],
+      "delivery": {
+        "push": true,
+        "status_frames": true,
+        "attachment_sources": ["data_base64", "url", "storage_key"]
+      }
+    }
+  },
+  "requirements": {
+    "optional_secrets": ["WEBHOOK_INGRESS_SECRET", "WEBHOOK_OUTBOUND_BEARER_TOKEN"],
+    "network_domains": ["*"]
+  }
+}

@@ -1,0 +1,116 @@
+# channel-slack
+
+A [Dispatch](https://github.com/serenorg/dispatch) channel plugin
+for Slack.
+
+## Scope
+
+Implemented:
+
+- `capabilities`
+- `configure`
+- `health`
+- `start_ingress`
+- `stop_ingress`
+- `ingress_event`
+- `deliver`
+- `push`
+- `status`
+
+Behavior:
+
+- outbound delivery can use `chat.postMessage` with a bot token
+- outbound delivery can also fall back to a Slack incoming webhook URL
+- outbound attachments support one inline `data_base64` upload per message when
+  using bot-token delivery
+- health checks validate the bot token with `auth.test` when configured
+- ingress verifies Slack request signatures and parses Events API payloads
+- challenge and acknowledgement replies are returned through `callback_reply`
+- status frames render visible status messages into Slack conversations
+
+Not implemented:
+
+- slash command registration and lifecycle
+- block kit generation
+- URL- or storage-key-backed attachment delivery
+- message edits
+
+## Build
+
+```bash
+cargo build --release
+```
+
+## Configuration
+
+Optional env vars:
+
+- `SLACK_BOT_TOKEN` - used for `auth.test` and `chat.postMessage`
+- `SLACK_SIGNING_SECRET` - used by the host to verify incoming Slack event
+  signatures
+- `SLACK_INCOMING_WEBHOOK_URL` - used for low-friction outbound delivery
+
+Useful config fields:
+
+- `default_channel_id` - default target channel for bot-token delivery
+- `default_thread_ts` - optional default thread timestamp
+- `webhook_public_url` - public base URL used for ingress declaration
+- `webhook_path` - ingress route path, default `/slack/events`
+
+## Protocol
+
+Requests are sent as JSONL on stdin:
+
+```json
+{"protocol_version":1,"request":{"kind":"capabilities"}}
+```
+
+Delivery example using bot-token mode:
+
+```json
+{
+  "protocol_version": 1,
+  "request": {
+    "kind": "deliver",
+    "config": {
+      "default_channel_id": "C1234567890"
+    },
+    "message": {
+      "content": "Dispatch says hello from Slack."
+    }
+  }
+}
+```
+
+Push example:
+
+```json
+{
+  "protocol_version": 1,
+  "request": {
+    "kind": "push",
+    "config": {
+      "default_channel_id": "C1234567890"
+    },
+    "message": {
+      "content": "Dispatch scheduled update for Slack."
+    }
+  }
+}
+```
+
+## Notes on ingress
+
+Slack does not provide a simple webhook registration API equivalent to
+Telegram's `setWebhook`. This plugin therefore treats `start_ingress` as a
+configuration handshake for an Events API deployment:
+
+1. validate available auth material
+2. validate the declared public route
+3. report the endpoint and signing-secret requirement to the host
+
+That keeps the plugin honest about what it can support.
+
+## License
+
+MIT

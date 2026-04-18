@@ -1,0 +1,42 @@
+{
+  "schema": "https://serenorg.github.io/dispatch/schemas/extension.v1.json",
+  "kind": "channel",
+  "name": "channel-discord",
+  "version": "0.1.0",
+  "protocol": "jsonl",
+  "protocol_version": 1,
+  "description": "Discord channel plugin for Dispatch.",
+  "entrypoint": {
+    "command": "../../target/release/channel-discord",
+    "args": []
+  },
+  "auth": {
+    "mode": "manual",
+    "provider": "Discord",
+    "setup_url": "https://discord.com/developers/applications"
+  },
+  "capabilities": {
+    "channel": {
+      "platform": "discord",
+      "ingress_modes": ["interaction_webhook"],
+      "outbound_message_types": ["text"],
+      "threading_model": "channel_or_thread",
+      "attachment_support": true,
+      "reply_verification_support": true,
+      "account_scoped_config": true,
+      "allow_polling": false,
+      "webhook_secret_support": true,
+      "allowed_paths": ["/discord/interactions"],
+      "delivery": {
+        "push": true,
+        "status_frames": true,
+        "attachment_sources": ["data_base64"]
+      }
+    }
+  },
+  "requirements": {
+    "secrets": ["DISCORD_BOT_TOKEN"],
+    "optional_secrets": ["DISCORD_INTERACTION_PUBLIC_KEY"],
+    "network_domains": ["discord.com"]
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "schema": "https://serenorg.github.io/dispatch/schemas/extension.v1.json",
+  "kind": "channel",
+  "name": "channel-twilio-sms",
+  "version": "0.1.0",
+  "protocol": "jsonl",
+  "protocol_version": 1,
+  "description": "Twilio SMS channel plugin for Dispatch.",
+  "entrypoint": {
+    "command": "../../target/release/channel-twilio-sms",
+    "args": []
+  },
+  "auth": {
+    "mode": "manual",
+    "provider": "Twilio",
+    "setup_url": "https://console.twilio.com/"
+  },
+  "capabilities": {
+    "channel": {
+      "platform": "twilio_sms",
+      "ingress_modes": ["webhook"],
+      "outbound_message_types": ["text"],
+      "threading_model": "phone_number",
+      "attachment_support": true,
+      "reply_verification_support": true,
+      "account_scoped_config": true,
+      "allow_polling": false,
+      "webhook_secret_support": true,
+      "allowed_paths": ["/twilio/sms"],
+      "delivery": {
+        "push": true,
+        "status_frames": false,
+        "attachment_sources": ["url"]
+      }
+    }
+  },
+  "requirements": {
+    "secrets": ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"],
+    "optional_secrets": ["TWILIO_WEBHOOK_AUTH_TOKEN"],
+    "network_domains": ["api.twilio.com"]
+  }
+}

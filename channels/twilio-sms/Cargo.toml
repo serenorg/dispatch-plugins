@@ -1,0 +1,29 @@
+[package]
+name = "channel-twilio-sms"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dispatch channel plugin for Twilio SMS."
+repository.workspace = true
+keywords = ["dispatch", "channel", "twilio", "sms", "agents"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "channel-twilio-sms"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", rev = "f3354efba62f3af26fb0583482fd6f99f069c9a8", package = "dispatch-channel-protocol" }
+hmac = "0.12"
+jiff = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+ureq = { version = "3", features = ["json"] }
+url = "2"
+urlencoding = "2"
+
+[dev-dependencies]
+channel-schema = { path = "../schema" }

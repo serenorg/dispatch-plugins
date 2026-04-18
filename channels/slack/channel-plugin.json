@@ -1,0 +1,46 @@
+{
+  "schema": "https://serenorg.github.io/dispatch/schemas/extension.v1.json",
+  "kind": "channel",
+  "name": "channel-slack",
+  "version": "0.1.0",
+  "protocol": "jsonl",
+  "protocol_version": 1,
+  "description": "Slack channel plugin for Dispatch.",
+  "entrypoint": {
+    "command": "../../target/release/channel-slack",
+    "args": []
+  },
+  "auth": {
+    "mode": "manual",
+    "provider": "Slack",
+    "setup_url": "https://api.slack.com/apps"
+  },
+  "capabilities": {
+    "channel": {
+      "platform": "slack",
+      "ingress_modes": ["events_webhook"],
+      "outbound_message_types": ["text"],
+      "threading_model": "channel_or_thread",
+      "attachment_support": true,
+      "reply_verification_support": true,
+      "account_scoped_config": true,
+      "allow_polling": false,
+      "webhook_secret_support": true,
+      "allowed_paths": ["/slack/events"],
+      "delivery": {
+        "push": true,
+        "status_frames": true,
+        "attachment_sources": ["data_base64"]
+      }
+    }
+  },
+  "requirements": {
+    "optional_secrets": [
+      "SLACK_BOT_TOKEN",
+      "SLACK_SIGNING_SECRET",
+      "SLACK_INCOMING_WEBHOOK_URL"
+    ],
+    "network_domains": ["slack.com", "hooks.slack.com"],
+    "platforms": ["slack-events-api", "slack-web-api", "slack-incoming-webhook"]
+  }
+}

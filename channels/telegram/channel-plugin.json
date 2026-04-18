@@ -1,0 +1,80 @@
+{
+  "schema": "https://serenorg.github.io/dispatch/schemas/extension.v1.json",
+  "kind": "channel",
+  "name": "channel-telegram",
+  "version": "0.1.0",
+  "protocol": "jsonl",
+  "protocol_version": 1,
+  "description": "Telegram channel plugin for Dispatch.",
+  "entrypoint": {
+    "command": "../../target/release/channel-telegram",
+    "args": []
+  },
+  "bootstrap": {
+    "credentials": [
+      {
+        "name": "TELEGRAM_BOT_TOKEN",
+        "prompt": "Enter the Telegram bot token from BotFather."
+      },
+      {
+        "name": "TELEGRAM_WEBHOOK_SECRET",
+        "prompt": "Optional webhook secret. Leave blank to generate one.",
+        "optional": true,
+        "generator": {
+          "strategy": "hex",
+          "bytes": 64
+        }
+      }
+    ],
+    "setup_url": "https://t.me/BotFather",
+    "verification_endpoint": "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
+  },
+  "auth": {
+    "mode": "manual",
+    "provider": "Telegram",
+    "setup_url": "https://t.me/BotFather"
+  },
+  "capabilities": {
+    "channel": {
+      "platform": "telegram",
+      "ingress_modes": ["webhook", "polling"],
+      "outbound_message_types": ["text"],
+      "threading_model": "chat_or_topic",
+      "attachment_support": true,
+      "reply_verification_support": true,
+      "account_scoped_config": true,
+      "allow_polling": true,
+      "webhook_secret_support": true,
+      "allowed_paths": ["/telegram/updates"],
+      "ingress": {
+        "endpoints": [
+          {
+            "path": "/telegram/updates",
+            "methods": ["POST"],
+            "host_managed": true
+          }
+        ],
+        "trust": {
+          "mode": "shared_secret_header",
+          "header_name": "X-Telegram-Bot-Api-Secret-Token",
+          "secret_name": "TELEGRAM_WEBHOOK_SECRET",
+          "host_managed": true
+        },
+        "polling": {
+          "min_interval_ms": 100,
+          "default_interval_ms": 250
+        }
+      },
+      "delivery": {
+        "push": true,
+        "status_frames": true,
+        "attachment_sources": ["data_base64", "url", "storage_key"]
+      }
+    }
+  },
+  "requirements": {
+    "secrets": ["TELEGRAM_BOT_TOKEN"],
+    "optional_secrets": ["TELEGRAM_WEBHOOK_SECRET"],
+    "network_domains": ["api.telegram.org"]
+  }
+}
