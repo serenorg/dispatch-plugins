@@ -120,6 +120,7 @@
         "secrets": [],
         "optional_secrets": [
           "SLACK_BOT_TOKEN",
+          "SLACK_APP_TOKEN",
           "SLACK_SIGNING_SECRET",
           "SLACK_INCOMING_WEBHOOK_URL"
         ],
