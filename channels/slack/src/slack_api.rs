@@ -107,7 +107,7 @@ impl SlackClient {
         Ok(SlackMessage {
             message_id: ts.clone(),
             channel_id,
-            thread_ts: Some(ts),
+            thread_ts: thread_ts.map(ToOwned::to_owned),
         })
     }
 
@@ -293,6 +293,48 @@ mod tests {
     struct StubResponse {
         content_type: &'static str,
         body: String,
+    }
+
+    #[test]
+    fn send_message_without_thread_ts_does_not_report_thread() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        listener
+            .set_nonblocking(false)
+            .expect("listener blocking mode");
+        let address = listener.local_addr().expect("listener addr");
+        let base_url = format!("http://{address}/api");
+        let (request_tx, request_rx) = mpsc::channel();
+        let responses = vec![StubResponse {
+            content_type: "application/json",
+            body: r#"{"ok":true,"channel":"D123","ts":"1712860000.000001"}"#.to_string(),
+        }];
+
+        let server = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept connection");
+                let request = read_request(&mut stream);
+                request_tx.send(request).expect("send request");
+                write_response(&mut stream, &response);
+            }
+        });
+
+        let client = SlackClient::new_for_tests(&base_url);
+        let message = client
+            .send_message("D123", "hello from slack", None, None)
+            .expect("send message");
+
+        assert_eq!(message.message_id, "1712860000.000001");
+        assert_eq!(message.channel_id, "D123");
+        assert_eq!(message.thread_ts, None);
+
+        let request = request_rx.recv().expect("chat.postMessage request");
+        assert_eq!(request.request_line, "POST /api/chat.postMessage HTTP/1.1");
+        let payload: Value = serde_json::from_slice(&request.body).expect("parse request json");
+        assert_eq!(payload["channel"], "D123");
+        assert_eq!(payload["text"], "hello from slack");
+        assert!(payload.get("thread_ts").is_none());
+
+        server.join().expect("server thread");
     }
 
     #[test]

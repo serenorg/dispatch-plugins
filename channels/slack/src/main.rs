@@ -8,6 +8,7 @@ use sha2::Sha256;
 use std::{
     collections::BTreeMap,
     io::{self, BufRead, Write},
+    sync::{Mutex, OnceLock},
 };
 
 mod protocol;
@@ -63,6 +64,8 @@ const ROUTE_CONVERSATION_ID: &str = "conversation_id";
 const ROUTE_THREAD_ID: &str = "thread_id";
 const ROUTE_DESTINATION_URL: &str = "destination_url";
 const SLACK_STATUS_TEXT: &str = "slack_status_text";
+
+static BOT_USER_ID_CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
 
 fn main() -> Result<()> {
     let stdin = io::stdin().lock();
@@ -338,7 +341,7 @@ fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<Delivery
         META_DELIVERY_MODE.to_string(),
         MODE_INCOMING_WEBHOOK.to_string(),
     );
-    metadata.insert(META_DESTINATION_URL.to_string(), webhook_url);
+    metadata.insert(META_DESTINATION_URL.to_string(), "configured".to_string());
 
     Ok(DeliveryReceipt {
         message_id: posted.message_id,
@@ -515,6 +518,9 @@ fn build_inbound_event(
     if !supports_inbound_event(event) {
         return Ok(None);
     }
+    if is_self_authored_event(config, event)? {
+        return Ok(None);
+    }
 
     let Some(channel_id) = event.channel.as_ref() else {
         return Ok(None);
@@ -622,6 +628,52 @@ fn supports_inbound_event(event: &SlackEventPayload) -> bool {
         "message" => matches!(event.subtype.as_deref(), None | Some("file_share")),
         _ => false,
     }
+}
+
+fn is_self_authored_event(config: &ChannelConfig, event: &SlackEventPayload) -> Result<bool> {
+    let bot_user_id = cached_bot_user_id(config)?;
+    Ok(is_self_authored_event_for_bot_user(
+        event,
+        bot_user_id.as_deref(),
+    ))
+}
+
+fn is_self_authored_event_for_bot_user(
+    event: &SlackEventPayload,
+    bot_user_id: Option<&str>,
+) -> bool {
+    if event.bot_id.is_some() {
+        return true;
+    }
+
+    if matches!(event.subtype.as_deref(), Some("bot_message")) {
+        return true;
+    }
+
+    match (event.user.as_deref(), bot_user_id) {
+        (Some(event_user), Some(bot_user_id)) => event_user == bot_user_id,
+        _ => false,
+    }
+}
+
+fn cached_bot_user_id(config: &ChannelConfig) -> Result<Option<String>> {
+    let env_name = bot_token_env(config);
+    if !has_optional_env(env_name) {
+        return Ok(None);
+    }
+
+    let cache = BOT_USER_ID_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    {
+        let cached = cache.lock().expect("bot user id cache poisoned");
+        if let Some(user_id) = cached.get(env_name) {
+            return Ok(Some(user_id.clone()));
+        }
+    }
+
+    let user_id = SlackClient::from_env(env_name)?.identity()?.user_id;
+    let mut cached = cache.lock().expect("bot user id cache poisoned");
+    cached.insert(env_name.to_string(), user_id.clone());
+    Ok(Some(user_id))
 }
 
 fn extract_attachments(
@@ -1068,6 +1120,10 @@ struct SlackFile {
 mod tests {
     use super::*;
     use crate::protocol::OutboundAttachment;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
 
     fn base_payload(body: &str) -> IngressPayload {
         IngressPayload {
@@ -1266,6 +1322,60 @@ mod tests {
     }
 
     #[test]
+    fn self_authored_bot_user_message_is_detected() {
+        let payload = base_payload(
+            r#"{
+                "type":"event_callback",
+                "team_id":"T123",
+                "event_id":"Ev127",
+                "event":{
+                    "type":"message",
+                    "channel":"C123",
+                    "channel_type":"channel",
+                    "user":"UBOT123",
+                    "text":"echo: reply",
+                    "ts":"1712860002.100200",
+                    "event_ts":"1712860002.100200"
+                }
+            }"#,
+        );
+
+        let event_envelope: SlackEventEnvelope =
+            serde_json::from_str(&payload.body).expect("parse event envelope");
+        let event = event_envelope.event.as_ref().expect("event body");
+        assert!(is_self_authored_event_for_bot_user(event, Some("UBOT123")));
+    }
+
+    #[test]
+    fn bot_message_subtype_is_ignored() {
+        let payload = base_payload(
+            r#"{
+                "type":"event_callback",
+                "team_id":"T123",
+                "event_id":"Ev128",
+                "event":{
+                    "type":"message",
+                    "subtype":"bot_message",
+                    "channel":"C123",
+                    "channel_type":"channel",
+                    "bot_id":"B123",
+                    "text":"echo: reply",
+                    "ts":"1712860003.100200",
+                    "event_ts":"1712860003.100200"
+                }
+            }"#,
+        );
+
+        let response =
+            handle_ingress_event(&ChannelConfig::default(), &payload).expect("handle ingress");
+
+        match response {
+            PluginResponse::IngressEventsReceived { events, .. } => assert!(events.is_empty()),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
     fn invalid_signature_is_rejected() {
         let mut payload = base_payload(r#"{"type":"event_callback","team_id":"T123","event":{}}"#);
         payload.trust_verified = false;
@@ -1448,5 +1558,82 @@ mod tests {
                 .to_string()
                 .contains("storage_key attachments are not supported")
         );
+    }
+
+    #[test]
+    fn incoming_webhook_delivery_redacts_destination_url_metadata() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        listener
+            .set_nonblocking(false)
+            .expect("listener blocking mode");
+        let address = listener.local_addr().expect("listener addr");
+        let webhook_url = format!("http://{address}/services/test");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .expect("set read timeout");
+
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            || error.kind() == io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(error) => panic!("read request: {error}"),
+                }
+            }
+
+            let response =
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n\r\nok";
+            stream.write_all(response).expect("write response");
+        });
+
+        let delivery = deliver(
+            &ChannelConfig {
+                incoming_webhook_url: Some(webhook_url.clone()),
+                ..ChannelConfig::default()
+            },
+            &OutboundMessage {
+                content: "hello from incoming webhook".to_string(),
+                attachments: Vec::new(),
+                channel_id: None,
+                thread_ts: None,
+                destination_url: None,
+                metadata: BTreeMap::new(),
+            },
+        )
+        .expect("deliver");
+
+        assert_eq!(
+            delivery
+                .metadata
+                .get(META_DELIVERY_MODE)
+                .map(String::as_str),
+            Some(MODE_INCOMING_WEBHOOK)
+        );
+        assert_eq!(
+            delivery
+                .metadata
+                .get(META_DESTINATION_URL)
+                .map(String::as_str),
+            Some("configured")
+        );
+        assert_ne!(
+            delivery
+                .metadata
+                .get(META_DESTINATION_URL)
+                .map(String::as_str),
+            Some(webhook_url.as_str())
+        );
+
+        server.join().expect("server thread");
     }
 }
