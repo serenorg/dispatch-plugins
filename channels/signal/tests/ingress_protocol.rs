@@ -33,56 +33,49 @@ fn run_request(request: Value) -> Value {
     serde_json::from_str(line).expect("parse response")
 }
 
-fn serve_signal_rpc_once(response_body: String) -> String {
+fn serve_signal_receive_once(response_body: String) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind signal test listener");
     let addr = listener.local_addr().expect("listener addr");
 
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept request");
-        let mut buffer = Vec::new();
-        let header_end;
-        loop {
-            let mut chunk = [0_u8; 1024];
-            let read = stream.read(&mut chunk).expect("read request");
-            assert!(read > 0, "signal test server saw EOF before headers");
-            buffer.extend_from_slice(&chunk[..read]);
-            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-                header_end = position + 4;
-                break;
-            }
-        }
-
-        let headers = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                if name.eq_ignore_ascii_case("Content-Length") {
-                    return value.trim().parse::<usize>().ok();
+        for index in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buffer = Vec::new();
+            let header_end;
+            loop {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).expect("read request");
+                assert!(read > 0, "signal test server saw EOF before headers");
+                buffer.extend_from_slice(&chunk[..read]);
+                if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                    header_end = position + 4;
+                    break;
                 }
-                None
-            })
-            .expect("content-length header");
-        while buffer.len() < header_end + content_length {
-            let mut chunk = [0_u8; 1024];
-            let read = stream.read(&mut chunk).expect("read request body");
-            assert!(read > 0, "signal test server saw EOF before full body");
-            buffer.extend_from_slice(&chunk[..read]);
+            }
+
+            let headers = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+            let (expected_fragment, body) = if index == 0 {
+                (
+                    "/v1/about",
+                    json!({"mode": "native", "version": "0.98"}).to_string(),
+                )
+            } else {
+                ("/v1/receive/", response_body.clone())
+            };
+            assert!(headers.contains(expected_fragment));
+            if index == 1 {
+                assert!(headers.contains("+15550001111") || headers.contains("%2B15550001111"));
+            }
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
         }
-
-        let body = String::from_utf8_lossy(&buffer[header_end..header_end + content_length]);
-        assert!(headers.starts_with("POST /api/v1/rpc HTTP/1.1"));
-        assert!(body.contains("\"method\":\"receive\""));
-        assert!(body.contains("\"account\":\"+15550001111\""));
-
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            response_body.len(),
-            response_body
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write response");
     });
 
     format!("http://{}", addr)
@@ -90,31 +83,27 @@ fn serve_signal_rpc_once(response_body: String) -> String {
 
 #[test]
 fn poll_ingress_round_trips_signal_receive_messages() {
-    let response_body = json!({
-        "jsonrpc": "2.0",
-        "id": "dispatch-signal",
-        "result": [{
-            "envelope": {
-                "source": "+15552223333",
-                "sourceNumber": "+15552223333",
-                "sourceName": "Alice",
-                "sourceUuid": "4c5d6e7f",
-                "sourceDevice": 2,
-                "timestamp": 1712860000123_i64,
-                "dataMessage": {
-                    "message": "hello from signal",
-                    "attachments": [{
-                        "contentType": "image/jpeg",
-                        "id": "att-1",
-                        "size": 4096,
-                        "filename": "photo.jpg"
-                    }]
-                }
+    let response_body = json!([{
+        "envelope": {
+            "source": "+15552223333",
+            "sourceNumber": "+15552223333",
+            "sourceName": "Alice",
+            "sourceUuid": "4c5d6e7f",
+            "sourceDevice": 2,
+            "timestamp": 1712860000123_i64,
+            "dataMessage": {
+                "message": "hello from signal",
+                "attachments": [{
+                    "contentType": "image/jpeg",
+                    "id": "att-1",
+                    "size": 4096,
+                    "filename": "photo.jpg"
+                }]
             }
-        }]
-    })
+        }
+    }])
     .to_string();
-    let base_url = serve_signal_rpc_once(response_body);
+    let base_url = serve_signal_receive_once(response_body);
 
     let response = run_request(json!({
         "protocol_version": 1,

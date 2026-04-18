@@ -1,7 +1,7 @@
 # channel-signal
 
 A [Dispatch](https://github.com/serenorg/dispatch) channel plugin
-for Signal using a `signal-cli` REST or JSON-RPC endpoint.
+for Signal using the upstream `signal-cli-rest-api` HTTP API.
 
 ## Scope
 
@@ -19,11 +19,12 @@ Implemented:
 
 Behavior:
 
-- outbound delivery uses `POST /api/v1/rpc` with the `send` method
+- outbound delivery uses `POST /v2/send`
 - outbound delivery supports base64-backed attachments
-- health checks validate connectivity with `GET /api/v1/check`
-- status frames map to Signal typing indicators with `sendTyping`
-- polling ingress calls the Signal `receive` method and normalizes inbound
+- health checks validate connectivity with `GET /v1/about`
+- status frames map to Signal typing indicators with
+  `PUT /v1/typing-indicator/{number}`
+- polling ingress uses `GET /v1/receive/{number}` and normalizes inbound
   message envelopes into Dispatch events
 
 Not implemented:
@@ -56,15 +57,26 @@ prefixed forms like `signal:+15551234567`.
 
 ## Setup
 
-This plugin expects a running `signal-cli` REST or JSON-RPC backend.
+This plugin expects a running
+[`bbernhard/signal-cli-rest-api`](https://github.com/bbernhard/signal-cli-rest-api)
+backend.
 
 Typical setup:
 
 1. Provision or link a Signal account with `signal-cli`.
-2. Start a `signal-cli` REST or JSON-RPC service that exposes the account.
+2. Start `signal-cli-rest-api` in `native` or `normal` mode so the published
+  `GET /v1/receive/{number}` polling endpoint is available.
 3. Point the plugin at that service with `base_url` or `SIGNAL_RPC_URL`.
 4. Set `account` in the plugin config when the backend requires an explicit
-    account selector for polling and sending.
+  account selector for polling and sending.
+
+Notes:
+
+- `poll_ingress` requires `MODE=native` or `MODE=normal`. In upstream
+  `json-rpc` mode, `receive` is exposed as a websocket endpoint instead of a
+  polling GET request.
+- `deliver` and `status` target the upstream REST API routes documented by
+  `signal-cli-rest-api`, not the older `/api/v1/rpc` wrapper contract.
 
 ## Build
 

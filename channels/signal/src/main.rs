@@ -24,6 +24,7 @@ const META_BASE_URL_ENV: &str = "base_url_env";
 const META_ACCOUNT: &str = "account";
 const META_DEFAULT_RECIPIENT: &str = "default_recipient";
 const META_VERSION: &str = "version";
+const META_BACKEND_MODE: &str = "backend_mode";
 const META_INGRESS_MODE: &str = "ingress_mode";
 const META_POLL_TIMEOUT_SECS: &str = "poll_timeout_secs";
 const META_REASON: &str = "reason";
@@ -154,6 +155,9 @@ fn health(config: &ChannelConfig) -> Result<HealthReport> {
     metadata.insert(META_BASE_URL.to_string(), client_base_url(config)?);
     if let Some(version) = state.version.clone() {
         metadata.insert(META_VERSION.to_string(), version);
+    }
+    if let Some(mode) = state.mode.clone() {
+        metadata.insert(META_BACKEND_MODE.to_string(), mode);
     }
     if let Some(account) = &config.account {
         metadata.insert(META_ACCOUNT.to_string(), account.clone());
