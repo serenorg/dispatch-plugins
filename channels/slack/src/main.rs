@@ -8,7 +8,6 @@ use sha2::Sha256;
 use std::{
     collections::BTreeMap,
     io::{self, BufRead, Write},
-    sync::{Mutex, OnceLock},
 };
 
 mod protocol;
@@ -38,6 +37,7 @@ const META_TEAM_NAME: &str = "team_name";
 const META_MODE: &str = "mode";
 const META_HOST_ACTION: &str = "host_action";
 const META_SIGNING_SECRET: &str = "signing_secret";
+const META_BOT_USER_ID: &str = "bot_user_id";
 const META_DELIVERY_MODE: &str = "delivery_mode";
 const META_CHANNEL_ID: &str = "channel_id";
 const META_THREAD_TS: &str = "thread_ts";
@@ -64,8 +64,6 @@ const ROUTE_CONVERSATION_ID: &str = "conversation_id";
 const ROUTE_THREAD_ID: &str = "thread_id";
 const ROUTE_DESTINATION_URL: &str = "destination_url";
 const SLACK_STATUS_TEXT: &str = "slack_status_text";
-
-static BOT_USER_ID_CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
 
 fn main() -> Result<()> {
     let stdin = io::stdin().lock();
@@ -130,7 +128,11 @@ fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
         PluginRequest::Push { config, message } => Ok(PluginResponse::Pushed {
             delivery: deliver(config, message)?,
         }),
-        PluginRequest::IngressEvent { config, payload } => handle_ingress_event(config, payload),
+        PluginRequest::IngressEvent {
+            config,
+            state,
+            payload,
+        } => handle_ingress_event(config, state.as_ref(), payload),
         PluginRequest::Status { config, update } => Ok(PluginResponse::StatusAccepted {
             status: send_status(config, update)?,
         }),
@@ -268,6 +270,7 @@ fn start_ingress(config: &ChannelConfig) -> Result<IngressState> {
         if let Some(team_id) = identity.team_id {
             metadata.insert(META_TEAM_ID.to_string(), team_id);
         }
+        metadata.insert(META_BOT_USER_ID.to_string(), identity.user_id);
     }
 
     Ok(IngressState {
@@ -424,6 +427,7 @@ fn slack_upload(message: &OutboundMessage) -> Result<Option<SlackUpload>> {
 
 fn handle_ingress_event(
     config: &ChannelConfig,
+    state: Option<&IngressState>,
     payload: &IngressPayload,
 ) -> Result<PluginResponse> {
     if !payload.method.eq_ignore_ascii_case("POST") {
@@ -483,7 +487,8 @@ fn handle_ingress_event(
                 ));
             };
 
-            let Some(inbound_event) = build_inbound_event(config, payload, &envelope, event)?
+            let Some(inbound_event) =
+                build_inbound_event(config, state, payload, &envelope, event)?
             else {
                 return Ok(PluginResponse::IngressEventsReceived {
                     events: Vec::new(),
@@ -511,6 +516,7 @@ fn handle_ingress_event(
 
 fn build_inbound_event(
     config: &ChannelConfig,
+    ingress_state: Option<&IngressState>,
     payload: &IngressPayload,
     envelope: &SlackEventEnvelope,
     event: &SlackEventPayload,
@@ -518,7 +524,7 @@ fn build_inbound_event(
     if !supports_inbound_event(event) {
         return Ok(None);
     }
-    if is_self_authored_event(config, event)? {
+    if is_self_authored_event(ingress_state, event) {
         return Ok(None);
     }
 
@@ -630,12 +636,11 @@ fn supports_inbound_event(event: &SlackEventPayload) -> bool {
     }
 }
 
-fn is_self_authored_event(config: &ChannelConfig, event: &SlackEventPayload) -> Result<bool> {
-    let bot_user_id = cached_bot_user_id(config)?;
-    Ok(is_self_authored_event_for_bot_user(
-        event,
-        bot_user_id.as_deref(),
-    ))
+fn is_self_authored_event(ingress_state: Option<&IngressState>, event: &SlackEventPayload) -> bool {
+    let bot_user_id = ingress_state
+        .and_then(|state| state.metadata.get(META_BOT_USER_ID))
+        .map(String::as_str);
+    is_self_authored_event_for_bot_user(event, bot_user_id)
 }
 
 fn is_self_authored_event_for_bot_user(
@@ -654,26 +659,6 @@ fn is_self_authored_event_for_bot_user(
         (Some(event_user), Some(bot_user_id)) => event_user == bot_user_id,
         _ => false,
     }
-}
-
-fn cached_bot_user_id(config: &ChannelConfig) -> Result<Option<String>> {
-    let env_name = bot_token_env(config);
-    if !has_optional_env(env_name) {
-        return Ok(None);
-    }
-
-    let cache = BOT_USER_ID_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
-    {
-        let cached = cache.lock().expect("bot user id cache poisoned");
-        if let Some(user_id) = cached.get(env_name) {
-            return Ok(Some(user_id.clone()));
-        }
-    }
-
-    let user_id = SlackClient::from_env(env_name)?.identity()?.user_id;
-    let mut cached = cache.lock().expect("bot user id cache poisoned");
-    cached.insert(env_name.to_string(), user_id.clone());
-    Ok(Some(user_id))
 }
 
 fn extract_attachments(
@@ -1145,8 +1130,8 @@ mod tests {
             r#"{"type":"url_verification","challenge":"challenge-token","team_id":"T123"}"#,
         );
 
-        let response =
-            handle_ingress_event(&ChannelConfig::default(), &payload).expect("handle ingress");
+        let response = handle_ingress_event(&ChannelConfig::default(), None, &payload)
+            .expect("handle ingress");
 
         match response {
             PluginResponse::IngressEventsReceived {
@@ -1186,8 +1171,8 @@ mod tests {
             }"#,
         );
 
-        let response =
-            handle_ingress_event(&ChannelConfig::default(), &payload).expect("handle ingress");
+        let response = handle_ingress_event(&ChannelConfig::default(), None, &payload)
+            .expect("handle ingress");
 
         match response {
             PluginResponse::IngressEventsReceived {
@@ -1239,8 +1224,8 @@ mod tests {
             }"#,
         );
 
-        let response =
-            handle_ingress_event(&ChannelConfig::default(), &payload).expect("handle ingress");
+        let response = handle_ingress_event(&ChannelConfig::default(), None, &payload)
+            .expect("handle ingress");
 
         match response {
             PluginResponse::IngressEventsReceived { events, .. } => assert!(events.is_empty()),
@@ -1282,8 +1267,8 @@ mod tests {
             }"#,
         );
 
-        let response =
-            handle_ingress_event(&ChannelConfig::default(), &payload).expect("handle ingress");
+        let response = handle_ingress_event(&ChannelConfig::default(), None, &payload)
+            .expect("handle ingress");
 
         match response {
             PluginResponse::IngressEventsReceived { events, .. } => {
@@ -1343,7 +1328,13 @@ mod tests {
         let event_envelope: SlackEventEnvelope =
             serde_json::from_str(&payload.body).expect("parse event envelope");
         let event = event_envelope.event.as_ref().expect("event body");
-        assert!(is_self_authored_event_for_bot_user(event, Some("UBOT123")));
+        let ingress_state = IngressState {
+            mode: IngressMode::EventsWebhook,
+            status: "configured".to_string(),
+            endpoint: Some("https://example.com/slack/events".to_string()),
+            metadata: BTreeMap::from([(META_BOT_USER_ID.to_string(), "UBOT123".to_string())]),
+        };
+        assert!(is_self_authored_event(Some(&ingress_state), event));
     }
 
     #[test]
@@ -1366,8 +1357,8 @@ mod tests {
             }"#,
         );
 
-        let response =
-            handle_ingress_event(&ChannelConfig::default(), &payload).expect("handle ingress");
+        let response = handle_ingress_event(&ChannelConfig::default(), None, &payload)
+            .expect("handle ingress");
 
         match response {
             PluginResponse::IngressEventsReceived { events, .. } => assert!(events.is_empty()),
@@ -1420,6 +1411,7 @@ mod tests {
                 dm_policy: Some("pairing".to_string()),
                 ..ChannelConfig::default()
             },
+            None,
             &payload,
         )
         .expect("handle ingress");

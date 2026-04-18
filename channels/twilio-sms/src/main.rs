@@ -124,7 +124,9 @@ fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
         PluginRequest::Push { config, message } => Ok(PluginResponse::Pushed {
             delivery: deliver(config, message)?,
         }),
-        PluginRequest::IngressEvent { config, payload } => handle_ingress_event(config, payload),
+        PluginRequest::IngressEvent {
+            config, payload, ..
+        } => handle_ingress_event(config, payload),
         PluginRequest::Status { .. } => Ok(PluginResponse::StatusAccepted {
             status: StatusAcceptance {
                 accepted: false,

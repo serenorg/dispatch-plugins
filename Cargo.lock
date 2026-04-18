@@ -304,7 +304,7 @@ dependencies = [
 [[package]]
 name = "dispatch-channel-protocol"
 version = "0.3.0"
-source = "git+https://github.com/serenorg/dispatch?rev=f3354efba62f3af26fb0583482fd6f99f069c9a8#f3354efba62f3af26fb0583482fd6f99f069c9a8"
+source = "git+https://github.com/serenorg/dispatch?rev=02dda945c53be7dbb02f43a008285733b34fb089#02dda945c53be7dbb02f43a008285733b34fb089"
 dependencies = [
  "serde",
  "serde_json",
