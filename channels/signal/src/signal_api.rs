@@ -303,10 +303,12 @@ fn configure_websocket_read_timeout(
     timeout_secs: u16,
 ) -> std::io::Result<()> {
     let timeout = Some(Duration::from_secs(u64::from(timeout_secs).max(1) + 1));
-    match stream {
-        MaybeTlsStream::Plain(stream) => stream.set_read_timeout(timeout),
-        _ => Ok(()),
-    }
+    let tcp = match stream {
+        MaybeTlsStream::Plain(tcp) => tcp,
+        MaybeTlsStream::Rustls(tls) => &mut tls.sock,
+        _ => return Ok(()),
+    };
+    tcp.set_read_timeout(timeout)
 }
 
 pub fn normalize_base_url(value: &str) -> Result<String> {
