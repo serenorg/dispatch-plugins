@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -9,7 +9,58 @@ use tungstenite::{
     handshake::server::{Request, Response},
 };
 
-fn run_request(request: Value) -> Value {
+fn request_method(kind: &str) -> &'static str {
+    match kind {
+        "capabilities" => "channel.capabilities",
+        "configure" => "channel.configure",
+        "health" => "channel.health",
+        "start_ingress" => "channel.start_ingress",
+        "stop_ingress" => "channel.stop_ingress",
+        "ingress_event" => "channel.ingress_event",
+        "deliver" => "channel.deliver",
+        "push" => "channel.push",
+        "status" => "channel.status",
+        "shutdown" => "channel.shutdown",
+        other => panic!("unsupported request kind `{other}`"),
+    }
+}
+
+fn wrap_request(request: Value) -> Value {
+    let protocol_version = request["protocol_version"].clone();
+    let mut params = request["request"]
+        .as_object()
+        .expect("request object")
+        .clone();
+    let kind = params
+        .get("kind")
+        .and_then(Value::as_str)
+        .expect("request kind")
+        .to_string();
+    params.insert("protocol_version".to_string(), protocol_version);
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": request_method(&kind),
+        "params": Value::Object(params),
+    })
+}
+
+fn read_message(reader: &mut BufReader<std::process::ChildStdout>) -> Value {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line).expect("read child stdout");
+        assert!(
+            bytes > 0,
+            "signal child exited before emitting expected output"
+        );
+        if !line.trim().is_empty() {
+            return serde_json::from_str(line.trim()).expect("parse plugin json");
+        }
+    }
+}
+
+fn run_start_ingress_cycle(config: Value) -> (Value, Value) {
     let binary = std::env::var("CARGO_BIN_EXE_channel-signal").expect("channel-signal binary path");
     let mut child = Command::new(binary)
         .stdin(Stdio::piped())
@@ -18,23 +69,56 @@ fn run_request(request: Value) -> Value {
         .expect("spawn channel-signal");
 
     let mut stdin = child.stdin.take().expect("child stdin");
-    writeln!(stdin, "{request}").expect("write request");
-    drop(stdin);
+    writeln!(
+        stdin,
+        "{}",
+        wrap_request(json!({
+            "protocol_version": 1,
+            "request": {
+                "kind": "start_ingress",
+                "config": config,
+                "state": null
+            }
+        }))
+    )
+    .expect("write start_ingress request");
 
-    let output = child.wait_with_output().expect("wait for child");
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut response = None;
+    let mut notification = None;
+    for _ in 0..4 {
+        let message = read_message(&mut reader);
+        if let Some(result) = message.get("result") {
+            response = Some(result.clone());
+        } else if message["method"] == "channel.event" {
+            notification = Some(message["params"].clone());
+        }
+        if response.is_some() && notification.is_some() {
+            break;
+        }
+    }
+
+    writeln!(
+        stdin,
+        "{}",
+        wrap_request(json!({
+            "protocol_version": 1,
+            "request": { "kind": "shutdown" }
+        }))
+    )
+    .expect("write shutdown request");
+    drop(stdin);
+    let status = child.wait().expect("wait for child");
     assert!(
-        output.status.success(),
-        "channel-signal failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        status.success(),
+        "channel-signal exited unsuccessfully: {status}"
     );
 
-    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
-    let line = stdout
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .expect("response line");
-    serde_json::from_str(line).expect("parse response")
+    (
+        response.expect("start_ingress response"),
+        notification.expect("channel.event notification"),
+    )
 }
 
 fn serve_signal_receive_once(response_body: String) -> String {
@@ -136,7 +220,7 @@ fn serve_signal_websocket_receive_once(response_body: String) -> String {
 }
 
 #[test]
-fn poll_ingress_round_trips_signal_receive_messages() {
+fn start_ingress_emits_signal_receive_messages() {
     let response_body = json!([{
         "envelope": {
             "source": "+15552223333",
@@ -159,23 +243,18 @@ fn poll_ingress_round_trips_signal_receive_messages() {
     .to_string();
     let base_url = serve_signal_receive_once(response_body);
 
-    let response = run_request(json!({
-        "protocol_version": 1,
-        "request": {
-            "kind": "poll_ingress",
-            "config": {
-                "base_url": base_url,
-                "account": "+15550001111"
-            }
-        }
+    let (response, notification) = run_start_ingress_cycle(json!({
+        "base_url": base_url,
+        "account": "+15550001111",
+        "poll_timeout_secs": 1
     }));
 
-    assert_eq!(response["kind"], "ingress_events_received");
-    assert!(response["callback_reply"].is_null());
-    assert_eq!(response["poll_after_ms"], 1000);
+    assert_eq!(response["kind"], "ingress_started");
     assert_eq!(response["state"]["mode"], "polling");
     assert_eq!(response["state"]["status"], "running");
-    let events = response["events"].as_array().expect("events array");
+    assert_eq!(notification["protocol_version"], 1);
+    assert_eq!(notification["poll_after_ms"], 1000);
+    let events = notification["events"].as_array().expect("events array");
     assert_eq!(events.len(), 1);
 
     let event = &events[0];
@@ -194,7 +273,7 @@ fn poll_ingress_round_trips_signal_receive_messages() {
 }
 
 #[test]
-fn poll_ingress_round_trips_signal_websocket_messages() {
+fn start_ingress_emits_signal_websocket_messages() {
     let response_body = json!([{
         "envelope": {
             "source": "+15553334444",
@@ -211,19 +290,13 @@ fn poll_ingress_round_trips_signal_websocket_messages() {
     .to_string();
     let base_url = serve_signal_websocket_receive_once(response_body);
 
-    let response = run_request(json!({
-        "protocol_version": 1,
-        "request": {
-            "kind": "poll_ingress",
-            "config": {
-                "base_url": base_url,
-                "account": "+15550001111"
-            }
-        }
+    let (_response, notification) = run_start_ingress_cycle(json!({
+        "base_url": base_url,
+        "account": "+15550001111",
+        "poll_timeout_secs": 1
     }));
 
-    assert_eq!(response["kind"], "ingress_events_received");
-    let events = response["events"].as_array().expect("events array");
+    let events = notification["events"].as_array().expect("events array");
     assert_eq!(events.len(), 1);
     let event = &events[0];
     assert_eq!(event["platform"], "signal");

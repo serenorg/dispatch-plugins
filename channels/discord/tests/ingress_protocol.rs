@@ -3,6 +3,42 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
+fn request_method(kind: &str) -> &'static str {
+    match kind {
+        "capabilities" => "channel.capabilities",
+        "configure" => "channel.configure",
+        "health" => "channel.health",
+        "start_ingress" => "channel.start_ingress",
+        "stop_ingress" => "channel.stop_ingress",
+        "ingress_event" => "channel.ingress_event",
+        "deliver" => "channel.deliver",
+        "push" => "channel.push",
+        "status" => "channel.status",
+        "shutdown" => "channel.shutdown",
+        other => panic!("unsupported request kind `{other}`"),
+    }
+}
+
+fn wrap_request(request: Value) -> Value {
+    let protocol_version = request["protocol_version"].clone();
+    let mut params = request["request"]
+        .as_object()
+        .expect("request object")
+        .clone();
+    let kind = params
+        .get("kind")
+        .and_then(Value::as_str)
+        .expect("request kind")
+        .to_string();
+    params.insert("protocol_version".to_string(), protocol_version);
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": request_method(&kind),
+        "params": Value::Object(params),
+    })
+}
+
 fn run_request(request: Value) -> Value {
     let binary =
         std::env::var("CARGO_BIN_EXE_channel-discord").expect("channel-discord binary path");
@@ -13,7 +49,7 @@ fn run_request(request: Value) -> Value {
         .expect("spawn channel-discord");
 
     let mut stdin = child.stdin.take().expect("child stdin");
-    writeln!(stdin, "{request}").expect("write request");
+    writeln!(stdin, "{}", wrap_request(request)).expect("write request");
     drop(stdin);
 
     let output = child.wait_with_output().expect("wait for child");
@@ -29,7 +65,8 @@ fn run_request(request: Value) -> Value {
         .lines()
         .find(|line| !line.trim().is_empty())
         .expect("response line");
-    serde_json::from_str(line).expect("parse response")
+    let response: Value = serde_json::from_str(line).expect("parse response");
+    response["result"].clone()
 }
 
 #[test]

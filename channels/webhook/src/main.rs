@@ -15,7 +15,8 @@ use protocol::{
     HealthReport, InboundActor, InboundAttachment, InboundConversationRef, InboundEventEnvelope,
     InboundMessage, IngressCallbackReply, IngressMode, IngressPayload, IngressState,
     OutboundMessage, PluginRequest, PluginRequestEnvelope, PluginResponse, StatusAcceptance,
-    StatusFrame, StatusKind, capabilities, plugin_error,
+    StatusFrame, StatusKind, capabilities, parse_jsonrpc_request, plugin_error,
+    response_to_jsonrpc,
 };
 
 fn main() -> Result<()> {
@@ -28,15 +29,15 @@ fn main() -> Result<()> {
             continue;
         }
 
-        let envelope: PluginRequestEnvelope =
-            serde_json::from_str(&line).context("failed to parse channel request")?;
+        let (request_id, envelope) = parse_jsonrpc_request(&line)
+            .map_err(|error| anyhow!("failed to parse channel request: {error}"))?;
 
         let response = match handle_request(&envelope) {
             Ok(response) => response,
             Err(error) => plugin_error("internal_error", error.to_string()),
         };
 
-        let json = serde_json::to_string(&response)?;
+        let json = response_to_jsonrpc(&request_id, &response).map_err(|error| anyhow!(error))?;
         writeln!(stdout, "{json}")?;
         stdout.flush()?;
     }
@@ -65,16 +66,12 @@ fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
         PluginRequest::Health { config } => Ok(PluginResponse::Health {
             health: health(config)?,
         }),
-        PluginRequest::StartIngress { config } => Ok(PluginResponse::IngressStarted {
+        PluginRequest::StartIngress { config, .. } => Ok(PluginResponse::IngressStarted {
             state: start_ingress(config)?,
         }),
         PluginRequest::StopIngress { config, state } => Ok(PluginResponse::IngressStopped {
             state: stop_ingress(config, state.clone())?,
         }),
-        PluginRequest::PollIngress { .. } => Ok(plugin_error(
-            "polling_not_supported",
-            "generic webhook channels do not support poll_ingress",
-        )),
         PluginRequest::Deliver { config, message } => Ok(PluginResponse::Delivered {
             delivery: deliver(config, message)?,
         }),
@@ -87,6 +84,7 @@ fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
         PluginRequest::Status { config, update } => Ok(PluginResponse::StatusAccepted {
             status: send_status(config, update)?,
         }),
+        PluginRequest::Shutdown => Ok(PluginResponse::Ok),
     }
 }
 

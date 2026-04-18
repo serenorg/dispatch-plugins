@@ -7,17 +7,24 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     io::{self, BufRead, Write},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
 };
 
 mod protocol;
 mod telegram_api;
 
 use protocol::{
-    CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ChannelPolicy, ConfiguredChannel,
-    DeliveryReceipt, HealthReport, InboundActor, InboundAttachment, InboundConversationRef,
-    InboundEventEnvelope, InboundMessage, IngressCallbackReply, IngressMode, IngressPayload,
-    IngressState, OutboundAttachment, OutboundMessage, PluginRequest, PluginRequestEnvelope,
-    PluginResponse, StatusAcceptance, StatusFrame, StatusKind, capabilities, plugin_error,
+    CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ChannelEventNotification, ChannelPolicy,
+    ConfiguredChannel, DeliveryReceipt, HealthReport, InboundActor, InboundAttachment,
+    InboundConversationRef, InboundEventEnvelope, InboundMessage, IngressCallbackReply,
+    IngressMode, IngressPayload, IngressState, OutboundAttachment, OutboundMessage,
+    PluginNotificationEnvelope, PluginRequest, PluginRequestEnvelope, PluginResponse,
+    StatusAcceptance, StatusFrame, StatusKind, capabilities, notification_to_jsonrpc,
+    parse_jsonrpc_request, plugin_error, response_to_jsonrpc,
 };
 use telegram_api::{TelegramClient, TelegramMediaSource, TelegramUpload};
 
@@ -57,9 +64,16 @@ const CONTENT_ORIGIN_EMPTY: &str = "empty";
 const TRANSPORT_WEBHOOK: &str = "webhook";
 const TRANSPORT_POLLING: &str = "polling";
 
+struct IngressWorker {
+    stop: Arc<AtomicBool>,
+    state: Arc<Mutex<Option<IngressState>>>,
+    handle: JoinHandle<()>,
+}
+
 fn main() -> Result<()> {
     let stdin = io::stdin().lock();
-    let mut stdout = io::stdout().lock();
+    let stdout_lock = Arc::new(Mutex::new(()));
+    let mut ingress_worker: Option<IngressWorker> = None;
 
     for line in stdin.lines() {
         let line = line.context("failed to read stdin")?;
@@ -67,23 +81,31 @@ fn main() -> Result<()> {
             continue;
         }
 
-        let envelope: PluginRequestEnvelope =
-            serde_json::from_str(&line).context("failed to parse channel request")?;
+        let (request_id, envelope) = parse_jsonrpc_request(&line)
+            .map_err(|error| anyhow!("failed to parse channel request: {error}"))?;
+        let should_exit = matches!(envelope.request, PluginRequest::Shutdown);
 
-        let response = match handle_request(&envelope) {
+        let response = match handle_request(&envelope, &stdout_lock, &mut ingress_worker) {
             Ok(response) => response,
             Err(error) => plugin_error("internal_error", error.to_string()),
         };
 
-        let json = serde_json::to_string(&response)?;
-        writeln!(stdout, "{json}")?;
-        stdout.flush()?;
+        let json = response_to_jsonrpc(&request_id, &response).map_err(|error| anyhow!(error))?;
+        write_stdout_line(&stdout_lock, &json)?;
+        if should_exit {
+            break;
+        }
     }
 
+    let _ = stop_ingress_worker(&mut ingress_worker);
     Ok(())
 }
 
-fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
+fn handle_request(
+    envelope: &PluginRequestEnvelope,
+    stdout_lock: &Arc<Mutex<()>>,
+    ingress_worker: &mut Option<IngressWorker>,
+) -> Result<PluginResponse> {
     if envelope.protocol_version != CHANNEL_PLUGIN_PROTOCOL_VERSION {
         return Ok(plugin_error(
             "unsupported_protocol_version",
@@ -104,13 +126,30 @@ fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
         PluginRequest::Health { config } => Ok(PluginResponse::Health {
             health: health(config)?,
         }),
-        PluginRequest::StartIngress { config } => Ok(PluginResponse::IngressStarted {
-            state: start_ingress(config)?,
-        }),
+        PluginRequest::StartIngress { config, state } => {
+            let started = start_ingress(config)?;
+            let started = match (&started.mode, state.clone()) {
+                (IngressMode::Polling, Some(state)) if state.mode == IngressMode::Polling => state,
+                _ => started,
+            };
+            if matches!(started.mode, IngressMode::Polling) {
+                restart_ingress_worker(
+                    ingress_worker,
+                    config.clone(),
+                    started.clone(),
+                    Arc::clone(stdout_lock),
+                );
+            } else {
+                let _ = stop_ingress_worker(ingress_worker);
+            }
+            Ok(PluginResponse::IngressStarted { state: started })
+        }
         PluginRequest::StopIngress { config, state } => Ok(PluginResponse::IngressStopped {
-            state: stop_ingress(config, state.clone())?,
+            state: stop_ingress(
+                config,
+                stop_ingress_worker(ingress_worker).or(state.clone()),
+            )?,
         }),
-        PluginRequest::PollIngress { config, state } => poll_ingress(config, state.clone()),
         PluginRequest::Deliver { config, message } => Ok(PluginResponse::Delivered {
             delivery: deliver(config, message)?,
         }),
@@ -123,7 +162,118 @@ fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
         PluginRequest::Status { config, update } => Ok(PluginResponse::StatusAccepted {
             status: send_status(config, update)?,
         }),
+        PluginRequest::Shutdown => {
+            let _ = stop_ingress_worker(ingress_worker);
+            Ok(PluginResponse::Ok)
+        }
     }
+}
+
+fn restart_ingress_worker(
+    worker: &mut Option<IngressWorker>,
+    config: ChannelConfig,
+    state: IngressState,
+    stdout_lock: Arc<Mutex<()>>,
+) {
+    let _ = stop_ingress_worker(worker);
+    *worker = Some(spawn_ingress_worker(config, state, stdout_lock));
+}
+
+fn spawn_ingress_worker(
+    config: ChannelConfig,
+    initial_state: IngressState,
+    stdout_lock: Arc<Mutex<()>>,
+) -> IngressWorker {
+    let stop = Arc::new(AtomicBool::new(false));
+    let state = Arc::new(Mutex::new(Some(initial_state)));
+    let stop_flag = Arc::clone(&stop);
+    let shared_state = Arc::clone(&state);
+    let handle = thread::spawn(move || {
+        while !stop_flag.load(Ordering::Relaxed) {
+            let prior_state = shared_state
+                .lock()
+                .expect("telegram ingress state poisoned")
+                .clone();
+            match poll_ingress(&config, prior_state) {
+                Ok(PluginResponse::IngressEventsReceived {
+                    events,
+                    state,
+                    poll_after_ms,
+                    ..
+                }) => {
+                    if let Some(next_state) = state.clone() {
+                        *shared_state
+                            .lock()
+                            .expect("telegram ingress state poisoned") = Some(next_state);
+                    }
+                    if let Err(error) = emit_channel_event_notification(
+                        &stdout_lock,
+                        ChannelEventNotification {
+                            events,
+                            state,
+                            poll_after_ms,
+                        },
+                    ) {
+                        eprintln!("telegram ingress worker failed to emit notification: {error}");
+                        break;
+                    }
+                }
+                Ok(PluginResponse::Error { error }) => {
+                    eprintln!(
+                        "telegram ingress worker stopped after plugin error {}: {}",
+                        error.code, error.message
+                    );
+                    break;
+                }
+                Ok(other) => {
+                    eprintln!(
+                        "telegram ingress worker received unexpected response variant: {:?}",
+                        other
+                    );
+                    break;
+                }
+                Err(error) => {
+                    eprintln!("telegram ingress worker stopped after receive failure: {error}");
+                    break;
+                }
+            }
+        }
+    });
+
+    IngressWorker {
+        stop,
+        state,
+        handle,
+    }
+}
+
+fn stop_ingress_worker(worker: &mut Option<IngressWorker>) -> Option<IngressState> {
+    let worker = worker.take()?;
+    worker.stop.store(true, Ordering::Relaxed);
+    let _ = worker.handle.join();
+    worker.state.lock().ok().and_then(|state| (*state).clone())
+}
+
+fn emit_channel_event_notification(
+    stdout_lock: &Arc<Mutex<()>>,
+    notification: ChannelEventNotification,
+) -> Result<()> {
+    let envelope = PluginNotificationEnvelope {
+        protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+        notification,
+    };
+    let json = notification_to_jsonrpc(&envelope).map_err(|error| anyhow!(error))?;
+    write_stdout_line(stdout_lock, &json)
+}
+
+fn write_stdout_line(stdout_lock: &Arc<Mutex<()>>, line: &str) -> Result<()> {
+    let _guard = stdout_lock
+        .lock()
+        .map_err(|_| anyhow!("stdout lock poisoned"))?;
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{line}")?;
+    stdout.flush()?;
+    Ok(())
 }
 
 fn configure(config: &ChannelConfig) -> Result<ConfiguredChannel> {

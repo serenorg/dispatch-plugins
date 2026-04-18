@@ -2,10 +2,12 @@ use dispatch_channel_protocol as proto;
 use serde::{Deserialize, Serialize};
 
 pub use proto::{
-    AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities, ConfiguredChannel,
-    DeliveryReceipt, HealthReport, InboundActor, InboundAttachment, InboundConversationRef,
-    InboundEventEnvelope, InboundMessage, IngressMode, IngressState, OutboundMessageEnvelope,
-    PluginResponse, StatusAcceptance, StatusFrame, StatusKind, ThreadingModel, plugin_error,
+    AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities,
+    ChannelEventNotification, ConfiguredChannel, DeliveryReceipt, HealthReport, InboundActor,
+    InboundAttachment, InboundConversationRef, InboundEventEnvelope, InboundMessage, IngressMode,
+    IngressState, OutboundMessageEnvelope, PluginNotificationEnvelope, PluginResponse,
+    StatusAcceptance, StatusFrame, StatusKind, ThreadingModel, notification_to_jsonrpc,
+    parse_jsonrpc_request, plugin_error, response_to_jsonrpc,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

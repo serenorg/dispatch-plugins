@@ -7,7 +7,8 @@ pub use proto::{
     ConfiguredChannel, DeliveryReceipt, HealthReport, InboundActor, InboundAttachment,
     InboundConversationRef, InboundEventEnvelope, InboundMessage, IngressCallbackReply,
     IngressMode, IngressPayload, IngressState, OutboundAttachment, PluginResponse,
-    StatusAcceptance, StatusFrame, StatusKind, ThreadingModel, plugin_error,
+    StatusAcceptance, StatusFrame, StatusKind, ThreadingModel, parse_jsonrpc_request, plugin_error,
+    response_to_jsonrpc,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

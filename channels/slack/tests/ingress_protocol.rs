@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -9,6 +9,42 @@ use tungstenite::{
     Message, accept_hdr,
     handshake::server::{Request, Response},
 };
+
+fn request_method(kind: &str) -> &'static str {
+    match kind {
+        "capabilities" => "channel.capabilities",
+        "configure" => "channel.configure",
+        "health" => "channel.health",
+        "start_ingress" => "channel.start_ingress",
+        "stop_ingress" => "channel.stop_ingress",
+        "ingress_event" => "channel.ingress_event",
+        "deliver" => "channel.deliver",
+        "push" => "channel.push",
+        "status" => "channel.status",
+        "shutdown" => "channel.shutdown",
+        other => panic!("unsupported request kind `{other}`"),
+    }
+}
+
+fn wrap_request(request: Value) -> Value {
+    let protocol_version = request["protocol_version"].clone();
+    let mut params = request["request"]
+        .as_object()
+        .expect("request object")
+        .clone();
+    let kind = params
+        .get("kind")
+        .and_then(Value::as_str)
+        .expect("request kind")
+        .to_string();
+    params.insert("protocol_version".to_string(), protocol_version);
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": request_method(&kind),
+        "params": Value::Object(params),
+    })
+}
 
 fn run_request(request: Value) -> Value {
     run_request_with_env(request, BTreeMap::new())
@@ -24,7 +60,7 @@ fn run_request_with_env(request: Value, envs: BTreeMap<String, String>) -> Value
         .expect("spawn channel-slack");
 
     let mut stdin = child.stdin.take().expect("child stdin");
-    writeln!(stdin, "{request}").expect("write request");
+    writeln!(stdin, "{}", wrap_request(request)).expect("write request");
     drop(stdin);
 
     let output = child.wait_with_output().expect("wait for child");
@@ -40,7 +76,85 @@ fn run_request_with_env(request: Value, envs: BTreeMap<String, String>) -> Value
         .lines()
         .find(|line| !line.trim().is_empty())
         .expect("response line");
-    serde_json::from_str(line).expect("parse response")
+    let response: Value = serde_json::from_str(line).expect("parse response");
+    response["result"].clone()
+}
+
+fn read_message(reader: &mut BufReader<std::process::ChildStdout>) -> Value {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line).expect("read child stdout");
+        assert!(
+            bytes > 0,
+            "slack child exited before emitting expected output"
+        );
+        if !line.trim().is_empty() {
+            return serde_json::from_str(line.trim()).expect("parse plugin json");
+        }
+    }
+}
+
+fn run_start_ingress_cycle(config: Value, envs: BTreeMap<String, String>) -> (Value, Value) {
+    let binary = std::env::var("CARGO_BIN_EXE_channel-slack").expect("channel-slack binary path");
+    let mut child = Command::new(binary)
+        .envs(envs)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn channel-slack");
+
+    let mut stdin = child.stdin.take().expect("child stdin");
+    writeln!(
+        stdin,
+        "{}",
+        wrap_request(json!({
+            "protocol_version": 1,
+            "request": {
+                "kind": "start_ingress",
+                "config": config,
+                "state": null
+            }
+        }))
+    )
+    .expect("write start_ingress request");
+
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut response = None;
+    let mut notification = None;
+    for _ in 0..4 {
+        let message = read_message(&mut reader);
+        if let Some(result) = message.get("result") {
+            response = Some(result.clone());
+        } else if message["method"] == "channel.event" {
+            notification = Some(message["params"].clone());
+        }
+        if response.is_some() && notification.is_some() {
+            break;
+        }
+    }
+
+    writeln!(
+        stdin,
+        "{}",
+        wrap_request(json!({
+            "protocol_version": 1,
+            "request": { "kind": "shutdown" }
+        }))
+    )
+    .expect("write shutdown request");
+    drop(stdin);
+    let status = child.wait().expect("wait for child");
+    assert!(
+        status.success(),
+        "channel-slack exited unsuccessfully: {status}"
+    );
+
+    (
+        response.expect("start_ingress response"),
+        notification.expect("channel.event notification"),
+    )
 }
 
 fn serve_slack_socket_mode_once(event_payload: Value, expected_app_token: &str) -> String {
@@ -181,7 +295,7 @@ fn ingress_event_round_trips_slack_message_event() {
 }
 
 #[test]
-fn poll_ingress_round_trips_slack_socket_mode_event() {
+fn start_ingress_emits_slack_socket_mode_event() {
     let app_token_env = "SLACK_TEST_APP_TOKEN_SOCKET";
     let app_token = "xapp-test-token";
     let base_url = serve_slack_socket_mode_once(
@@ -205,21 +319,15 @@ fn poll_ingress_round_trips_slack_socket_mode_event() {
         app_token,
     );
 
-    let response = run_request_with_env(
+    let (response, notification) = run_start_ingress_cycle(
         json!({
-            "protocol_version": 1,
-            "request": {
-                "kind": "poll_ingress",
-                "config": {
-                    "app_token_env": app_token_env,
-                    "poll_timeout_secs": 5,
-                    "webhook_public_url": null,
-                    "default_channel_id": null,
-                    "bot_token_env": null,
-                    "signing_secret_env": null,
-                    "incoming_webhook_url_env": null
-                }
-            }
+            "app_token_env": app_token_env,
+            "poll_timeout_secs": 5,
+            "webhook_public_url": null,
+            "default_channel_id": null,
+            "bot_token_env": null,
+            "signing_secret_env": null,
+            "incoming_webhook_url_env": null
         }),
         BTreeMap::from([
             (app_token_env.to_string(), app_token.to_string()),
@@ -227,11 +335,11 @@ fn poll_ingress_round_trips_slack_socket_mode_event() {
         ]),
     );
 
-    assert_eq!(response["kind"], "ingress_events_received");
-    assert!(response["callback_reply"].is_null());
+    assert_eq!(response["kind"], "ingress_started");
     assert_eq!(response["state"]["mode"], "polling");
     assert_eq!(response["state"]["metadata"]["mode"], "socket_mode");
-    let events = response["events"].as_array().expect("events array");
+    assert_eq!(notification["protocol_version"], 1);
+    let events = notification["events"].as_array().expect("events array");
     assert_eq!(events.len(), 1);
 
     let event = &events[0];
