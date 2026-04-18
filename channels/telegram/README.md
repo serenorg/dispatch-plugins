@@ -62,14 +62,70 @@ Optional:
 
 ## Setup
 
-To obtain a Telegram bot token:
+Telegram bot setup:
 
 1. Open Telegram and start a chat with `@BotFather`.
 2. Run `/newbot` and follow the prompts to create the bot.
 3. Copy the bot token that BotFather returns.
 4. Export it as `TELEGRAM_BOT_TOKEN`.
 5. If you want Telegram to send the webhook secret-token header, generate a
-    secret value and export it as `TELEGRAM_WEBHOOK_SECRET`.
+  secret value and export it as `TELEGRAM_WEBHOOK_SECRET`.
+
+Webhook mode setup:
+
+1. Choose a public HTTPS base URL that Telegram can reach.
+2. Set `webhook_public_url` in the plugin config.
+3. Optionally set `webhook_path` if you do not want the default
+  `/telegram/updates`.
+4. Export `TELEGRAM_WEBHOOK_SECRET` if you want Telegram to include the
+  `X-Telegram-Bot-Api-Secret-Token` header.
+5. Call `start_ingress` through Dispatch. The plugin will register the webhook
+  with Telegram by calling `setWebhook`.
+
+Polling mode setup:
+
+1. Set `ingress_mode = "polling"` in the plugin config.
+2. Set `poll_timeout_secs` if you want a non-default long-poll timeout.
+3. Call `start_ingress`. The plugin will clear any webhook registration with
+  Telegram and return polling state.
+
+Getting destination ids:
+
+- private chats use the numeric chat id from an inbound event
+- channels and groups usually use negative ids such as `-1001234567890`
+- forum topics use `default_message_thread_id` for the topic id
+
+Minimal polling config:
+
+```toml
+ingress_mode = "polling"
+default_chat_id = "-1001234567890"
+poll_timeout_secs = 25
+```
+
+Minimal webhook config:
+
+```toml
+ingress_mode = "webhook"
+webhook_public_url = "https://example.com"
+webhook_path = "/telegram/updates"
+default_chat_id = "-1001234567890"
+```
+
+Environment example:
+
+```bash
+export TELEGRAM_BOT_TOKEN="123456:ABC..."
+export TELEGRAM_WEBHOOK_SECRET="replace-me"
+```
+
+Common failure modes:
+
+- `getMe` failures usually mean the bot token is invalid.
+- `setWebhook` failures usually mean the public URL is not reachable by
+  Telegram or is not HTTPS.
+- missing inbound events in polling mode usually mean the bot still has a
+  webhook registered; rerun `start_ingress` with `ingress_mode = "polling"`.
 
 ## Manifest
 

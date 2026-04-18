@@ -71,13 +71,67 @@ Typical setup:
 4. Set `account` in the plugin config when the backend requires an explicit
   account selector for polling and sending.
 
+One practical Docker setup:
+
+```bash
+mkdir -p "$HOME/.local/share/signal-cli"
+docker run -d --name signal-api --restart=always \
+  -p 8080:8080 \
+  -v "$HOME/.local/share/signal-cli:/home/.local/share/signal-cli" \
+  -e MODE=json-rpc \
+  bbernhard/signal-cli-rest-api
+```
+
+Linking a device:
+
+1. Open the QR code endpoint exposed by `signal-cli-rest-api`, for example
+  `http://127.0.0.1:8080/v1/qrcodelink?device_name=dispatch`.
+2. In the Signal mobile app, open `Settings -> Linked devices`.
+3. Scan the QR code.
+4. Confirm that `GET /v1/about` returns the expected mode and version from the
+  backend.
+
+Choosing a backend mode:
+
+- `normal` is the safest baseline and works everywhere
+- `native` reduces startup overhead for each HTTP receive/send call
+- `json-rpc` keeps a daemon process alive and gives the best receive latency;
+  this plugin uses websocket-backed receive in that mode
+
+Minimal config:
+
+```toml
+base_url = "http://127.0.0.1:8080"
+account = "+15551234567"
+poll_timeout_secs = 30
+default_recipient = "+15557654321"
+```
+
+Environment example:
+
+```bash
+export SIGNAL_RPC_URL="http://127.0.0.1:8080"
+```
+
 Notes:
 
 - `poll_ingress` adapts to the upstream backend mode automatically:
   - `native` and `normal` use the documented HTTP receive endpoint
   - `json-rpc` uses the documented websocket receive endpoint
+- the plugin still exposes the same Dispatch `poll_ingress` request in both
+  cases; only the upstream Signal transport changes
 - `deliver` and `status` target the upstream REST API routes documented by
   `signal-cli-rest-api`, not the older `/api/v1/rpc` wrapper contract.
+
+Common failure modes:
+
+- `signal polling ingress requires config.account` means the plugin does not
+  know which Signal identity to poll.
+- connection errors against `/v1/about` usually mean the REST API container is
+  not running or `base_url` is wrong.
+- websocket receive issues in `json-rpc` mode usually mean the backend is not
+  actually running in `json-rpc` mode or the plugin binary was built without
+  websocket TLS support.
 
 ## Build
 

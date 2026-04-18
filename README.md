@@ -29,3 +29,18 @@ Dispatch extension projects collected under a single parent directory.
 - The protocol surface may still change as Dispatch hardens the channel
   runtime, so it should not yet be treated as a stable Dispatch core
   compatibility contract.
+
+## Ingress modes in practice
+
+`poll_ingress` is the Dispatch-side contract. Individual plugins may satisfy
+that contract with different upstream transports:
+
+- `channel-telegram` uses Bot API polling or webhooks.
+- `channel-signal` uses HTTP receive in `native` / `normal` mode and websocket
+  receive in `json-rpc` mode.
+- `channel-slack` uses webhook ingress for the Events API and Socket Mode for
+  polling.
+
+That separation is intentional: Dispatch polls the plugin, and the plugin is
+free to translate that into the upstream transport that best matches the
+platform.
