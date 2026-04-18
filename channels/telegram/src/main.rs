@@ -812,7 +812,7 @@ fn validate_ingress_secret(
         )));
     };
 
-    if actual_secret != expected_secret {
+    if !constant_time_eq(actual_secret.as_bytes(), expected_secret.as_bytes()) {
         return Ok(Some(callback_reply(
             403,
             "telegram webhook secret token mismatch",
@@ -820,6 +820,24 @@ fn validate_ingress_secret(
     }
 
     Ok(None)
+}
+
+/// Constant-time byte comparison for secret-sensitive equality checks.
+///
+/// Telegram's webhook uses a shared secret header (`X-Telegram-Bot-Api-Secret-
+/// Token`), so the comparison against the configured secret must not leak
+/// length or content via timing. We only need a minimal primitive here and do
+/// not want a new dependency, so we inline a fold-based implementation and
+/// guard against constant-folding with `std::hint::black_box`.
+fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
+    let mut diff = lhs.len() ^ rhs.len();
+    let max_len = lhs.len().max(rhs.len());
+    for idx in 0..max_len {
+        let a = lhs.get(idx).copied().unwrap_or_default();
+        let b = rhs.get(idx).copied().unwrap_or_default();
+        diff |= usize::from(a ^ b);
+    }
+    std::hint::black_box(diff) == 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1665,6 +1683,12 @@ mod tests {
         let reply = callback_reply.expect("callback reply");
         assert_eq!(reply.status, 403);
         assert!(reply.body.contains("mismatch"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_lengths() {
+        assert!(!constant_time_eq(b"secret", b"secret!"));
+        assert!(!constant_time_eq(b"secret!", b"secret"));
     }
 
     #[test]
