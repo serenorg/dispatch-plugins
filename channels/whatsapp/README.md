@@ -60,6 +60,20 @@ Useful config fields:
 - `webhook_public_url` - public base URL for ingress declaration
 - `webhook_path` - ingress route path, default `/whatsapp/webhook`
 
+## Setup
+
+To obtain the required WhatsApp Cloud API credentials:
+
+1. Create a Meta app with WhatsApp enabled in the Meta developer console.
+2. Generate or copy a WhatsApp Cloud API access token.
+3. Export it as `WHATSAPP_ACCESS_TOKEN`.
+4. Copy the WhatsApp phone number id for the sending number and set it as
+    `phone_number_id` in the plugin config.
+5. If you are configuring webhook verification, choose a verify token and
+    export it as `WHATSAPP_VERIFY_TOKEN`.
+6. If you want to validate `X-Hub-Signature-256`, copy the app secret and
+    export it as `WHATSAPP_APP_SECRET`.
+
 ## Protocol
 
 Requests are sent as JSONL on stdin:

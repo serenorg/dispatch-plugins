@@ -52,6 +52,18 @@ Ingress verification when using `start_ingress`:
 - `DISCORD_INTERACTION_PUBLIC_KEY` - optional at install time, required when
   the configured ingress mode relies on Discord interaction webhooks
 
+## Setup
+
+To obtain the required Discord credentials:
+
+1. Create an application in the Discord Developer Portal.
+2. Add a bot user to the application.
+3. Copy the bot token and export it as `DISCORD_BOT_TOKEN`.
+4. If you are using interaction webhooks, copy the application's public key
+    and export it as `DISCORD_INTERACTION_PUBLIC_KEY`.
+5. Install the bot into the target server with the permissions needed to post
+    messages in the destination channel or thread.
+
 ## Manifest
 
 The Dispatch channel manifest is stored in `channel-plugin.json`. The host can

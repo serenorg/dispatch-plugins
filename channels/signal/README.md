@@ -54,6 +54,18 @@ backend `receive` call is scoped to a specific account.
 Recipients may be plain phone numbers, `group:<id>`, `username:<value>`, or
 prefixed forms like `signal:+15551234567`.
 
+## Setup
+
+This plugin expects a running `signal-cli` REST or JSON-RPC backend.
+
+Typical setup:
+
+1. Provision or link a Signal account with `signal-cli`.
+2. Start a `signal-cli` REST or JSON-RPC service that exposes the account.
+3. Point the plugin at that service with `base_url` or `SIGNAL_RPC_URL`.
+4. Set `account` in the plugin config when the backend requires an explicit
+    account selector for polling and sending.
+
 ## Build
 
 ```bash

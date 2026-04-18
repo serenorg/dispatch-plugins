@@ -58,6 +58,16 @@ Useful config fields:
 - `webhook_public_url` - public base URL used for ingress declaration
 - `webhook_path` - ingress route path, default `/twilio/sms`
 
+## Setup
+
+To obtain the required Twilio credentials:
+
+1. Create or open a Twilio project in the Twilio Console.
+2. Copy the Account SID and export it as `TWILIO_ACCOUNT_SID`.
+3. Copy the Auth Token and export it as `TWILIO_AUTH_TOKEN`.
+4. Provision a Twilio phone number or Messaging Service for outbound SMS.
+5. Set `from_number` or `messaging_service_sid` in the plugin config.
+
 ## Protocol
 
 Requests are sent as JSONL on stdin:

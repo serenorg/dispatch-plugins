@@ -60,6 +60,17 @@ Optional:
 - `drop_pending_updates` - request Telegram to drop queued updates when
   switching ingress mode
 
+## Setup
+
+To obtain a Telegram bot token:
+
+1. Open Telegram and start a chat with `@BotFather`.
+2. Run `/newbot` and follow the prompts to create the bot.
+3. Copy the bot token that BotFather returns.
+4. Export it as `TELEGRAM_BOT_TOKEN`.
+5. If you want Telegram to send the webhook secret-token header, generate a
+    secret value and export it as `TELEGRAM_WEBHOOK_SECRET`.
+
 ## Manifest
 
 The Dispatch channel manifest is stored in `channel-plugin.json`. The host can

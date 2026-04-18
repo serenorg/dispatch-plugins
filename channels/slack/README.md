@@ -57,6 +57,26 @@ Useful config fields:
 - `webhook_public_url` - public base URL used for ingress declaration
 - `webhook_path` - ingress route path, default `/slack/events`
 
+## Setup
+
+Slack supports two outbound auth paths in this plugin.
+
+Bot-token mode:
+
+1. Create a Slack app in the Slack API dashboard.
+2. Enable a bot user for the app.
+3. Install the app into the target workspace.
+4. Copy the bot token and export it as `SLACK_BOT_TOKEN`.
+5. If you are using Events API ingress, copy the signing secret and export it
+    as `SLACK_SIGNING_SECRET`.
+
+Incoming-webhook mode:
+
+1. Create a Slack app and enable incoming webhooks.
+2. Install the app into the target workspace.
+3. Create an incoming webhook for the target channel.
+4. Export the webhook URL as `SLACK_INCOMING_WEBHOOK_URL`.
+
 ## Protocol
 
 Requests are sent as JSONL on stdin:
