@@ -548,12 +548,15 @@ fn validate_twilio_signature(
     let mut mac =
         Hmac::<Sha1>::new_from_slice(auth_token.as_bytes()).context("invalid Twilio auth token")?;
     mac.update(signing_input.as_bytes());
-    let expected_signature = mac.finalize().into_bytes();
-    let provided_signature = BASE64_STANDARD
-        .decode(signature_header)
-        .map_err(|_| anyhow!("invalid X-Twilio-Signature header"))?;
+    let provided_signature = match BASE64_STANDARD.decode(signature_header.trim()) {
+        Ok(signature) => signature,
+        Err(_) => return Ok(Some(callback_reply(403, "twilio signature mismatch"))),
+    };
 
-    if provided_signature != expected_signature.as_slice() {
+    // `Mac::verify_slice` performs a constant-time comparison against the
+    // computed MAC tag, which prevents leaking the expected signature via
+    // timing side channels during HMAC verification.
+    if mac.verify_slice(&provided_signature).is_err() {
         return Ok(Some(callback_reply(403, "twilio signature mismatch")));
     }
 
@@ -837,6 +840,57 @@ mod tests {
 
         assert_eq!(reply.status, 403);
         assert_eq!(reply.body, "twilio signature mismatch");
+    }
+
+    #[test]
+    fn malformed_signature_header_is_rejected() {
+        let mut payload = base_payload("POST");
+        payload.trust_verified = false;
+        payload.body =
+            "MessageSid=SM123&From=%2B15550001111&To=%2B15550002222&Body=hello".to_string();
+        payload.headers.insert(
+            HEADER_X_TWILIO_SIGNATURE.to_string(),
+            "%%% definitely not base64 %%%".to_string(),
+        );
+
+        let reply = validate_twilio_signature(
+            "secret",
+            &payload,
+            &incoming_params(&payload),
+            "https://example.com/twilio/sms".to_string(),
+        )
+        .expect("validate signature")
+        .expect("rejection reply");
+
+        assert_eq!(reply.status, 403);
+        assert_eq!(reply.body, "twilio signature mismatch");
+    }
+
+    #[test]
+    fn signature_with_surrounding_whitespace_is_accepted() {
+        let mut payload = base_payload("POST");
+        payload.trust_verified = false;
+        payload.body =
+            "MessageSid=SM123&From=%2B15550001111&To=%2B15550002222&Body=hello".to_string();
+        let params = incoming_params(&payload);
+        let request_url = "https://example.com/twilio/sms".to_string();
+        let mut signing_input = request_url.clone();
+        for (name, value) in &params {
+            signing_input.push_str(name);
+            signing_input.push_str(value);
+        }
+        let mut mac = Hmac::<Sha1>::new_from_slice(b"secret").expect("valid HMAC key");
+        mac.update(signing_input.as_bytes());
+        let signature = BASE64_STANDARD.encode(mac.finalize().into_bytes());
+        payload.headers.insert(
+            HEADER_X_TWILIO_SIGNATURE.to_string(),
+            format!("  {signature}  "),
+        );
+
+        let reply = validate_twilio_signature("secret", &payload, &params, request_url)
+            .expect("validate signature");
+
+        assert!(reply.is_none());
     }
 
     #[test]
