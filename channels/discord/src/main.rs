@@ -66,6 +66,13 @@ const DISCORD_STATUS_TEXT: &str = "discord_status_text";
 const HEADER_X_SIGNATURE_ED25519: &str = "X-Signature-Ed25519";
 const HEADER_X_SIGNATURE_TIMESTAMP: &str = "X-Signature-Timestamp";
 
+/// Accept Discord interaction signatures whose timestamp is within this many
+/// seconds of the host clock. The ED25519 signature covers the timestamp, but
+/// the timestamp itself is not bounded by the signature — without a freshness
+/// window, an attacker who captured a valid interaction could replay it
+/// indefinitely. Discord's own documentation recommends a small window.
+const DISCORD_MAX_SIGNATURE_AGE_SECS: i64 = 300;
+
 const INTERACTION_TYPE_PING: u8 = 1;
 const INTERACTION_TYPE_APPLICATION_COMMAND: u8 = 2;
 const INTERACTION_TYPE_MESSAGE_COMPONENT: u8 = 3;
@@ -779,6 +786,22 @@ fn validate_discord_signature(
         )));
     };
 
+    // Reject signatures whose timestamp is too far from now. Discord sends
+    // Unix epoch seconds; treat unparseable values as untrusted.
+    let Ok(signature_ts) = timestamp.parse::<i64>() else {
+        return Ok(Some(callback_reply(
+            401,
+            "discord request timestamp is not a valid unix epoch",
+        )));
+    };
+    let now = Timestamp::now().as_second();
+    if now.abs_diff(signature_ts) > DISCORD_MAX_SIGNATURE_AGE_SECS as u64 {
+        return Ok(Some(callback_reply(
+            401,
+            "discord request timestamp outside the accepted window",
+        )));
+    }
+
     let public_key_bytes =
         hex::decode(public_key_hex).context("invalid Discord interaction public key")?;
     let public_key_bytes: [u8; 32] = public_key_bytes
@@ -1369,7 +1392,7 @@ mod tests {
             .insert(HEADER_X_SIGNATURE_ED25519.to_string(), "00".repeat(64));
         payload.headers.insert(
             HEADER_X_SIGNATURE_TIMESTAMP.to_string(),
-            "1712878800".to_string(),
+            Timestamp::now().as_second().to_string(),
         );
 
         let reply = validate_discord_signature("11".repeat(32).as_str(), &payload)
@@ -1383,7 +1406,7 @@ mod tests {
     #[test]
     fn valid_signature_is_accepted() {
         let body = r#"{"id":"1","application_id":"app-1","type":1}"#;
-        let timestamp = "1712878800";
+        let timestamp = Timestamp::now().as_second().to_string();
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let verify_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
         let signature = signing_key.sign(format!("{timestamp}{body}").as_bytes());
@@ -1394,15 +1417,105 @@ mod tests {
             HEADER_X_SIGNATURE_ED25519.to_string(),
             hex::encode(signature.to_bytes()),
         );
-        payload.headers.insert(
-            HEADER_X_SIGNATURE_TIMESTAMP.to_string(),
-            timestamp.to_string(),
-        );
+        payload
+            .headers
+            .insert(HEADER_X_SIGNATURE_TIMESTAMP.to_string(), timestamp);
 
         let reply =
             validate_discord_signature(&verify_key_hex, &payload).expect("validate signature");
 
         assert!(reply.is_none());
+    }
+
+    #[test]
+    fn stale_timestamp_is_rejected() {
+        let body = r#"{"id":"1","application_id":"app-1","type":1}"#;
+        // Sign with a timestamp well outside the freshness window so we cannot
+        // be replayed even with a cryptographically valid signature.
+        let stale_timestamp =
+            (Timestamp::now().as_second() - DISCORD_MAX_SIGNATURE_AGE_SECS - 60).to_string();
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let verify_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+        let signature = signing_key.sign(format!("{stale_timestamp}{body}").as_bytes());
+
+        let mut payload = base_payload(body);
+        payload.trust_verified = false;
+        payload.headers.insert(
+            HEADER_X_SIGNATURE_ED25519.to_string(),
+            hex::encode(signature.to_bytes()),
+        );
+        payload
+            .headers
+            .insert(HEADER_X_SIGNATURE_TIMESTAMP.to_string(), stale_timestamp);
+
+        let reply = validate_discord_signature(&verify_key_hex, &payload)
+            .expect("validate signature")
+            .expect("rejection reply");
+
+        assert_eq!(reply.status, 401);
+        assert_eq!(
+            reply.body,
+            "discord request timestamp outside the accepted window"
+        );
+    }
+
+    #[test]
+    fn future_timestamp_outside_window_is_rejected() {
+        let body = r#"{"id":"1","application_id":"app-1","type":1}"#;
+        let future_timestamp =
+            (Timestamp::now().as_second() + DISCORD_MAX_SIGNATURE_AGE_SECS + 60).to_string();
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let verify_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+        let signature = signing_key.sign(format!("{future_timestamp}{body}").as_bytes());
+
+        let mut payload = base_payload(body);
+        payload.trust_verified = false;
+        payload.headers.insert(
+            HEADER_X_SIGNATURE_ED25519.to_string(),
+            hex::encode(signature.to_bytes()),
+        );
+        payload
+            .headers
+            .insert(HEADER_X_SIGNATURE_TIMESTAMP.to_string(), future_timestamp);
+
+        let reply = validate_discord_signature(&verify_key_hex, &payload)
+            .expect("validate signature")
+            .expect("rejection reply");
+
+        assert_eq!(reply.status, 401);
+        assert_eq!(
+            reply.body,
+            "discord request timestamp outside the accepted window"
+        );
+    }
+
+    #[test]
+    fn absurdly_negative_timestamp_is_rejected_without_panicking() {
+        let body = r#"{"id":"1","application_id":"app-1","type":1}"#;
+        let timestamp = i64::MIN.to_string();
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let verify_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+        let signature = signing_key.sign(format!("{timestamp}{body}").as_bytes());
+
+        let mut payload = base_payload(body);
+        payload.trust_verified = false;
+        payload.headers.insert(
+            HEADER_X_SIGNATURE_ED25519.to_string(),
+            hex::encode(signature.to_bytes()),
+        );
+        payload
+            .headers
+            .insert(HEADER_X_SIGNATURE_TIMESTAMP.to_string(), timestamp);
+
+        let reply = validate_discord_signature(&verify_key_hex, &payload)
+            .expect("validate signature")
+            .expect("rejection reply");
+
+        assert_eq!(reply.status, 401);
+        assert_eq!(
+            reply.body,
+            "discord request timestamp outside the accepted window"
+        );
     }
 
     #[test]
