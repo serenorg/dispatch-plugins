@@ -14,5 +14,5 @@ name = "dispatch_channel_runtime"
 path = "src/lib.rs"
 
 [dependencies]
-dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", rev = "e6a1c9a6c7f79507ffc0c7bcac8670ad47bd655d" }
+dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", rev = "0783dabd10895ba19312b53614972ed78b7b58f9" }
 thiserror = "2"

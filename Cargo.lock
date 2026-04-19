@@ -427,7 +427,7 @@ dependencies = [
 [[package]]
 name = "dispatch-channel-protocol"
 version = "0.3.0"
-source = "git+https://github.com/serenorg/dispatch?rev=e6a1c9a6c7f79507ffc0c7bcac8670ad47bd655d#e6a1c9a6c7f79507ffc0c7bcac8670ad47bd655d"
+source = "git+https://github.com/serenorg/dispatch?rev=0783dabd10895ba19312b53614972ed78b7b58f9#0783dabd10895ba19312b53614972ed78b7b58f9"
 dependencies = [
  "dispatch-plugin-rpc",
  "serde",
@@ -455,10 +455,11 @@ dependencies = [
 [[package]]
 name = "dispatch-plugin-rpc"
 version = "0.3.0"
-source = "git+https://github.com/serenorg/dispatch?rev=e6a1c9a6c7f79507ffc0c7bcac8670ad47bd655d#e6a1c9a6c7f79507ffc0c7bcac8670ad47bd655d"
+source = "git+https://github.com/serenorg/dispatch?rev=0783dabd10895ba19312b53614972ed78b7b58f9#0783dabd10895ba19312b53614972ed78b7b58f9"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]

@@ -14,7 +14,7 @@ path = "src/lib.rs"
 anyhow = "1"
 base64 = "0.22"
 dispatch-channel-runtime = { path = "../dispatch-channel-runtime" }
-dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", rev = "e6a1c9a6c7f79507ffc0c7bcac8670ad47bd655d" }
+dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", rev = "0783dabd10895ba19312b53614972ed78b7b58f9" }
 imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
 jiff = "0.2"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }

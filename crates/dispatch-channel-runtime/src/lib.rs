@@ -1,5 +1,5 @@
 use dispatch_channel_protocol::{
-    CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelEventNotification, IngressState,
+    CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelEventNotification, IngressState, JsonRpcMessageError,
     PluginNotificationEnvelope, PluginResponse, notification_to_jsonrpc,
 };
 use std::{
@@ -18,7 +18,7 @@ pub enum RuntimeError {
     #[error("stdout lock poisoned")]
     StdoutLockPoisoned,
     #[error("failed to encode channel event notification: {0}")]
-    NotificationEncode(String),
+    NotificationEncode(JsonRpcMessageError),
     #[error(transparent)]
     Io(#[from] io::Error),
 }

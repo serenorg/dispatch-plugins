@@ -120,12 +120,14 @@ pub type EmailResult<T> = std::result::Result<T, EmailCoreError>;
 pub enum EmailCoreError {
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error("failed to read stdin: {0}")]
+    ReadStdin(io::Error),
     #[error(transparent)]
     Runtime(#[from] dispatch_channel_runtime::RuntimeError),
     #[error("failed to parse channel request: {0}")]
-    RequestParse(String),
+    RequestParse(proto::JsonRpcMessageError),
     #[error("failed to encode channel response: {0}")]
-    ResponseEncode(String),
+    ResponseEncode(proto::JsonRpcMessageError),
     #[error("configuration error: {0}")]
     Configuration(String),
     #[error("health check failed: {0}")]
@@ -171,7 +173,7 @@ pub fn run<P: EmailPreset>() -> EmailResult<()> {
     let mut ingress_worker: Option<IngressWorker> = None;
 
     for line in stdin.lines() {
-        let line = line?;
+        let line = line.map_err(EmailCoreError::ReadStdin)?;
         if line.trim().is_empty() {
             continue;
         }
