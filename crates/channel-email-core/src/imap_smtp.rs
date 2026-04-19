@@ -37,6 +37,8 @@ pub struct OutgoingEmail {
     pub from_email: String,
     pub from_name: Option<String>,
     pub to: String,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
     pub subject: String,
     pub body_text: String,
     pub in_reply_to: Option<String>,
@@ -176,6 +178,19 @@ pub fn send_email<P: EmailPreset>(
         .to(to)
         .subject(&email.subject)
         .message_id(Some(message_id.clone()));
+
+    for cc in &email.cc {
+        let parsed: Mailbox = cc
+            .parse()
+            .with_context(|| format!("invalid Cc address `{cc}`"))?;
+        builder = builder.cc(parsed);
+    }
+    for bcc in &email.bcc {
+        let parsed: Mailbox = bcc
+            .parse()
+            .with_context(|| format!("invalid Bcc address `{bcc}`"))?;
+        builder = builder.bcc(parsed);
+    }
 
     if let Some(in_reply_to) = &email.in_reply_to {
         builder = builder.in_reply_to(in_reply_to.clone());

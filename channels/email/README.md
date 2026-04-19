@@ -30,7 +30,18 @@ Behavior:
 - inbound subjects are surfaced as `thread_id` so Dispatch replies can preserve
   the thread subject without host changes
 - inbound attachment metadata is surfaced on the normalized event
+- inbound message metadata includes `body_source = text | html | subject` so
+  downstream consumers can tell whether the message body came from a real
+  text/plain part, HTML fallback, or subject-only fallback
 - outbound attachments require `data_base64`
+- outbound deliveries accept per-message `cc` / `bcc` metadata (comma-separated
+  address lists), with optional `default_cc` / `default_bcc` fallbacks on the
+  channel config
+- inbound messages with only an HTML body are converted to plaintext with a
+  lightweight HTML stripper so the agent always sees readable content
+- mailing-list and auto-responder traffic is suppressed at ingress via the
+  `Auto-Submitted`, `Precedence`, and `List-Unsubscribe` headers so agents do
+  not reply to bounces, digests, or bulk mail
 
 Not implemented:
 
@@ -86,6 +97,8 @@ Useful config fields:
 - `smtp_from_email` - outbound sender address; falls back to `smtp_username`
 - `smtp_from_name` - optional display name for the From header
 - `default_recipient` - fallback destination for manual pushes
+- `default_cc` - comma-separated fallback Cc list for manual pushes
+- `default_bcc` - comma-separated fallback Bcc list for manual pushes
 - `default_subject` - fallback subject for manual pushes
 - `poll_interval_secs` - IMAP polling interval, clamped to at least 5 seconds
 
@@ -167,6 +180,22 @@ format, see Dispatch's `docs/extensions.md`.
 - inbound `message.id` is the RFC5322 `Message-ID` when present
 - Dispatch-generated replies preserve `conversation_id`, `thread_id`, and
   `reply_to_message_id`, which lets the plugin rebuild a threaded SMTP reply
+- to Cc or Bcc additional recipients on a push or reply, set
+  `message.metadata.cc` / `message.metadata.bcc` to comma-separated address
+  lists (each entry may be `"user@example.com"` or `"Name <user@example.com>"`)
+
+## Notes on inbound filtering
+
+Messages are dropped silently (no event emitted) when:
+
+- the sender address matches any of `imap_username`, `smtp_username`, or
+  `smtp_from_email` (self-authored loop prevention)
+- the message carries `Auto-Submitted` set to anything other than `no`
+- the message carries `Precedence` of `bulk`, `list`, `junk`, or `auto_reply`
+- the message carries a `List-Unsubscribe` header
+
+These heuristics match the long-standing conventions used to avoid replying
+to bounces, vacation auto-replies, and mailing-list traffic.
 
 ## License
 
