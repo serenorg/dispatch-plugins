@@ -15,6 +15,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use thiserror::Error;
 
 mod imap_smtp;
 
@@ -113,6 +114,27 @@ pub struct ChannelConfig {
 pub type OutboundMessage = OutboundMessageEnvelope;
 pub type PluginRequest = proto::PluginRequest<ChannelConfig, OutboundMessage>;
 pub type PluginRequestEnvelope = proto::PluginRequestEnvelope<PluginRequest>;
+pub type EmailResult<T> = std::result::Result<T, EmailCoreError>;
+
+#[derive(Debug, Error)]
+pub enum EmailCoreError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Runtime(#[from] dispatch_channel_runtime::RuntimeError),
+    #[error("failed to parse channel request: {0}")]
+    RequestParse(String),
+    #[error("failed to encode channel response: {0}")]
+    ResponseEncode(String),
+    #[error("configuration error: {0}")]
+    Configuration(String),
+    #[error("health check failed: {0}")]
+    Health(String),
+    #[error("failed to resolve outgoing email: {0}")]
+    ResolveOutgoingEmail(String),
+    #[error("failed to build inbound email event: {0}")]
+    BuildInboundEvent(String),
+}
 
 pub trait EmailPreset: Send + Sync + 'static {
     const PLUGIN_ID: &'static str;
@@ -143,19 +165,19 @@ pub fn capabilities<P: EmailPreset>() -> ChannelCapabilities {
     }
 }
 
-pub fn run<P: EmailPreset>() -> Result<()> {
+pub fn run<P: EmailPreset>() -> EmailResult<()> {
     let stdin = io::stdin().lock();
     let stdout_lock = Arc::new(Mutex::new(()));
     let mut ingress_worker: Option<IngressWorker> = None;
 
     for line in stdin.lines() {
-        let line = line.context("failed to read stdin")?;
+        let line = line?;
         if line.trim().is_empty() {
             continue;
         }
 
-        let (request_id, envelope): (_, PluginRequestEnvelope) = parse_jsonrpc_request(&line)
-            .map_err(|error| anyhow!("failed to parse channel request: {error}"))?;
+        let (request_id, envelope): (_, PluginRequestEnvelope) =
+            parse_jsonrpc_request(&line).map_err(EmailCoreError::RequestParse)?;
         let should_exit = matches!(envelope.request, PluginRequest::Shutdown);
 
         let response = match handle_request::<P>(&envelope, &stdout_lock, &mut ingress_worker) {
@@ -163,7 +185,8 @@ pub fn run<P: EmailPreset>() -> Result<()> {
             Err(error) => plugin_error("internal_error", error.to_string()),
         };
 
-        let json = response_to_jsonrpc(&request_id, &response).map_err(|error| anyhow!(error))?;
+        let json =
+            response_to_jsonrpc(&request_id, &response).map_err(EmailCoreError::ResponseEncode)?;
         write_stdout_line(&stdout_lock, &json)?;
         if should_exit {
             break;
@@ -277,7 +300,11 @@ fn email_after_cycle(config: &ChannelConfig, stop: &StopSignal) {
     stop.sleep_until_stopped(Duration::from_secs(u64::from(poll_interval_secs(config))));
 }
 
-pub fn configure<P: EmailPreset>(config: &ChannelConfig) -> Result<ConfiguredChannel> {
+pub fn configure<P: EmailPreset>(config: &ChannelConfig) -> EmailResult<ConfiguredChannel> {
+    configure_inner::<P>(config).map_err(|error| EmailCoreError::Configuration(error.to_string()))
+}
+
+fn configure_inner<P: EmailPreset>(config: &ChannelConfig) -> Result<ConfiguredChannel> {
     ensure_configured::<P>(config)?;
 
     let mut metadata = BTreeMap::new();
@@ -342,7 +369,11 @@ pub fn configure<P: EmailPreset>(config: &ChannelConfig) -> Result<ConfiguredCha
     })
 }
 
-pub fn health<P: EmailPreset>(config: &ChannelConfig) -> Result<HealthReport> {
+pub fn health<P: EmailPreset>(config: &ChannelConfig) -> EmailResult<HealthReport> {
+    health_inner::<P>(config).map_err(|error| EmailCoreError::Health(error.to_string()))
+}
+
+fn health_inner<P: EmailPreset>(config: &ChannelConfig) -> Result<HealthReport> {
     ensure_configured::<P>(config)?;
 
     let mut ok = true;
@@ -485,6 +516,14 @@ fn deliver<P: EmailPreset>(
 pub fn resolve_outgoing_email<P: EmailPreset>(
     config: &ChannelConfig,
     message: &OutboundMessage,
+) -> EmailResult<OutgoingEmail> {
+    resolve_outgoing_email_inner::<P>(config, message)
+        .map_err(|error| EmailCoreError::ResolveOutgoingEmail(error.to_string()))
+}
+
+fn resolve_outgoing_email_inner<P: EmailPreset>(
+    config: &ChannelConfig,
+    message: &OutboundMessage,
 ) -> Result<OutgoingEmail> {
     let recipient = message
         .metadata
@@ -597,6 +636,15 @@ fn delivery_receipt<P: EmailPreset>(outgoing: &OutgoingEmail, sent: &SentEmail) 
 }
 
 pub fn build_inbound_event<P: EmailPreset>(
+    config: &ChannelConfig,
+    mailbox: &MailboxStatus,
+    fetched: &FetchedEmail,
+) -> EmailResult<Option<InboundEventEnvelope>> {
+    build_inbound_event_inner::<P>(config, mailbox, fetched)
+        .map_err(|error| EmailCoreError::BuildInboundEvent(error.to_string()))
+}
+
+fn build_inbound_event_inner<P: EmailPreset>(
     config: &ChannelConfig,
     mailbox: &MailboxStatus,
     fetched: &FetchedEmail,

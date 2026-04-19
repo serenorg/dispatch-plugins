@@ -1,4 +1,3 @@
-use anyhow::{Result, anyhow};
 use dispatch_channel_protocol::{
     CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelEventNotification, IngressState,
     PluginNotificationEnvelope, PluginResponse, notification_to_jsonrpc,
@@ -12,6 +11,17 @@ use std::{
     thread::{self, JoinHandle},
     time::Duration,
 };
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum RuntimeError {
+    #[error("stdout lock poisoned")]
+    StdoutLockPoisoned,
+    #[error("failed to encode channel event notification: {0}")]
+    NotificationEncode(String),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
 
 pub struct IngressWorker {
     stop: Arc<AtomicBool>,
@@ -39,7 +49,7 @@ impl StopSignal {
 
 pub fn no_after_cycle<C>(_: &C, _: &StopSignal) {}
 
-pub fn restart_ingress_worker<C, Poll, After>(
+pub fn restart_ingress_worker<C, Poll, After, E>(
     worker: &mut Option<IngressWorker>,
     config: C,
     initial_state: IngressState,
@@ -49,8 +59,9 @@ pub fn restart_ingress_worker<C, Poll, After>(
     after_cycle: After,
 ) where
     C: Send + 'static,
-    Poll: Fn(&C, Option<IngressState>) -> Result<PluginResponse> + Send + 'static,
+    Poll: Fn(&C, Option<IngressState>) -> Result<PluginResponse, E> + Send + 'static,
     After: Fn(&C, &StopSignal) + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
 {
     let _ = stop_ingress_worker(worker);
     *worker = Some(spawn_ingress_worker(
@@ -70,17 +81,17 @@ pub fn stop_ingress_worker(worker: &mut Option<IngressWorker>) -> Option<Ingress
     worker.state.lock().ok().and_then(|state| (*state).clone())
 }
 
-pub fn write_stdout_line(stdout_lock: &Arc<Mutex<()>>, line: &str) -> Result<()> {
+pub fn write_stdout_line(stdout_lock: &Arc<Mutex<()>>, line: &str) -> Result<(), RuntimeError> {
     let _guard = stdout_lock
         .lock()
-        .map_err(|_| anyhow!("stdout lock poisoned"))?;
+        .map_err(|_| RuntimeError::StdoutLockPoisoned)?;
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "{line}")?;
     stdout.flush()?;
     Ok(())
 }
 
-fn spawn_ingress_worker<C, Poll, After>(
+fn spawn_ingress_worker<C, Poll, After, E>(
     config: C,
     initial_state: IngressState,
     stdout_lock: Arc<Mutex<()>>,
@@ -90,8 +101,9 @@ fn spawn_ingress_worker<C, Poll, After>(
 ) -> IngressWorker
 where
     C: Send + 'static,
-    Poll: Fn(&C, Option<IngressState>) -> Result<PluginResponse> + Send + 'static,
+    Poll: Fn(&C, Option<IngressState>) -> Result<PluginResponse, E> + Send + 'static,
     After: Fn(&C, &StopSignal) + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
 {
     let stop = Arc::new(AtomicBool::new(false));
     let state = Arc::new(Mutex::new(Some(initial_state)));
@@ -163,11 +175,11 @@ where
 fn emit_channel_event_notification(
     stdout_lock: &Arc<Mutex<()>>,
     notification: ChannelEventNotification,
-) -> Result<()> {
+) -> Result<(), RuntimeError> {
     let envelope = PluginNotificationEnvelope {
         protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
         notification,
     };
-    let json = notification_to_jsonrpc(&envelope).map_err(|error| anyhow!(error))?;
+    let json = notification_to_jsonrpc(&envelope).map_err(RuntimeError::NotificationEncode)?;
     write_stdout_line(stdout_lock, &json)
 }

@@ -131,6 +131,7 @@ dependencies = [
  "mail-parser",
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -437,8 +438,8 @@ dependencies = [
 name = "dispatch-channel-runtime"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "dispatch-channel-protocol",
+ "thiserror",
 ]
 
 [[package]]
