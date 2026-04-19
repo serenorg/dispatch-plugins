@@ -64,52 +64,35 @@ To obtain the required Discord credentials:
 5. Install the bot into the target server with the permissions needed to post
     messages in the destination channel or thread.
 
+Minimal config:
+
+```toml
+default_channel_id = "123456789012345678"
+webhook_public_url = "https://example.com"
+webhook_path = "/discord/interactions"
+```
+
 ## Manifest
 
 The Dispatch channel manifest is stored in `channel-plugin.json`. The host can
 install it with `dispatch channel install`.
 
-## Protocol
+## Dispatch usage
 
-Requests are sent as JSONL on stdin:
+```bash
+dispatch channel call channel-discord \
+  --request-json '{"kind":"health","config":{"default_channel_id":"123456789012345678"}}'
 
-```json
-{"protocol_version":1,"request":{"kind":"capabilities"}}
+dispatch channel listen channel-discord \
+  --listen 127.0.0.1:8787 \
+  --config-file ./discord.toml
+
+dispatch channel call channel-discord \
+  --request-json '{"kind":"push","config":{"default_channel_id":"123456789012345678"},"message":{"content":"Dispatch Discord test"}}'
 ```
 
-Delivery example:
-
-```json
-{
-  "protocol_version": 1,
-  "request": {
-    "kind": "deliver",
-    "config": {
-      "default_channel_id": "123456789012345678"
-    },
-    "message": {
-      "content": "Dispatch says hello from Discord."
-    }
-  }
-}
-```
-
-Status example:
-
-```json
-{
-  "protocol_version": 1,
-  "request": {
-    "kind": "status",
-    "config": {},
-    "update": {
-      "kind": "processing",
-      "message": "Dispatch is preparing a reply.",
-      "conversation_id": "123456789012345678"
-    }
-  }
-}
-```
+The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Dispatch operators
+normally use the host CLI rather than writing raw envelopes.
 
 ## Notes on ingress
 

@@ -74,49 +74,30 @@ To obtain the required WhatsApp Cloud API credentials:
 6. If you want to validate `X-Hub-Signature-256`, copy the app secret and
     export it as `WHATSAPP_APP_SECRET`.
 
-## Protocol
+Minimal config:
 
-Requests are sent as JSONL on stdin:
-
-```json
-{"protocol_version":1,"request":{"kind":"capabilities"}}
+```toml
+phone_number_id = "1234567890"
+webhook_public_url = "https://example.com"
+webhook_path = "/whatsapp/webhook"
 ```
 
-Delivery example:
+## Dispatch usage
 
-```json
-{
-  "protocol_version": 1,
-  "request": {
-    "kind": "deliver",
-    "config": {
-      "phone_number_id": "1234567890"
-    },
-    "message": {
-      "to_number": "15557654321",
-      "content": "Dispatch says hello from WhatsApp."
-    }
-  }
-}
+```bash
+dispatch channel call channel-whatsapp \
+  --request-json '{"kind":"health","config":{"phone_number_id":"1234567890"}}'
+
+dispatch channel listen channel-whatsapp \
+  --listen 127.0.0.1:8787 \
+  --config-file ./whatsapp.toml
+
+dispatch channel call channel-whatsapp \
+  --request-json '{"kind":"push","config":{"phone_number_id":"1234567890"},"message":{"to_number":"15557654321","content":"Dispatch WhatsApp test"}}'
 ```
 
-Push example:
-
-```json
-{
-  "protocol_version": 1,
-  "request": {
-    "kind": "push",
-    "config": {
-      "phone_number_id": "1234567890"
-    },
-    "message": {
-      "to_number": "15557654321",
-      "content": "Dispatch scheduled update from WhatsApp."
-    }
-  }
-}
-```
+The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Dispatch operators
+normally use the host CLI rather than writing raw envelopes.
 
 ## Notes on ingress
 

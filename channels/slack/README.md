@@ -12,54 +12,71 @@ Implemented:
 - `health`
 - `start_ingress`
 - `stop_ingress`
-- `poll_ingress`
 - `ingress_event`
 - `deliver`
 - `push`
 - `status`
+- `shutdown`
 
 Behavior:
 
 - outbound delivery can use `chat.postMessage` with a bot token
-- outbound delivery can also fall back to a Slack incoming webhook URL
+- outbound delivery can fall back to a Slack incoming webhook URL
 - outbound attachments support one inline `data_base64` upload per message when
   using bot-token delivery
 - health checks validate the bot token with `auth.test` when configured
-- ingress verifies Slack request signatures and parses Events API payloads
-- polling ingress can also receive Events API payloads over Slack Socket Mode
+- Events API ingress uses host-managed webhook callbacks
+- Socket Mode ingress opens Slack's websocket via `apps.connections.open` from
+  a background worker and emits `channel.event` notifications while the
+  Dispatch poller is active
 - challenge and acknowledgement replies are returned through `callback_reply`
 - status frames render visible status messages into Slack conversations
 
 Not implemented:
 
 - slash command registration and lifecycle
-- block kit generation
+- Block Kit generation
 - URL- or storage-key-backed attachment delivery
 - message edits
 
-## Build
+## Availability
 
-```bash
-cargo build --release
-```
+Inbound:
+
+- Events API webhook mode is available when `webhook_public_url` is configured
+  and `SLACK_SIGNING_SECRET` is available
+- Socket Mode is available when `SLACK_APP_TOKEN` is configured and
+  `webhook_public_url` is not set
+
+Outbound:
+
+- bot-token delivery uses `SLACK_BOT_TOKEN` and `chat.postMessage`
+- incoming-webhook delivery uses `SLACK_INCOMING_WEBHOOK_URL`
+- `default_channel_id` and `default_thread_ts` provide routing defaults
 
 ## Configuration
 
-Optional env vars:
+Optional environment:
 
 - `SLACK_BOT_TOKEN` - used for `auth.test` and `chat.postMessage`
-- `SLACK_APP_TOKEN` - used for Slack Socket Mode polling via `apps.connections.open`
-- `SLACK_SIGNING_SECRET` - used by the host to verify incoming Slack event
-  signatures
+- `SLACK_APP_TOKEN` - app-level token used for Socket Mode via
+  `apps.connections.open`
+- `SLACK_SIGNING_SECRET` - used to verify inbound Slack event signatures
 - `SLACK_INCOMING_WEBHOOK_URL` - used for low-friction outbound delivery
 
 Useful config fields:
 
+- `bot_token_env`, `app_token_env`, `signing_secret_env`,
+  `incoming_webhook_url_env` - override the default env var names
+- `incoming_webhook_url` - inline incoming webhook URL when env vars are not
+  desirable
+- `webhook_public_url` - public base URL used for Events API ingress
+- `webhook_path` - ingress route path, default `/slack/events`
 - `default_channel_id` - default target channel for bot-token delivery
 - `default_thread_ts` - optional default thread timestamp
-- `webhook_public_url` - public base URL used for ingress declaration
-- `webhook_path` - ingress route path, default `/slack/events`
-- `poll_timeout_secs` - socket-mode wait timeout in seconds, minimum 1
+- `poll_timeout_secs` - Socket Mode receive timeout in seconds, minimum 1
+- `allowed_team_ids`, `allowed_sender_ids`, `owner_id`, and `dm_policy` -
+  optional policy controls surfaced through `configure`
 
 `SLACK_APP_TOKEN` is only for Socket Mode ingress. It does not replace the bot
 token for `health`, `deliver`, `push`, or `status`.
@@ -68,18 +85,6 @@ token for `health`, `deliver`, `push`, or `status`.
 
 Slack supports two ingress paths and two outbound auth paths in this plugin.
 
-Ingress paths:
-
-1. Events API webhook mode:
-  - configure `webhook_public_url`
-  - export `SLACK_SIGNING_SECRET`
-2. Socket Mode polling:
-  - enable Socket Mode in the Slack app settings
-  - create an app-level token with the `connections:write` scope
-  - export it as `SLACK_APP_TOKEN`
-  - keep the bot token configured as well if you want outbound delivery and
-    identity metadata
-
 Bot-token mode:
 
 1. Create a Slack app in the Slack API dashboard.
@@ -87,43 +92,41 @@ Bot-token mode:
 3. Install the app into the target workspace.
 4. Copy the bot token and export it as `SLACK_BOT_TOKEN`.
 5. If you are using Events API ingress, copy the signing secret and export it
-  as `SLACK_SIGNING_SECRET`.
+    as `SLACK_SIGNING_SECRET`.
 
-Recommended bot scopes for this plugin:
+Recommended bot scopes:
 
-- `chat:write` for outbound delivery
-- `files:write` for inline `data_base64` attachment uploads
+- `chat:write`
+- `files:write`
 
 Recommended event subscriptions:
 
-- `app_mention` for mention-driven bots
-- `message.channels` if you want channel message events
-- `message.groups` if you want private-channel message events
-- `message.im` if you want direct-message events
-- `message.mpim` if you want multi-person direct-message events
+- `app_mention`
+- `message.channels`
+- `message.groups`
+- `message.im`
+- `message.mpim`
 
-Socket Mode setup in the Slack dashboard:
+Socket Mode setup:
 
 1. Open the app at `https://api.slack.com/apps`.
 2. In `Socket Mode`, enable Socket Mode for the app.
 3. In `Basic Information`, create an app-level token.
-4. Give the app-level token the `connections:write` scope.
-5. Copy the generated `xapp-...` token and export it as `SLACK_APP_TOKEN`.
-6. Reinstall the app to the workspace if Slack asks for it after scope or
-  event changes.
+4. Give that token the `connections:write` scope.
+5. Export the generated `xapp-...` token as `SLACK_APP_TOKEN`.
+6. Reinstall the app if Slack asks for it after scope or event changes.
 
-Events API webhook setup in the Slack dashboard:
+Events API setup:
 
 1. In `Event Subscriptions`, enable events.
 2. Set the request URL to the public endpoint reported by Dispatch, for
-  example `https://example.com/slack/events`.
+    example `https://example.com/slack/events`.
 3. Subscribe to the bot events you want to receive.
-4. Copy the signing secret from `Basic Information` and export it as
-  `SLACK_SIGNING_SECRET`.
+4. Export the signing secret as `SLACK_SIGNING_SECRET`.
 
 Incoming-webhook mode:
 
-1. Create a Slack app and enable incoming webhooks.
+1. Enable incoming webhooks on the Slack app.
 2. Install the app into the target workspace.
 3. Create an incoming webhook for the target channel.
 4. Export the webhook URL as `SLACK_INCOMING_WEBHOOK_URL`.
@@ -131,11 +134,11 @@ Incoming-webhook mode:
 Minimal Socket Mode config:
 
 ```toml
-poll_timeout_secs = 60
 default_channel_id = "C1234567890"
+poll_timeout_secs = 60
 ```
 
-Minimal webhook config:
+Minimal Events API config:
 
 ```toml
 webhook_public_url = "https://example.com"
@@ -151,71 +154,47 @@ export SLACK_APP_TOKEN="xapp-..."
 export SLACK_SIGNING_SECRET="..."
 ```
 
-Common failure modes:
+## Dispatch usage
 
-- `polling_not_supported` means `SLACK_APP_TOKEN` was not available to the
-  plugin process.
-- `failed to connect Slack socket mode websocket` usually means the plugin was
-  built without websocket TLS support or the app-level token is invalid.
-- repeated self-replies usually mean the app is receiving its own bot messages;
-  the plugin filters bot-authored events, so verify the running binary is up to
-  date if this appears again.
+Dispatch operators normally use the host CLI:
 
-## Protocol
+```bash
+dispatch channel call channel-slack \
+  --request-json '{"kind":"health","config":{"bot_token_env":"SLACK_BOT_TOKEN","default_channel_id":"C1234567890"}}'
 
-Requests are sent as JSONL on stdin:
+dispatch channel listen channel-slack \
+  --listen 127.0.0.1:8787 \
+  --config-file ./slack-events.toml
 
-```json
-{"protocol_version":1,"request":{"kind":"capabilities"}}
+dispatch channel poll channel-slack \
+  --config-file ./slack-socket-mode.toml --once
+
+dispatch channel call channel-slack \
+  --request-json '{"kind":"push","config":{"bot_token_env":"SLACK_BOT_TOKEN","default_channel_id":"C1234567890"},"message":{"content":"Dispatch Slack test"}}'
 ```
 
-Delivery example using bot-token mode:
-
-```json
-{
-  "protocol_version": 1,
-  "request": {
-    "kind": "deliver",
-    "config": {
-      "default_channel_id": "C1234567890"
-    },
-    "message": {
-      "content": "Dispatch says hello from Slack."
-    }
-  }
-}
-```
-
-Push example:
-
-```json
-{
-  "protocol_version": 1,
-  "request": {
-    "kind": "push",
-    "config": {
-      "default_channel_id": "C1234567890"
-    },
-    "message": {
-      "content": "Dispatch scheduled update for Slack."
-    }
-  }
-}
-```
+The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Events API and
+Socket Mode are upstream Slack transport choices that the plugin translates
+into the shared Dispatch channel protocol.
 
 ## Notes on ingress
 
-For Events API webhooks, Slack does not provide a simple webhook registration
-API equivalent to Telegram's `setWebhook`. This plugin therefore treats
-`start_ingress` as a configuration handshake:
+- if `SLACK_APP_TOKEN` is configured and `webhook_public_url` is not set,
+  `start_ingress` chooses Socket Mode
+- otherwise `start_ingress` chooses Events API webhook mode and reports the
+  public route that the host should expose
+- Socket Mode keeps a background worker alive, acknowledges each `envelope_id`,
+  and emits normalized inbound notifications to Dispatch
 
-1. validate available auth material
-2. validate the declared public route
-3. report the endpoint and signing-secret requirement to the host
+Common failure modes:
 
-For Socket Mode, `poll_ingress` opens a websocket connection through
-`apps.connections.open`, waits for the next event envelope, acknowledges it by
-`envelope_id`, and returns the normalized Dispatch event to the host.
+- `polling_not_supported` means `SLACK_APP_TOKEN` was not available to the
+  plugin process
+- `failed to connect Slack socket mode websocket` usually means the app-level
+  token is invalid or the binary was built without websocket TLS support
+- repeated self-replies usually mean the app is receiving its own bot messages;
+  the plugin filters bot-authored events, so verify the running binary is up to
+  date if this appears again
 
 ## License
 

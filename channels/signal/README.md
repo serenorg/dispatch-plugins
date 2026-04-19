@@ -1,7 +1,7 @@
 # channel-signal
 
 A [Dispatch](https://github.com/serenorg/dispatch) channel plugin
-for Signal using the upstream `signal-cli-rest-api` HTTP API.
+for Signal using the upstream `signal-cli-rest-api` API.
 
 ## Scope
 
@@ -12,10 +12,10 @@ Implemented:
 - `health`
 - `start_ingress`
 - `stop_ingress`
-- `poll_ingress`
 - `deliver`
 - `push`
 - `status`
+- `shutdown`
 
 Behavior:
 
@@ -24,8 +24,11 @@ Behavior:
 - health checks validate connectivity with `GET /v1/about`
 - status frames map to Signal typing indicators with
   `PUT /v1/typing-indicator/{number}`
-- polling ingress uses `GET /v1/receive/{number}` and normalizes inbound
-  message envelopes into Dispatch events
+- ingress runs as a background receive loop and emits `channel.event`
+  notifications while the Dispatch poller is active
+- the plugin automatically adapts to the backend mode:
+  - `native` and `normal` use HTTP receive
+  - `json-rpc` uses the websocket receive endpoint
 
 Not implemented:
 
@@ -44,16 +47,29 @@ Or provide:
 
 Optional config fields:
 
-- `account` - sending account or linked Signal identity when the backend
-  requires it
+- `base_url_env` - override the base-url env var name, defaults to
+  `SIGNAL_RPC_URL`
+- `account` - sending account or linked Signal identity; required for ingress
+  because receive calls are account-scoped
 - `default_recipient` - fallback recipient for `deliver`, `push`, and `status`
-- `poll_timeout_secs` - polling receive timeout in seconds, minimum 1
-
-`config.account` is also required for polling ingress, because the Signal
-backend `receive` call is scoped to a specific account.
+- `poll_timeout_secs` - receive timeout in seconds, minimum 1
 
 Recipients may be plain phone numbers, `group:<id>`, `username:<value>`, or
-prefixed forms like `signal:+15551234567`.
+prefixed forms such as `signal:+15551234567`.
+
+## Availability
+
+Inbound:
+
+- available only as a background ingress session
+- there is no webhook mode; the plugin always owns the upstream receive loop
+- upstream transport is HTTP in `native` / `normal` mode and websocket in
+  `json-rpc` mode
+
+Outbound:
+
+- available whenever the configured Signal backend can send messages for the
+  chosen account
 
 ## Setup
 
@@ -65,11 +81,11 @@ Typical setup:
 
 1. Provision or link a Signal account with `signal-cli`.
 2. Start `signal-cli-rest-api` in one of its supported modes:
-  - `native` or `normal` for HTTP polling via `GET /v1/receive/{number}`
-  - `json-rpc` for websocket receive on `/v1/receive/{number}`
+    - `native` or `normal` for HTTP receive
+    - `json-rpc` for websocket-backed receive
 3. Point the plugin at that service with `base_url` or `SIGNAL_RPC_URL`.
-4. Set `account` in the plugin config when the backend requires an explicit
-  account selector for polling and sending.
+4. Set `account` in the plugin config.
+5. Optionally set `default_recipient` for proactive outbound delivery.
 
 One practical Docker setup:
 
@@ -85,18 +101,10 @@ docker run -d --name signal-api --restart=always \
 Linking a device:
 
 1. Open the QR code endpoint exposed by `signal-cli-rest-api`, for example
-  `http://127.0.0.1:8080/v1/qrcodelink?device_name=dispatch`.
+    `http://127.0.0.1:8080/v1/qrcodelink?device_name=dispatch`.
 2. In the Signal mobile app, open `Settings -> Linked devices`.
 3. Scan the QR code.
-4. Confirm that `GET /v1/about` returns the expected mode and version from the
-  backend.
-
-Choosing a backend mode:
-
-- `normal` is the safest baseline and works everywhere
-- `native` reduces startup overhead for each HTTP receive/send call
-- `json-rpc` keeps a daemon process alive and gives the best receive latency;
-  this plugin uses websocket-backed receive in that mode
+4. Confirm that `GET /v1/about` returns the expected mode and version.
 
 Minimal config:
 
@@ -113,25 +121,42 @@ Environment example:
 export SIGNAL_RPC_URL="http://127.0.0.1:8080"
 ```
 
-Notes:
+## Dispatch usage
 
-- `poll_ingress` adapts to the upstream backend mode automatically:
-  - `native` and `normal` use the documented HTTP receive endpoint
-  - `json-rpc` uses the documented websocket receive endpoint
-- the plugin still exposes the same Dispatch `poll_ingress` request in both
-  cases; only the upstream Signal transport changes
-- `deliver` and `status` target the upstream REST API routes documented by
-  `signal-cli-rest-api`, not the older `/api/v1/rpc` wrapper contract.
+Dispatch operators normally drive Signal through the host CLI:
+
+```bash
+dispatch channel call channel-signal \
+  --request-json '{"kind":"health","config":{"base_url":"http://127.0.0.1:8080","account":"+15551234567"}}'
+
+dispatch channel poll channel-signal \
+  --config-file ./signal.toml --once
+
+dispatch channel call channel-signal \
+  --request-json '{"kind":"push","config":{"base_url":"http://127.0.0.1:8080","account":"+15551234567","default_recipient":"+15557654321"},"message":{"content":"Dispatch Signal test"}}'
+```
+
+The plugin transport is JSON-RPC 2.0 over JSONL on stdio. The upstream Signal
+transport may still be HTTP or websocket depending on backend mode; Dispatch
+does not speak websocket to the plugin directly.
+
+## Notes
+
+- `start_ingress` validates the account and backend, then starts the background
+  receive worker
+- inbound messages are emitted back to Dispatch as `channel.event`
+  notifications
+- `ingress_event` is intentionally unsupported because Signal is not modeled as
+  a host-managed webhook integration
 
 Common failure modes:
 
 - `signal polling ingress requires config.account` means the plugin does not
-  know which Signal identity to poll.
+  know which Signal identity to poll
 - connection errors against `/v1/about` usually mean the REST API container is
-  not running or `base_url` is wrong.
+  not running or `base_url` is wrong
 - websocket receive issues in `json-rpc` mode usually mean the backend is not
-  actually running in `json-rpc` mode or the plugin binary was built without
-  websocket TLS support.
+  actually running in `json-rpc` mode
 
 ## Build
 

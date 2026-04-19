@@ -68,49 +68,30 @@ To obtain the required Twilio credentials:
 4. Provision a Twilio phone number or Messaging Service for outbound SMS.
 5. Set `from_number` or `messaging_service_sid` in the plugin config.
 
-## Protocol
+Minimal config:
 
-Requests are sent as JSONL on stdin:
-
-```json
-{"protocol_version":1,"request":{"kind":"capabilities"}}
+```toml
+from_number = "+15551234567"
+webhook_public_url = "https://example.com"
+webhook_path = "/twilio/sms"
 ```
 
-Delivery example:
+## Dispatch usage
 
-```json
-{
-  "protocol_version": 1,
-  "request": {
-    "kind": "deliver",
-    "config": {
-      "from_number": "+15551234567"
-    },
-    "message": {
-      "to_number": "+15557654321",
-      "content": "Dispatch says hello from SMS."
-    }
-  }
-}
+```bash
+dispatch channel call channel-twilio-sms \
+  --request-json '{"kind":"health","config":{"from_number":"+15551234567"}}'
+
+dispatch channel listen channel-twilio-sms \
+  --listen 127.0.0.1:8787 \
+  --config-file ./twilio-sms.toml
+
+dispatch channel call channel-twilio-sms \
+  --request-json '{"kind":"push","config":{"from_number":"+15551234567"},"message":{"to_number":"+15557654321","content":"Dispatch SMS test"}}'
 ```
 
-Push example:
-
-```json
-{
-  "protocol_version": 1,
-  "request": {
-    "kind": "push",
-    "config": {
-      "from_number": "+15551234567"
-    },
-    "message": {
-      "to_number": "+15557654321",
-      "content": "Dispatch scheduled update from SMS."
-    }
-  }
-}
-```
+The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Dispatch operators
+normally use the host CLI rather than writing raw envelopes.
 
 ## Notes on ingress
 
