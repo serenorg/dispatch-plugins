@@ -1,4 +1,4 @@
-use crate::protocol::ChannelConfig;
+use crate::{ChannelConfig, EmailPreset};
 use anyhow::{Context, Result, anyhow, bail};
 use imap::ClientBuilder;
 use lettre::{
@@ -8,12 +8,6 @@ use lettre::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_IMAP_HOST: &str = "imap.gmail.com";
-const DEFAULT_IMAP_PORT: u16 = 993;
-const DEFAULT_SMTP_HOST: &str = "smtp.gmail.com";
-const DEFAULT_SMTP_PORT: u16 = 465;
-const DEFAULT_IMAP_PASSWORD_ENV: &str = "GMAIL_APP_PASSWORD";
-const DEFAULT_SMTP_PASSWORD_ENV: &str = "GMAIL_APP_PASSWORD";
 const DEFAULT_IMAP_MAILBOX: &str = "INBOX";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,12 +56,12 @@ pub struct SentEmail {
     pub message_id: String,
 }
 
-pub fn check_imap_health(config: &ChannelConfig) -> Result<MailboxStatus> {
-    require_imap_config(config)?;
-    let host = imap_host(config)?;
-    let port = imap_port(config);
+pub fn check_imap_health<P: EmailPreset>(config: &ChannelConfig) -> Result<MailboxStatus> {
+    require_imap_config::<P>(config)?;
+    let host = imap_host::<P>(config)?;
+    let port = imap_port::<P>(config);
     let username = imap_username(config)?;
-    let password = read_required_env(imap_password_env(config))?;
+    let password = read_required_env(imap_password_env::<P>(config))?;
     let mailbox_name = imap_mailbox(config);
 
     let client = ClientBuilder::new(&host, port)
@@ -86,15 +80,15 @@ pub fn check_imap_health(config: &ChannelConfig) -> Result<MailboxStatus> {
     Ok(status)
 }
 
-pub fn fetch_messages_since(
+pub fn fetch_messages_since<P: EmailPreset>(
     config: &ChannelConfig,
     last_uid: Option<u32>,
 ) -> Result<ImapPollResult> {
-    require_imap_config(config)?;
-    let host = imap_host(config)?;
-    let port = imap_port(config);
+    require_imap_config::<P>(config)?;
+    let host = imap_host::<P>(config)?;
+    let port = imap_port::<P>(config);
     let username = imap_username(config)?;
-    let password = read_required_env(imap_password_env(config))?;
+    let password = read_required_env(imap_password_env::<P>(config))?;
     let mailbox_name = imap_mailbox(config);
 
     let client = ClientBuilder::new(&host, port)
@@ -154,9 +148,12 @@ pub fn fetch_messages_since(
     })
 }
 
-pub fn send_email(config: &ChannelConfig, email: &OutgoingEmail) -> Result<SentEmail> {
-    require_smtp_config(config)?;
-    let transport = smtp_transport(config)?;
+pub fn send_email<P: EmailPreset>(
+    config: &ChannelConfig,
+    email: &OutgoingEmail,
+) -> Result<SentEmail> {
+    require_smtp_config::<P>(config)?;
+    let transport = smtp_transport::<P>(config)?;
     let message_id = generated_message_id(&email.from_email);
 
     let from = Mailbox::new(
@@ -216,9 +213,9 @@ pub fn send_email(config: &ChannelConfig, email: &OutgoingEmail) -> Result<SentE
     Ok(SentEmail { message_id })
 }
 
-pub fn smtp_connection_ok(config: &ChannelConfig) -> Result<bool> {
-    require_smtp_config(config)?;
-    smtp_transport(config)?
+pub fn smtp_connection_ok<P: EmailPreset>(config: &ChannelConfig) -> Result<bool> {
+    require_smtp_config::<P>(config)?;
+    smtp_transport::<P>(config)?
         .test_connection()
         .context("failed to test SMTP connection")
 }
@@ -230,17 +227,17 @@ pub fn latest_existing_uid(status: &MailboxStatus) -> Option<u32> {
         .filter(|uid| *uid > 0)
 }
 
-pub fn require_imap_config(config: &ChannelConfig) -> Result<()> {
-    let _ = imap_host(config)?;
+pub fn require_imap_config<P: EmailPreset>(config: &ChannelConfig) -> Result<()> {
+    let _ = imap_host::<P>(config)?;
     let _ = imap_username(config)?;
-    let _ = read_required_env(imap_password_env(config))?;
+    let _ = read_required_env(imap_password_env::<P>(config))?;
     Ok(())
 }
 
-pub fn require_smtp_config(config: &ChannelConfig) -> Result<()> {
-    let _ = smtp_host(config)?;
+pub fn require_smtp_config<P: EmailPreset>(config: &ChannelConfig) -> Result<()> {
+    let _ = smtp_host::<P>(config)?;
     let _ = smtp_username(config)?;
-    let _ = read_required_env(smtp_password_env(config))?;
+    let _ = read_required_env(smtp_password_env::<P>(config))?;
     let _ = smtp_from_email(config)?;
     Ok(())
 }
@@ -253,15 +250,15 @@ pub fn imap_mailbox(config: &ChannelConfig) -> String {
         .unwrap_or_else(|| DEFAULT_IMAP_MAILBOX.to_string())
 }
 
-pub fn imap_password_env(config: &ChannelConfig) -> &str {
+pub fn imap_password_env<P: EmailPreset>(config: &ChannelConfig) -> &str {
     config
         .imap_password_env
         .as_deref()
         .filter(|name| !name.trim().is_empty())
-        .unwrap_or(DEFAULT_IMAP_PASSWORD_ENV)
+        .unwrap_or(P::DEFAULT_IMAP_PASSWORD_ENV)
 }
 
-pub fn smtp_password_env(config: &ChannelConfig) -> &str {
+pub fn smtp_password_env<P: EmailPreset>(config: &ChannelConfig) -> &str {
     config
         .smtp_password_env
         .as_deref()
@@ -272,7 +269,7 @@ pub fn smtp_password_env(config: &ChannelConfig) -> &str {
                 .as_deref()
                 .filter(|name| !name.trim().is_empty())
         })
-        .unwrap_or(DEFAULT_SMTP_PASSWORD_ENV)
+        .unwrap_or(P::DEFAULT_SMTP_PASSWORD_ENV)
 }
 
 fn mailbox_status(mailbox_name: &str, mailbox: &imap::types::Mailbox) -> MailboxStatus {
@@ -285,11 +282,11 @@ fn mailbox_status(mailbox_name: &str, mailbox: &imap::types::Mailbox) -> Mailbox
     }
 }
 
-fn smtp_transport(config: &ChannelConfig) -> Result<SmtpTransport> {
-    let host = smtp_host(config)?;
-    let port = smtp_port(config);
+fn smtp_transport<P: EmailPreset>(config: &ChannelConfig) -> Result<SmtpTransport> {
+    let host = smtp_host::<P>(config)?;
+    let port = smtp_port::<P>(config);
     let username = smtp_username(config)?;
-    let password = read_required_env(smtp_password_env(config))?;
+    let password = read_required_env(smtp_password_env::<P>(config))?;
     let credentials = Credentials::new(username, password);
 
     let builder = if port == 465 {
@@ -301,16 +298,17 @@ fn smtp_transport(config: &ChannelConfig) -> Result<SmtpTransport> {
     Ok(builder.credentials(credentials).port(port).build())
 }
 
-pub fn imap_host(config: &ChannelConfig) -> Result<String> {
-    Ok(config
+pub fn imap_host<P: EmailPreset>(config: &ChannelConfig) -> Result<String> {
+    config
         .imap_host
         .clone()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_IMAP_HOST.to_string()))
+        .or_else(|| P::DEFAULT_IMAP_HOST.map(str::to_string))
+        .ok_or_else(|| anyhow!("config.imap_host is required for IMAP ingress"))
 }
 
-pub fn imap_port(config: &ChannelConfig) -> u16 {
-    config.imap_port.unwrap_or(DEFAULT_IMAP_PORT)
+pub fn imap_port<P: EmailPreset>(config: &ChannelConfig) -> u16 {
+    config.imap_port.unwrap_or(P::DEFAULT_IMAP_PORT)
 }
 
 fn imap_username(config: &ChannelConfig) -> Result<String> {
@@ -320,16 +318,17 @@ fn imap_username(config: &ChannelConfig) -> Result<String> {
     )
 }
 
-pub fn smtp_host(config: &ChannelConfig) -> Result<String> {
-    Ok(config
+pub fn smtp_host<P: EmailPreset>(config: &ChannelConfig) -> Result<String> {
+    config
         .smtp_host
         .clone()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_SMTP_HOST.to_string()))
+        .or_else(|| P::DEFAULT_SMTP_HOST.map(str::to_string))
+        .ok_or_else(|| anyhow!("config.smtp_host is required for SMTP delivery"))
 }
 
-pub fn smtp_port(config: &ChannelConfig) -> u16 {
-    config.smtp_port.unwrap_or(DEFAULT_SMTP_PORT)
+pub fn smtp_port<P: EmailPreset>(config: &ChannelConfig) -> u16 {
+    config.smtp_port.unwrap_or(P::DEFAULT_SMTP_PORT)
 }
 
 fn smtp_username(config: &ChannelConfig) -> Result<String> {
@@ -384,37 +383,56 @@ fn read_required_env(name: &str) -> Result<String> {
     std::env::var(name).map_err(|_| anyhow!("environment variable {name} is required"))
 }
 
-pub fn has_imap_config(config: &ChannelConfig) -> bool {
-    config
-        .imap_username
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-}
-
-pub fn has_smtp_config(config: &ChannelConfig) -> bool {
-    config
-        .smtp_from_email
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
+pub fn has_imap_config<P: EmailPreset>(config: &ChannelConfig) -> bool {
+    let has_host = P::DEFAULT_IMAP_HOST.is_some()
         || config
-            .smtp_username
+            .imap_host
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+
+    has_host
+        && config
+            .imap_username
             .as_deref()
             .map(str::trim)
             .is_some_and(|value| !value.is_empty())
-        || has_imap_config(config)
 }
 
-pub fn ensure_configured(config: &ChannelConfig) -> Result<()> {
-    if !has_imap_config(config) && !has_smtp_config(config) {
-        bail!("gmail plugin requires IMAP ingress, SMTP delivery, or both");
+pub fn has_smtp_config<P: EmailPreset>(config: &ChannelConfig) -> bool {
+    let has_host = P::DEFAULT_SMTP_HOST.is_some()
+        || config
+            .smtp_host
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+
+    has_host
+        && (config
+            .smtp_from_email
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+            || config
+                .smtp_username
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty())
+            || has_imap_config::<P>(config))
+}
+
+pub fn ensure_configured<P: EmailPreset>(config: &ChannelConfig) -> Result<()> {
+    if !has_imap_config::<P>(config) && !has_smtp_config::<P>(config) {
+        bail!(
+            "{} plugin requires IMAP ingress, SMTP delivery, or both",
+            P::DISPLAY_NAME
+        );
     }
-    if has_imap_config(config) {
-        require_imap_config(config)?;
+    if has_imap_config::<P>(config) {
+        require_imap_config::<P>(config)?;
     }
-    if has_smtp_config(config) {
-        require_smtp_config(config)?;
+    if has_smtp_config::<P>(config) {
+        require_smtp_config::<P>(config)?;
     }
     Ok(())
 }

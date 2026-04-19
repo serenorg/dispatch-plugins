@@ -1,0 +1,22 @@
+[package]
+name = "channel-email-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+
+[lib]
+name = "channel_email_core"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", rev = "e6a1c9a6c7f79507ffc0c7bcac8670ad47bd655d" }
+imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
+jiff = "0.2"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
+mail-parser = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
