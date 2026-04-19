@@ -1,0 +1,27 @@
+[package]
+name = "channel-email"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dispatch channel plugin for IMAP and SMTP email."
+repository.workspace = true
+keywords = ["dispatch", "channel", "email", "imap"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "channel-email"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", rev = "e6a1c9a6c7f79507ffc0c7bcac8670ad47bd655d" }
+imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
+jiff = "0.2"
+lettre = { version = "0.11.21", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
+mail-parser = "0.11.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+channel-schema = { path = "../schema" }

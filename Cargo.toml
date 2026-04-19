@@ -2,6 +2,7 @@
 members = [
   "catalog",
   "channels/discord",
+  "channels/email",
   "channels/schema",
   "channels/signal",
   "channels/slack",

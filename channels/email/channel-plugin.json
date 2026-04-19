@@ -1,0 +1,47 @@
+{
+  "schema": "https://serenorg.github.io/dispatch/schemas/extension.v1.json",
+  "kind": "channel",
+  "name": "channel-email",
+  "version": "0.1.0",
+  "protocol": "jsonl",
+  "protocol_version": 1,
+  "description": "Email channel plugin for Dispatch using IMAP ingress and SMTP delivery.",
+  "entrypoint": {
+    "command": "../../target/release/channel-email",
+    "args": []
+  },
+  "auth": {
+    "mode": "manual",
+    "provider": "Email"
+  },
+  "capabilities": {
+    "channel": {
+      "platform": "email",
+      "ingress_modes": ["polling"],
+      "outbound_message_types": ["text"],
+      "threading_model": "caller_defined",
+      "attachment_support": true,
+      "reply_verification_support": false,
+      "account_scoped_config": true,
+      "allow_polling": true,
+      "webhook_secret_support": false,
+      "allowed_paths": [],
+      "ingress": {
+        "polling": {
+          "min_interval_ms": 5000,
+          "default_interval_ms": 60000
+        }
+      },
+      "delivery": {
+        "push": true,
+        "status_frames": false,
+        "attachment_sources": ["data_base64"]
+      }
+    }
+  },
+  "requirements": {
+    "secrets": ["EMAIL_IMAP_PASSWORD", "EMAIL_SMTP_PASSWORD"],
+    "network_domains": ["*"],
+    "platforms": ["imap", "smtp"]
+  }
+}

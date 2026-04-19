@@ -89,6 +89,92 @@
       }
     },
     {
+      "name": "channel-email",
+      "display_name": "Email Channel",
+      "kind": "channel",
+      "version": "0.1.0",
+      "description": "Email channel plugin for Dispatch using IMAP ingress and SMTP delivery.",
+      "protocol": "jsonl",
+      "protocol_version": 1,
+      "source_dir": "channels/email",
+      "manifest_path": "channels/email/channel-plugin.json",
+      "keywords": [
+        "dispatch",
+        "channel",
+        "email",
+        "imap",
+        "smtp"
+      ],
+      "tags": [
+        "email",
+        "imap",
+        "smtp"
+      ],
+      "install_hint": "dispatch channel install channels/email/channel-plugin.json",
+      "auth": {
+        "method": "manual",
+        "provider": "Email"
+      },
+      "requirements": {
+        "secrets": [
+          "EMAIL_IMAP_PASSWORD",
+          "EMAIL_SMTP_PASSWORD"
+        ],
+        "optional_secrets": [],
+        "network_domains": [
+          "*"
+        ],
+        "platforms": [
+          "imap",
+          "smtp"
+        ]
+      },
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.1.0/channels/email/channel-plugin.json",
+      "source": {
+        "type": "github_release",
+        "repo": "serenorg/dispatch-plugins",
+        "tag": "v0.1.0",
+        "checksum_asset": "SHA256SUMS.txt",
+        "binaries": [
+          {
+            "target": "aarch64-apple-darwin",
+            "asset": "channel-email-aarch64-apple-darwin",
+            "binary_name": "channel-email"
+          },
+          {
+            "target": "x86_64-apple-darwin",
+            "asset": "channel-email-x86_64-apple-darwin",
+            "binary_name": "channel-email"
+          },
+          {
+            "target": "aarch64-unknown-linux-gnu",
+            "asset": "channel-email-aarch64-unknown-linux-gnu",
+            "binary_name": "channel-email"
+          },
+          {
+            "target": "aarch64-unknown-linux-musl",
+            "asset": "channel-email-aarch64-unknown-linux-musl",
+            "binary_name": "channel-email"
+          },
+          {
+            "target": "x86_64-unknown-linux-gnu",
+            "asset": "channel-email-x86_64-unknown-linux-gnu",
+            "binary_name": "channel-email"
+          },
+          {
+            "target": "x86_64-unknown-linux-musl",
+            "asset": "channel-email-x86_64-unknown-linux-musl",
+            "binary_name": "channel-email"
+          },
+          {
+            "target": "x86_64-pc-windows-msvc",
+            "asset": "channel-email-x86_64-pc-windows-msvc.exe",
+            "binary_name": "channel-email.exe"
+          }
+        ]
+      }
+    },
+    {
       "name": "channel-slack",
       "display_name": "Slack Channel",
       "kind": "channel",
