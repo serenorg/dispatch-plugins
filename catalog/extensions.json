@@ -175,6 +175,185 @@
       }
     },
     {
+      "name": "channel-gmail",
+      "display_name": "Gmail Channel",
+      "kind": "channel",
+      "version": "0.1.0",
+      "description": "Gmail channel plugin for Dispatch using Gmail IMAP ingress and SMTP delivery.",
+      "protocol": "jsonl",
+      "protocol_version": 1,
+      "source_dir": "channels/gmail",
+      "manifest_path": "channels/gmail/channel-plugin.json",
+      "keywords": [
+        "dispatch",
+        "channel",
+        "gmail",
+        "email",
+        "imap"
+      ],
+      "tags": [
+        "email",
+        "gmail",
+        "imap",
+        "smtp"
+      ],
+      "install_hint": "dispatch channel install channels/gmail/channel-plugin.json",
+      "auth": {
+        "method": "manual",
+        "provider": "Google",
+        "setup_url": "https://myaccount.google.com/apppasswords"
+      },
+      "requirements": {
+        "secrets": [
+          "GMAIL_APP_PASSWORD"
+        ],
+        "optional_secrets": [],
+        "network_domains": [
+          "imap.gmail.com",
+          "smtp.gmail.com"
+        ],
+        "platforms": [
+          "gmail",
+          "imap",
+          "smtp"
+        ]
+      },
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.1.0/channels/gmail/channel-plugin.json",
+      "source": {
+        "type": "github_release",
+        "repo": "serenorg/dispatch-plugins",
+        "tag": "v0.1.0",
+        "checksum_asset": "SHA256SUMS.txt",
+        "binaries": [
+          {
+            "target": "aarch64-apple-darwin",
+            "asset": "channel-gmail-aarch64-apple-darwin",
+            "binary_name": "channel-gmail"
+          },
+          {
+            "target": "x86_64-apple-darwin",
+            "asset": "channel-gmail-x86_64-apple-darwin",
+            "binary_name": "channel-gmail"
+          },
+          {
+            "target": "aarch64-unknown-linux-gnu",
+            "asset": "channel-gmail-aarch64-unknown-linux-gnu",
+            "binary_name": "channel-gmail"
+          },
+          {
+            "target": "aarch64-unknown-linux-musl",
+            "asset": "channel-gmail-aarch64-unknown-linux-musl",
+            "binary_name": "channel-gmail"
+          },
+          {
+            "target": "x86_64-unknown-linux-gnu",
+            "asset": "channel-gmail-x86_64-unknown-linux-gnu",
+            "binary_name": "channel-gmail"
+          },
+          {
+            "target": "x86_64-unknown-linux-musl",
+            "asset": "channel-gmail-x86_64-unknown-linux-musl",
+            "binary_name": "channel-gmail"
+          },
+          {
+            "target": "x86_64-pc-windows-msvc",
+            "asset": "channel-gmail-x86_64-pc-windows-msvc.exe",
+            "binary_name": "channel-gmail.exe"
+          }
+        ]
+      }
+    },
+    {
+      "name": "channel-outlook",
+      "display_name": "Outlook Channel",
+      "kind": "channel",
+      "version": "0.1.0",
+      "description": "Outlook channel plugin for Dispatch using Outlook / Microsoft 365 IMAP ingress and SMTP delivery.",
+      "protocol": "jsonl",
+      "protocol_version": 1,
+      "source_dir": "channels/outlook",
+      "manifest_path": "channels/outlook/channel-plugin.json",
+      "keywords": [
+        "dispatch",
+        "channel",
+        "outlook",
+        "email",
+        "imap"
+      ],
+      "tags": [
+        "email",
+        "outlook",
+        "office365",
+        "smtp"
+      ],
+      "install_hint": "dispatch channel install channels/outlook/channel-plugin.json",
+      "auth": {
+        "method": "manual",
+        "provider": "Outlook / Microsoft 365",
+        "setup_url": "https://account.microsoft.com/security"
+      },
+      "requirements": {
+        "secrets": [
+          "OUTLOOK_EMAIL_PASSWORD"
+        ],
+        "optional_secrets": [],
+        "network_domains": [
+          "outlook.office365.com",
+          "smtp.office365.com"
+        ],
+        "platforms": [
+          "imap",
+          "smtp",
+          "office365",
+          "outlook"
+        ]
+      },
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.1.0/channels/outlook/channel-plugin.json",
+      "source": {
+        "type": "github_release",
+        "repo": "serenorg/dispatch-plugins",
+        "tag": "v0.1.0",
+        "checksum_asset": "SHA256SUMS.txt",
+        "binaries": [
+          {
+            "target": "aarch64-apple-darwin",
+            "asset": "channel-outlook-aarch64-apple-darwin",
+            "binary_name": "channel-outlook"
+          },
+          {
+            "target": "x86_64-apple-darwin",
+            "asset": "channel-outlook-x86_64-apple-darwin",
+            "binary_name": "channel-outlook"
+          },
+          {
+            "target": "aarch64-unknown-linux-gnu",
+            "asset": "channel-outlook-aarch64-unknown-linux-gnu",
+            "binary_name": "channel-outlook"
+          },
+          {
+            "target": "aarch64-unknown-linux-musl",
+            "asset": "channel-outlook-aarch64-unknown-linux-musl",
+            "binary_name": "channel-outlook"
+          },
+          {
+            "target": "x86_64-unknown-linux-gnu",
+            "asset": "channel-outlook-x86_64-unknown-linux-gnu",
+            "binary_name": "channel-outlook"
+          },
+          {
+            "target": "x86_64-unknown-linux-musl",
+            "asset": "channel-outlook-x86_64-unknown-linux-musl",
+            "binary_name": "channel-outlook"
+          },
+          {
+            "target": "x86_64-pc-windows-msvc",
+            "asset": "channel-outlook-x86_64-pc-windows-msvc.exe",
+            "binary_name": "channel-outlook.exe"
+          }
+        ]
+      }
+    },
+    {
       "name": "channel-slack",
       "display_name": "Slack Channel",
       "kind": "channel",

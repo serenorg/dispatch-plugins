@@ -8,6 +8,8 @@ Dispatch channel extensions collected under a single parent directory.
 - `channels/schema` - shared manifest and catalog schema for channel plugins
 - `channels/discord` - Discord interaction-webhook plugin
 - `channels/email` - IMAP + SMTP email plugin
+- `channels/gmail` - Gmail-focused IMAP + SMTP email plugin
+- `channels/outlook` - Outlook / Microsoft 365 IMAP + SMTP email plugin
 - `channels/signal` - Signal plugin backed by `signal-cli-rest-api`
 - `channels/slack` - Slack Events API / Socket Mode plugin
 - `channels/telegram` - Telegram Bot API plugin
@@ -22,6 +24,8 @@ Dispatch channel extensions collected under a single parent directory.
 | --- | --- | --- | --- |
 | `channel-discord` | Interaction webhook only | Host-managed HTTPS callback | Discord REST bot messages |
 | `channel-email` | Background ingress session only | IMAP polling worker inside the plugin | SMTP delivery |
+| `channel-gmail` | Background ingress session only | Gmail IMAP polling worker inside the plugin | Gmail SMTP delivery |
+| `channel-outlook` | Background ingress session only | Outlook / Microsoft 365 IMAP polling worker inside the plugin | Outlook / Microsoft 365 SMTP delivery |
 | `channel-signal` | Background ingress session only | `signal-cli-rest-api` HTTP receive in `native` / `normal`, websocket receive in `json-rpc` | Signal REST API |
 | `channel-slack` | Events API webhook or Socket Mode | Host-managed HTTPS callback or Slack Socket Mode websocket | `chat.postMessage` or incoming webhook |
 | `channel-telegram` | Bot API webhook or polling | Telegram webhook callback or Bot API `getUpdates` | `sendMessage`, `sendPhoto`, `sendDocument` |
@@ -56,6 +60,10 @@ polling, an upstream websocket, or plain webhook callbacks.
 - Email-oriented plugins are still channels in Dispatch because they surface
   inbound user-originated messages and outbound replies through the same
   normalized conversation/event model as chat platforms.
+- Email service variants stay service-specific at the plugin layer:
+  `channel-email`, `channel-gmail`, and `channel-outlook`. Broader provider
+  umbrellas such as Google or Microsoft can exist later as separate connector
+  or tool surfaces without overloading the channel naming.
 - `catalog/extensions.json` acts as the local catalog seed for install/search
   tooling and normalizes the plugin manifests into one searchable index.
 - The protocol surface may still change as Dispatch hardens the channel

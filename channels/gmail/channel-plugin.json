@@ -1,0 +1,48 @@
+{
+  "schema": "https://serenorg.github.io/dispatch/schemas/extension.v1.json",
+  "kind": "channel",
+  "name": "channel-gmail",
+  "version": "0.1.0",
+  "protocol": "jsonl",
+  "protocol_version": 1,
+  "description": "Gmail channel plugin for Dispatch using Gmail IMAP ingress and SMTP delivery.",
+  "entrypoint": {
+    "command": "../../target/release/channel-gmail",
+    "args": []
+  },
+  "auth": {
+    "mode": "manual",
+    "provider": "Google",
+    "setup_url": "https://myaccount.google.com/apppasswords"
+  },
+  "capabilities": {
+    "channel": {
+      "platform": "gmail",
+      "ingress_modes": ["polling"],
+      "outbound_message_types": ["text"],
+      "threading_model": "caller_defined",
+      "attachment_support": true,
+      "reply_verification_support": false,
+      "account_scoped_config": true,
+      "allow_polling": true,
+      "webhook_secret_support": false,
+      "allowed_paths": [],
+      "ingress": {
+        "polling": {
+          "min_interval_ms": 5000,
+          "default_interval_ms": 60000
+        }
+      },
+      "delivery": {
+        "push": true,
+        "status_frames": false,
+        "attachment_sources": ["data_base64"]
+      }
+    }
+  },
+  "requirements": {
+    "secrets": ["GMAIL_APP_PASSWORD"],
+    "network_domains": ["imap.gmail.com", "smtp.gmail.com"],
+    "platforms": ["gmail", "imap", "smtp"]
+  }
+}

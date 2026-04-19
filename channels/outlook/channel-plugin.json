@@ -1,0 +1,48 @@
+{
+  "schema": "https://serenorg.github.io/dispatch/schemas/extension.v1.json",
+  "kind": "channel",
+  "name": "channel-outlook",
+  "version": "0.1.0",
+  "protocol": "jsonl",
+  "protocol_version": 1,
+  "description": "Outlook channel plugin for Dispatch using Outlook / Microsoft 365 IMAP ingress and SMTP delivery.",
+  "entrypoint": {
+    "command": "../../target/release/channel-outlook",
+    "args": []
+  },
+  "auth": {
+    "mode": "manual",
+    "provider": "Outlook / Microsoft 365",
+    "setup_url": "https://account.microsoft.com/security"
+  },
+  "capabilities": {
+    "channel": {
+      "platform": "outlook",
+      "ingress_modes": ["polling"],
+      "outbound_message_types": ["text"],
+      "threading_model": "caller_defined",
+      "attachment_support": true,
+      "reply_verification_support": false,
+      "account_scoped_config": true,
+      "allow_polling": true,
+      "webhook_secret_support": false,
+      "allowed_paths": [],
+      "ingress": {
+        "polling": {
+          "min_interval_ms": 5000,
+          "default_interval_ms": 60000
+        }
+      },
+      "delivery": {
+        "push": true,
+        "status_frames": false,
+        "attachment_sources": ["data_base64"]
+      }
+    }
+  },
+  "requirements": {
+    "secrets": ["OUTLOOK_EMAIL_PASSWORD"],
+    "network_domains": ["outlook.office365.com", "smtp.office365.com"],
+    "platforms": ["imap", "smtp", "office365", "outlook"]
+  }
+}

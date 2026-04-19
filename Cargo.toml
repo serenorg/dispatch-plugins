@@ -3,6 +3,8 @@ members = [
   "catalog",
   "channels/discord",
   "channels/email",
+  "channels/gmail",
+  "channels/outlook",
   "channels/schema",
   "channels/signal",
   "channels/slack",

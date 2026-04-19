@@ -2,6 +2,12 @@
 
 A [Dispatch](https://github.com/serenorg/dispatch) channel plugin for email.
 
+Provider-specific presets also exist in this repo:
+
+- `channel-gmail` - Gmail-flavoured IMAP/SMTP defaults and setup guidance
+- `channel-outlook` - Outlook / Microsoft 365 IMAP/SMTP defaults and
+  setup guidance
+
 ## Scope
 
 Implemented:
@@ -83,6 +89,12 @@ Useful config fields:
 - `default_subject` - fallback subject for manual pushes
 - `poll_interval_secs` - IMAP polling interval, clamped to at least 5 seconds
 
+Provider presets:
+
+- Gmail defaults: `imap.gmail.com:993`, `smtp.gmail.com:465`
+- Microsoft / Outlook defaults: `outlook.office365.com:993`,
+  `smtp.office365.com:587`
+
 Minimal config:
 
 ```toml
@@ -115,6 +127,13 @@ export EMAIL_SMTP_PASSWORD="replace-me"
     by `smtp_password_env`.
 5. Set the IMAP and SMTP hostnames in the plugin config.
 6. Start polling through Dispatch.
+
+Examples:
+
+- Gmail usually uses an app password with `imap.gmail.com` and
+  `smtp.gmail.com`
+- Outlook.com / Microsoft 365 usually uses `outlook.office365.com` and
+  `smtp.office365.com`
 
 Operational notes:
 
