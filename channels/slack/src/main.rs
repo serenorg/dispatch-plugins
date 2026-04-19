@@ -1,30 +1,29 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use dispatch_channel_runtime::{
+    IngressWorker, no_after_cycle, restart_ingress_worker as restart_runtime_ingress_worker,
+    stop_ingress_worker, write_stdout_line,
+};
 use hmac::{Hmac, Mac};
 use jiff::Timestamp;
 use serde::Deserialize;
 use sha2::Sha256;
 use std::{
     collections::BTreeMap,
-    io::{self, BufRead, Write},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::{self, JoinHandle},
+    io::{self, BufRead},
+    sync::{Arc, Mutex},
 };
 
 mod protocol;
 mod slack_api;
 
 use protocol::{
-    CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ChannelEventNotification, ChannelPolicy,
-    ConfiguredChannel, DeliveryReceipt, HealthReport, InboundActor, InboundAttachment,
-    InboundConversationRef, InboundEventEnvelope, InboundMessage, IngressCallbackReply,
-    IngressMode, IngressPayload, IngressState, OutboundMessage, PluginNotificationEnvelope,
-    PluginRequest, PluginRequestEnvelope, PluginResponse, StatusAcceptance, StatusFrame,
-    StatusKind, capabilities, notification_to_jsonrpc, parse_jsonrpc_request, plugin_error,
+    CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ChannelPolicy, ConfiguredChannel,
+    DeliveryReceipt, HealthReport, InboundActor, InboundAttachment, InboundConversationRef,
+    InboundEventEnvelope, InboundMessage, IngressCallbackReply, IngressMode, IngressPayload,
+    IngressState, OutboundMessage, PluginRequest, PluginRequestEnvelope, PluginResponse,
+    StatusAcceptance, StatusFrame, StatusKind, capabilities, parse_jsonrpc_request, plugin_error,
     response_to_jsonrpc,
 };
 use slack_api::{SlackClient, SlackUpload, send_incoming_webhook};
@@ -75,12 +74,6 @@ const ROUTE_CONVERSATION_ID: &str = "conversation_id";
 const ROUTE_THREAD_ID: &str = "thread_id";
 const ROUTE_DESTINATION_URL: &str = "destination_url";
 const SLACK_STATUS_TEXT: &str = "slack_status_text";
-
-struct IngressWorker {
-    stop: Arc<AtomicBool>,
-    state: Arc<Mutex<Option<IngressState>>>,
-    handle: JoinHandle<()>,
-}
 
 fn main() -> Result<()> {
     let stdin = io::stdin().lock();
@@ -189,104 +182,22 @@ fn restart_ingress_worker(
     state: IngressState,
     stdout_lock: Arc<Mutex<()>>,
 ) {
-    let _ = stop_ingress_worker(worker);
-    *worker = Some(spawn_ingress_worker(config, state, stdout_lock));
-}
-
-fn spawn_ingress_worker(
-    config: ChannelConfig,
-    initial_state: IngressState,
-    stdout_lock: Arc<Mutex<()>>,
-) -> IngressWorker {
-    let stop = Arc::new(AtomicBool::new(false));
-    let state = Arc::new(Mutex::new(Some(initial_state)));
-    let stop_flag = Arc::clone(&stop);
-    let shared_state = Arc::clone(&state);
-    let handle = thread::spawn(move || {
-        while !stop_flag.load(Ordering::Relaxed) {
-            let prior_state = shared_state
-                .lock()
-                .expect("slack ingress state poisoned")
-                .clone();
-            match handle_poll_ingress(&config, prior_state.as_ref()) {
-                Ok(PluginResponse::IngressEventsReceived {
-                    events,
-                    state,
-                    poll_after_ms,
-                    ..
-                }) => {
-                    if let Some(next_state) = state.clone() {
-                        *shared_state.lock().expect("slack ingress state poisoned") =
-                            Some(next_state);
-                    }
-                    if let Err(error) = emit_channel_event_notification(
-                        &stdout_lock,
-                        ChannelEventNotification {
-                            events,
-                            state,
-                            poll_after_ms,
-                        },
-                    ) {
-                        eprintln!("slack ingress worker failed to emit notification: {error}");
-                        break;
-                    }
-                }
-                Ok(PluginResponse::Error { error }) => {
-                    eprintln!(
-                        "slack ingress worker stopped after plugin error {}: {}",
-                        error.code, error.message
-                    );
-                    break;
-                }
-                Ok(other) => {
-                    eprintln!(
-                        "slack ingress worker received unexpected response variant: {:?}",
-                        other
-                    );
-                    break;
-                }
-                Err(error) => {
-                    eprintln!("slack ingress worker stopped after receive failure: {error}");
-                    break;
-                }
-            }
-        }
-    });
-
-    IngressWorker {
-        stop,
+    restart_runtime_ingress_worker(
+        worker,
+        config,
         state,
-        handle,
-    }
+        stdout_lock,
+        PLATFORM_SLACK,
+        slack_poll_ingress,
+        no_after_cycle::<ChannelConfig>,
+    );
 }
 
-fn stop_ingress_worker(worker: &mut Option<IngressWorker>) -> Option<IngressState> {
-    let worker = worker.take()?;
-    worker.stop.store(true, Ordering::Relaxed);
-    let _ = worker.handle.join();
-    worker.state.lock().ok().and_then(|state| (*state).clone())
-}
-
-fn emit_channel_event_notification(
-    stdout_lock: &Arc<Mutex<()>>,
-    notification: ChannelEventNotification,
-) -> Result<()> {
-    let envelope = PluginNotificationEnvelope {
-        protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
-        notification,
-    };
-    let json = notification_to_jsonrpc(&envelope).map_err(|error| anyhow!(error))?;
-    write_stdout_line(stdout_lock, &json)
-}
-
-fn write_stdout_line(stdout_lock: &Arc<Mutex<()>>, line: &str) -> Result<()> {
-    let _guard = stdout_lock
-        .lock()
-        .map_err(|_| anyhow!("stdout lock poisoned"))?;
-    let mut stdout = io::stdout().lock();
-    writeln!(stdout, "{line}")?;
-    stdout.flush()?;
-    Ok(())
+fn slack_poll_ingress(
+    config: &ChannelConfig,
+    state: Option<IngressState>,
+) -> Result<PluginResponse> {
+    handle_poll_ingress(config, state.as_ref())
 }
 
 fn configure(config: &ChannelConfig) -> Result<ConfiguredChannel> {

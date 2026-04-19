@@ -2,17 +2,17 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use dispatch_channel_protocol as proto;
+use dispatch_channel_runtime::{
+    IngressWorker, StopSignal, restart_ingress_worker as restart_runtime_ingress_worker,
+    stop_ingress_worker, write_stdout_line,
+};
 use jiff::Timestamp;
 use mail_parser::{MessageParser, MimeHeaders};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    io::{self, BufRead, Write},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::{self, JoinHandle},
+    io::{self, BufRead},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -124,12 +124,6 @@ pub trait EmailPreset: Send + Sync + 'static {
     const DEFAULT_SMTP_PORT: u16 = 587;
     const DEFAULT_IMAP_PASSWORD_ENV: &'static str;
     const DEFAULT_SMTP_PASSWORD_ENV: &'static str;
-}
-
-struct IngressWorker {
-    stop: Arc<AtomicBool>,
-    state: Arc<Mutex<Option<IngressState>>>,
-    handle: JoinHandle<()>,
 }
 
 pub fn capabilities<P: EmailPreset>() -> ChannelCapabilities {
@@ -261,115 +255,26 @@ fn restart_ingress_worker<P: EmailPreset>(
     state: IngressState,
     stdout_lock: Arc<Mutex<()>>,
 ) {
-    let _ = stop_ingress_worker(worker);
-    *worker = Some(spawn_ingress_worker::<P>(config, state, stdout_lock));
-}
-
-fn spawn_ingress_worker<P: EmailPreset>(
-    config: ChannelConfig,
-    initial_state: IngressState,
-    stdout_lock: Arc<Mutex<()>>,
-) -> IngressWorker {
-    let stop = Arc::new(AtomicBool::new(false));
-    let state = Arc::new(Mutex::new(Some(initial_state)));
-    let stop_flag = Arc::clone(&stop);
-    let shared_state = Arc::clone(&state);
-    let handle = thread::spawn(move || {
-        while !stop_flag.load(Ordering::Relaxed) {
-            let prior_state = shared_state
-                .lock()
-                .expect("email ingress state poisoned")
-                .clone();
-            match poll_ingress::<P>(&config, prior_state) {
-                Ok(PluginResponse::IngressEventsReceived {
-                    events,
-                    state,
-                    poll_after_ms,
-                    ..
-                }) => {
-                    if let Some(next_state) = state.clone() {
-                        *shared_state.lock().expect("email ingress state poisoned") =
-                            Some(next_state);
-                    }
-                    if let Err(error) = emit_channel_event_notification(
-                        &stdout_lock,
-                        ChannelEventNotification {
-                            events,
-                            state,
-                            poll_after_ms,
-                        },
-                    ) {
-                        eprintln!(
-                            "{} ingress worker failed to emit notification: {error}",
-                            P::DISPLAY_NAME
-                        );
-                        break;
-                    }
-                }
-                Ok(PluginResponse::Error { error }) => {
-                    eprintln!(
-                        "{} ingress worker stopped after plugin error {}: {}",
-                        P::DISPLAY_NAME,
-                        error.code,
-                        error.message
-                    );
-                    break;
-                }
-                Ok(other) => {
-                    eprintln!(
-                        "{} ingress worker received unexpected response variant: {:?}",
-                        P::DISPLAY_NAME,
-                        other
-                    );
-                    break;
-                }
-                Err(error) => {
-                    eprintln!(
-                        "{} ingress worker stopped after receive failure: {error}",
-                        P::DISPLAY_NAME
-                    );
-                    break;
-                }
-            }
-
-            sleep_until_next_cycle(&stop_flag, poll_interval_secs(&config));
-        }
-    });
-
-    IngressWorker {
-        stop,
+    restart_runtime_ingress_worker(
+        worker,
+        config,
         state,
-        handle,
-    }
+        stdout_lock,
+        P::DISPLAY_NAME,
+        email_poll_ingress::<P>,
+        email_after_cycle,
+    );
 }
 
-fn stop_ingress_worker(worker: &mut Option<IngressWorker>) -> Option<IngressState> {
-    let worker = worker.take()?;
-    worker.stop.store(true, Ordering::Relaxed);
-    let _ = worker.handle.join();
-    worker.state.lock().ok().and_then(|state| (*state).clone())
+fn email_poll_ingress<P: EmailPreset>(
+    config: &ChannelConfig,
+    state: Option<IngressState>,
+) -> Result<PluginResponse> {
+    poll_ingress::<P>(config, state)
 }
 
-fn emit_channel_event_notification(
-    stdout_lock: &Arc<Mutex<()>>,
-    notification: ChannelEventNotification,
-) -> Result<()> {
-    let envelope = PluginNotificationEnvelope {
-        protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
-        notification,
-    };
-    let json = notification_to_jsonrpc(&envelope).map_err(|error| anyhow!(error))?;
-    write_stdout_line(stdout_lock, &json)
-}
-
-fn write_stdout_line(stdout_lock: &Arc<Mutex<()>>, line: &str) -> Result<()> {
-    let _guard = stdout_lock
-        .lock()
-        .map_err(|_| anyhow!("stdout lock poisoned"))?;
-    let mut stdout = io::stdout().lock();
-    writeln!(stdout, "{line}")?;
-    stdout.flush()?;
-    Ok(())
+fn email_after_cycle(config: &ChannelConfig, stop: &StopSignal) {
+    stop.sleep_until_stopped(Duration::from_secs(u64::from(poll_interval_secs(config))));
 }
 
 pub fn configure<P: EmailPreset>(config: &ChannelConfig) -> Result<ConfiguredChannel> {
@@ -1057,16 +962,6 @@ fn poll_interval_secs(config: &ChannelConfig) -> u16 {
         .poll_interval_secs
         .map(|secs| secs.max(MIN_POLL_INTERVAL_SECS))
         .unwrap_or(DEFAULT_POLL_INTERVAL_SECS)
-}
-
-fn sleep_until_next_cycle(stop: &Arc<AtomicBool>, total_secs: u16) {
-    let deadline = Duration::from_secs(u64::from(total_secs));
-    let mut slept = Duration::ZERO;
-    while slept < deadline && !stop.load(Ordering::Relaxed) {
-        let step = std::cmp::min(Duration::from_millis(250), deadline - slept);
-        thread::sleep(step);
-        slept += step;
-    }
 }
 
 fn rejected_status(reason_code: &str, message: impl Into<String>) -> StatusAcceptance {

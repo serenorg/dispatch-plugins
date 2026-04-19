@@ -1,25 +1,24 @@
 use anyhow::{Context, Result, anyhow, bail};
+use dispatch_channel_runtime::{
+    IngressWorker, no_after_cycle, restart_ingress_worker as restart_runtime_ingress_worker,
+    stop_ingress_worker, write_stdout_line,
+};
 use jiff::Timestamp;
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
-    io::{self, BufRead, Write},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::{self, JoinHandle},
+    io::{self, BufRead},
+    sync::{Arc, Mutex},
 };
 
 mod protocol;
 mod signal_api;
 
 use protocol::{
-    CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ChannelEventNotification, ConfiguredChannel,
-    DeliveryReceipt, HealthReport, InboundActor, InboundAttachment, InboundConversationRef,
-    InboundEventEnvelope, InboundMessage, IngressMode, IngressState, OutboundMessage,
-    PluginNotificationEnvelope, PluginRequest, PluginRequestEnvelope, PluginResponse,
-    StatusAcceptance, StatusFrame, StatusKind, capabilities, notification_to_jsonrpc,
+    CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ConfiguredChannel, DeliveryReceipt,
+    HealthReport, InboundActor, InboundAttachment, InboundConversationRef, InboundEventEnvelope,
+    InboundMessage, IngressMode, IngressState, OutboundMessage, PluginRequest,
+    PluginRequestEnvelope, PluginResponse, StatusAcceptance, StatusFrame, StatusKind, capabilities,
     parse_jsonrpc_request, plugin_error, response_to_jsonrpc,
 };
 use signal_api::{SignalAttachmentPayload, SignalClient, SignalReceiveTransport, parse_target};
@@ -46,12 +45,6 @@ const TRANSPORT_WEBSOCKET: &str = "websocket";
 const ROUTE_CONVERSATION_ID: &str = "conversation_id";
 const PLATFORM_SIGNAL: &str = "signal";
 const TRANSPORT_POLLING: &str = "polling";
-
-struct IngressWorker {
-    stop: Arc<AtomicBool>,
-    state: Arc<Mutex<Option<IngressState>>>,
-    handle: JoinHandle<()>,
-}
 
 fn main() -> Result<()> {
     let stdin = io::stdin().lock();
@@ -152,100 +145,22 @@ fn restart_ingress_worker(
     state: IngressState,
     stdout_lock: Arc<Mutex<()>>,
 ) {
-    let _ = stop_ingress_worker(worker);
-    *worker = Some(spawn_ingress_worker(config, state, stdout_lock));
-}
-
-fn spawn_ingress_worker(
-    config: ChannelConfig,
-    initial_state: IngressState,
-    stdout_lock: Arc<Mutex<()>>,
-) -> IngressWorker {
-    let stop = Arc::new(AtomicBool::new(false));
-    let state = Arc::new(Mutex::new(Some(initial_state.clone())));
-    let stop_flag = Arc::clone(&stop);
-    let shared_state = Arc::clone(&state);
-    let handle = thread::spawn(move || {
-        while !stop_flag.load(Ordering::Relaxed) {
-            match poll_ingress(&config) {
-                Ok(PluginResponse::IngressEventsReceived {
-                    events,
-                    state,
-                    poll_after_ms,
-                    ..
-                }) => {
-                    if let Some(next_state) = state.clone() {
-                        *shared_state.lock().expect("signal ingress state poisoned") =
-                            Some(next_state);
-                    }
-                    if let Err(error) = emit_channel_event_notification(
-                        &stdout_lock,
-                        ChannelEventNotification {
-                            events,
-                            state,
-                            poll_after_ms,
-                        },
-                    ) {
-                        eprintln!("signal ingress worker failed to emit notification: {error}");
-                        break;
-                    }
-                }
-                Ok(PluginResponse::Error { error }) => {
-                    eprintln!(
-                        "signal ingress worker stopped after plugin error {}: {}",
-                        error.code, error.message
-                    );
-                    break;
-                }
-                Ok(other) => {
-                    eprintln!(
-                        "signal ingress worker received unexpected response variant: {:?}",
-                        other
-                    );
-                    break;
-                }
-                Err(error) => {
-                    eprintln!("signal ingress worker stopped after receive failure: {error}");
-                    break;
-                }
-            }
-        }
-    });
-
-    IngressWorker {
-        stop,
+    restart_runtime_ingress_worker(
+        worker,
+        config,
         state,
-        handle,
-    }
+        stdout_lock,
+        PLATFORM_SIGNAL,
+        signal_poll_ingress,
+        no_after_cycle::<ChannelConfig>,
+    );
 }
 
-fn stop_ingress_worker(worker: &mut Option<IngressWorker>) -> Option<IngressState> {
-    let worker = worker.take()?;
-    worker.stop.store(true, Ordering::Relaxed);
-    let _ = worker.handle.join();
-    worker.state.lock().ok().and_then(|state| (*state).clone())
-}
-
-fn emit_channel_event_notification(
-    stdout_lock: &Arc<Mutex<()>>,
-    notification: ChannelEventNotification,
-) -> Result<()> {
-    let envelope = PluginNotificationEnvelope {
-        protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
-        notification,
-    };
-    let json = notification_to_jsonrpc(&envelope).map_err(|error| anyhow!(error))?;
-    write_stdout_line(stdout_lock, &json)
-}
-
-fn write_stdout_line(stdout_lock: &Arc<Mutex<()>>, line: &str) -> Result<()> {
-    let _guard = stdout_lock
-        .lock()
-        .map_err(|_| anyhow!("stdout lock poisoned"))?;
-    let mut stdout = io::stdout().lock();
-    writeln!(stdout, "{line}")?;
-    stdout.flush()?;
-    Ok(())
+fn signal_poll_ingress(
+    config: &ChannelConfig,
+    _state: Option<IngressState>,
+) -> Result<PluginResponse> {
+    poll_ingress(config)
 }
 
 fn configure(config: &ChannelConfig) -> Result<ConfiguredChannel> {

@@ -169,6 +169,7 @@ fn serve_signal_receive_once(response_body: String) -> String {
     format!("http://{}", addr)
 }
 
+#[allow(clippy::result_large_err)]
 fn serve_signal_websocket_receive_once(response_body: String) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind signal websocket test listener");
     let addr = listener.local_addr().expect("listener addr");

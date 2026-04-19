@@ -1,0 +1,18 @@
+[package]
+name = "dispatch-channel-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Shared runtime helpers for Dispatch channel plugins."
+repository.workspace = true
+keywords = ["dispatch", "channel", "runtime", "plugins"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "dispatch_channel_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", rev = "e6a1c9a6c7f79507ffc0c7bcac8670ad47bd655d" }

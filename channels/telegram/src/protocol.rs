@@ -3,12 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub use proto::{
-    AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities,
-    ChannelEventNotification, ChannelPolicy, ConfiguredChannel, DeliveryReceipt, HealthReport,
-    InboundActor, InboundAttachment, InboundConversationRef, InboundEventEnvelope, InboundMessage,
-    IngressCallbackReply, IngressMode, IngressPayload, IngressState, OutboundAttachment,
-    PluginNotificationEnvelope, PluginResponse, StatusAcceptance, StatusFrame, StatusKind,
-    ThreadingModel, notification_to_jsonrpc, parse_jsonrpc_request, plugin_error,
+    AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities, ChannelPolicy,
+    ConfiguredChannel, DeliveryReceipt, HealthReport, InboundActor, InboundAttachment,
+    InboundConversationRef, InboundEventEnvelope, InboundMessage, IngressCallbackReply,
+    IngressMode, IngressPayload, IngressState, OutboundAttachment, PluginResponse,
+    StatusAcceptance, StatusFrame, StatusKind, ThreadingModel, parse_jsonrpc_request, plugin_error,
     response_to_jsonrpc,
 };
 

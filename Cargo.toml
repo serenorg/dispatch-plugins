@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "catalog",
+  "crates/dispatch-channel-runtime",
   "crates/channel-email-core",
   "channels/discord",
   "channels/email",

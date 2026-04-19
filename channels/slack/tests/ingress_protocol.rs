@@ -157,6 +157,7 @@ fn run_start_ingress_cycle(config: Value, envs: BTreeMap<String, String>) -> (Va
     )
 }
 
+#[allow(clippy::result_large_err)]
 fn serve_slack_socket_mode_once(event_payload: Value, expected_app_token: &str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind slack socket test listener");
     let addr = listener.local_addr().expect("listener addr");

@@ -124,6 +124,7 @@ dependencies = [
  "anyhow",
  "base64",
  "dispatch-channel-protocol",
+ "dispatch-channel-runtime",
  "imap",
  "jiff",
  "lettre",
@@ -170,6 +171,7 @@ dependencies = [
  "base64",
  "channel-schema",
  "dispatch-channel-protocol",
+ "dispatch-channel-runtime",
  "jiff",
  "serde",
  "serde_json",
@@ -186,6 +188,7 @@ dependencies = [
  "base64",
  "channel-schema",
  "dispatch-channel-protocol",
+ "dispatch-channel-runtime",
  "hex",
  "hmac",
  "jiff",
@@ -204,6 +207,7 @@ dependencies = [
  "base64",
  "channel-schema",
  "dispatch-channel-protocol",
+ "dispatch-channel-runtime",
  "jiff",
  "serde",
  "serde_json",
@@ -427,6 +431,14 @@ dependencies = [
  "dispatch-plugin-rpc",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "dispatch-channel-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dispatch-channel-protocol",
 ]
 
 [[package]]
