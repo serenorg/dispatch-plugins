@@ -8,12 +8,10 @@ members = [
   "channels/gmail",
   "channels/outlook",
   "channels/schema",
-  "channels/signal",
   "channels/slack",
   "channels/telegram",
   "channels/twilio-sms",
   "channels/webhook",
-  "channels/whatsapp",
 ]
 resolver = "3"
 

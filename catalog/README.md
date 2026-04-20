@@ -1,10 +1,8 @@
 # dispatch-extension-catalog
 
-A small local helper for browsing the Dispatch extension catalog in
-`catalog/extensions.json`.
+A small local helper for browsing the Dispatch extension catalog in `catalog/extensions.json`.
 
-It is intentionally narrow. It does not install anything itself. It reads the
-catalog index and provides:
+It is intentionally narrow. It does not install anything itself. It reads the catalog index and provides:
 
 - `list`
 - `search <query>`

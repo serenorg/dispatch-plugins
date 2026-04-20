@@ -5,8 +5,7 @@ A [Dispatch](https://github.com/serenorg/dispatch) channel plugin for email.
 Provider-specific presets also exist in this repo:
 
 - `channel-gmail` - Gmail-flavoured IMAP/SMTP defaults and setup guidance
-- `channel-outlook` - Outlook / Microsoft 365 IMAP/SMTP defaults and
-  setup guidance
+- `channel-outlook` - Outlook / Microsoft 365 IMAP/SMTP defaults and setup guidance
 
 ## Scope
 
@@ -25,25 +24,16 @@ Implemented:
 
 Behavior:
 
-- inbound email supports both one-shot `poll_ingress` fetches and background
-  `start_ingress` sessions over IMAP
+- inbound email supports both one-shot `poll_ingress` fetches and background `start_ingress` sessions over IMAP
 - outbound email is sent through SMTP
 - replies route back to the sender or `Reply-To` address from the inbound mail
-- inbound subjects are surfaced as `thread_id` so Dispatch replies can preserve
-  the thread subject without host changes
+- inbound subjects are surfaced as `thread_id` so Dispatch replies can preserve the thread subject without host changes
 - inbound attachment metadata is surfaced on the normalized event
-- inbound message metadata includes `body_source = text | html | subject` so
-  downstream consumers can tell whether the message body came from a real
-  text/plain part, HTML fallback, or subject-only fallback
+- inbound message metadata includes `body_source = text | html | subject` so downstream consumers can tell whether the message body came from a real text/plain part, HTML fallback, or subject-only fallback
 - outbound attachments require `data_base64`
-- outbound deliveries accept per-message `cc` / `bcc` metadata (comma-separated
-  address lists), with optional `default_cc` / `default_bcc` fallbacks on the
-  channel config
-- inbound messages with only an HTML body are converted to plaintext with a
-  lightweight HTML stripper so the agent always sees readable content
-- mailing-list and auto-responder traffic is suppressed at ingress via the
-  `Auto-Submitted`, `Precedence`, and `List-Unsubscribe` headers so agents do
-  not reply to bounces, digests, or bulk mail
+- outbound deliveries accept per-message `cc` / `bcc` metadata (comma-separated address lists), with optional `default_cc` / `default_bcc` fallbacks on the channel config
+- inbound messages with only an HTML body are converted to plaintext with a lightweight HTML stripper so the agent always sees readable content
+- mailing-list and auto-responder traffic is suppressed at ingress via the `Auto-Submitted`, `Precedence`, and `List-Unsubscribe` headers so agents do not reply to bounces, digests, or bulk mail
 
 Not implemented:
 
@@ -54,24 +44,19 @@ Not implemented:
 
 ## Why IMAP, not POP
 
-POP is not a good fit for a channel-style integration. Dispatch needs mailbox
-state, threading metadata, and repeatable incremental reads. IMAP provides
-that; POP does not.
+POP is not a good fit for a channel-style integration. Dispatch needs mailbox state, threading metadata, and repeatable incremental reads. IMAP provides that; POP does not.
 
 ## Availability
 
 Inbound:
 
-- one-shot polling and background ingress are available anywhere the plugin can
-  reach the IMAP server
-- Dispatch keeps the plugin subprocess alive while polling is active, and the
-  plugin emits `channel.event` notifications as new mail arrives
+- one-shot polling and background ingress are available anywhere the plugin can reach the IMAP server
+- Dispatch keeps the plugin subprocess alive while polling is active, and the plugin emits `channel.event` notifications as new mail arrives
 
 Outbound:
 
 - replies and proactive pushes use SMTP
-- `default_recipient` and `default_subject` provide routing defaults for
-  operator-triggered sends
+- `default_recipient` and `default_subject` provide routing defaults for operator-triggered sends
 
 ## Configuration
 
@@ -95,8 +80,7 @@ Useful config fields:
 - `imap_password_env` - defaults to `EMAIL_IMAP_PASSWORD`
 - `smtp_port` - defaults to `587`
 - `smtp_username` - falls back to `imap_username`
-- `smtp_password_env` - defaults to `EMAIL_SMTP_PASSWORD`, then falls back to
-  `imap_password_env`
+- `smtp_password_env` - defaults to `EMAIL_SMTP_PASSWORD`, then falls back to `imap_password_env`
 - `smtp_from_email` - outbound sender address; falls back to `smtp_username`
 - `smtp_from_name` - optional display name for the From header
 - `default_recipient` - fallback destination for manual pushes
@@ -108,8 +92,7 @@ Useful config fields:
 Provider presets:
 
 - Gmail defaults: `imap.gmail.com:993`, `smtp.gmail.com:465`
-- Microsoft / Outlook defaults: `outlook.office365.com:993`,
-  `smtp.office365.com:587`
+- Microsoft / Outlook defaults: `outlook.office365.com:993`, `smtp.office365.com:587`
 
 Minimal config:
 
@@ -135,30 +118,23 @@ export EMAIL_SMTP_PASSWORD="replace-me"
 ## Setup
 
 1. Create or choose the mailbox Dispatch should watch.
-2. Enable IMAP access for that mailbox with an app password or provider-issued
-    SMTP/IMAP credential.
-3. Export the IMAP password into `EMAIL_IMAP_PASSWORD` or another env var named
-    by `imap_password_env`.
-4. Export the SMTP password into `EMAIL_SMTP_PASSWORD` or another env var named
-    by `smtp_password_env`.
+2. Enable IMAP access for that mailbox with an app password or provider-issued SMTP/IMAP credential.
+3. Export the IMAP password into `EMAIL_IMAP_PASSWORD` or another env var named by `imap_password_env`.
+4. Export the SMTP password into `EMAIL_SMTP_PASSWORD` or another env var named by `smtp_password_env`.
 5. Set the IMAP and SMTP hostnames in the plugin config.
 6. Start polling through Dispatch.
 
 Examples:
 
-- Gmail usually uses an app password with `imap.gmail.com` and
-  `smtp.gmail.com`
-- Outlook.com / Microsoft 365 usually uses `outlook.office365.com` and
-  `smtp.office365.com`
+- Gmail usually uses an app password with `imap.gmail.com` and `smtp.gmail.com`
+- Outlook.com / Microsoft 365 usually uses `outlook.office365.com` and `smtp.office365.com`
 
 Operational notes:
 
 - `poll_ingress` performs one IMAP fetch cycle and returns updated cursor state
-- `start_ingress` records the current IMAP UID cursor and does not replay the
-  full historical mailbox by default
+- `start_ingress` records the current IMAP UID cursor and does not replay the full historical mailbox by default
 - restored Dispatch polling state resumes from the prior IMAP UID
-- if the mailbox UID validity changes, the plugin resets its cursor to the
-  current mailbox head instead of replaying stale history
+- if the mailbox UID validity changes, the plugin resets its cursor to the current mailbox head instead of replaying stale history
 
 ## Dispatch usage
 
@@ -173,33 +149,26 @@ dispatch channel call channel-email \
   --request-json '{"kind":"push","config":{"smtp_host":"smtp.example.com","smtp_username":"dispatch@example.com","smtp_from_email":"dispatch@example.com","default_recipient":"user@example.com","default_subject":"Dispatch test"},"message":{"content":"Dispatch email test"}}'
 ```
 
-The plugin transport is JSON-RPC 2.0 over JSONL on stdio. For the full wire
-format, see Dispatch's `docs/extensions.md`.
+The plugin transport is JSON-RPC 2.0 over JSONL on stdio. For the full wire format, see Dispatch's `docs/extensions.md`.
 
 ## Notes on routing
 
-- inbound `conversation_id` is the preferred reply destination: `Reply-To`
-  when present, otherwise `From`
+- inbound `conversation_id` is the preferred reply destination: `Reply-To` when present, otherwise `From`
 - inbound `thread_id` is the message subject
 - inbound `message.id` is the RFC5322 `Message-ID` when present
-- Dispatch-generated replies preserve `conversation_id`, `thread_id`, and
-  `reply_to_message_id`, which lets the plugin rebuild a threaded SMTP reply
-- to Cc or Bcc additional recipients on a push or reply, set
-  `message.metadata.cc` / `message.metadata.bcc` to comma-separated address
-  lists (each entry may be `"user@example.com"` or `"Name <user@example.com>"`)
+- Dispatch-generated replies preserve `conversation_id`, `thread_id`, and `reply_to_message_id`, which lets the plugin rebuild a threaded SMTP reply
+- to Cc or Bcc additional recipients on a push or reply, set `message.metadata.cc` / `message.metadata.bcc` to comma-separated address lists (each entry may be `"user@example.com"` or `"Name <user@example.com>"`)
 
 ## Notes on inbound filtering
 
 Messages are dropped silently (no event emitted) when:
 
-- the sender address matches any of `imap_username`, `smtp_username`, or
-  `smtp_from_email` (self-authored loop prevention)
+- the sender address matches any of `imap_username`, `smtp_username`, or `smtp_from_email` (self-authored loop prevention)
 - the message carries `Auto-Submitted` set to anything other than `no`
 - the message carries `Precedence` of `bulk`, `list`, `junk`, or `auto_reply`
 - the message carries a `List-Unsubscribe` header
 
-These heuristics match the long-standing conventions used to avoid replying
-to bounces, vacation auto-replies, and mailing-list traffic.
+These heuristics match the long-standing conventions used to avoid replying to bounces, vacation auto-replies, and mailing-list traffic.
 
 ## License
 

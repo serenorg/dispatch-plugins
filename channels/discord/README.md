@@ -1,7 +1,6 @@
 # channel-discord
 
-A [Dispatch](https://github.com/serenorg/dispatch) channel plugin
-for Discord.
+A [Dispatch](https://github.com/serenorg/dispatch) channel plugin for Discord.
 
 ## Scope
 
@@ -22,10 +21,8 @@ Behavior:
 - outbound delivery sends bot messages to a Discord channel or thread
 - outbound attachments support one inline `data_base64` file upload per message
 - health checks validate the bot token against `GET /users/@me`
-- ingress verifies Discord interaction signatures and normalizes interaction
-  payloads
-- `start_ingress` reports the expected public interaction endpoint and
-  verification-key requirement
+- ingress verifies Discord interaction signatures and normalizes interaction payloads
+- `start_ingress` reports the expected public interaction endpoint and verification-key requirement
 - status frames render visible status messages into a Discord channel or thread
 
 Not implemented:
@@ -49,8 +46,7 @@ Required:
 
 Ingress verification when using `start_ingress`:
 
-- `DISCORD_INTERACTION_PUBLIC_KEY` - optional at install time, required when
-  the configured ingress mode relies on Discord interaction webhooks
+- `DISCORD_INTERACTION_PUBLIC_KEY` - optional at install time, required when the configured ingress mode relies on Discord interaction webhooks
 
 ## Setup
 
@@ -59,10 +55,8 @@ To obtain the required Discord credentials:
 1. Create an application in the Discord Developer Portal.
 2. Add a bot user to the application.
 3. Copy the bot token and export it as `DISCORD_BOT_TOKEN`.
-4. If you are using interaction webhooks, copy the application's public key
-    and export it as `DISCORD_INTERACTION_PUBLIC_KEY`.
-5. Install the bot into the target server with the permissions needed to post
-    messages in the destination channel or thread.
+4. If you are using interaction webhooks, copy the application's public key and export it as `DISCORD_INTERACTION_PUBLIC_KEY`.
+5. Install the bot into the target server with the permissions needed to post messages in the destination channel or thread.
 
 Minimal config:
 
@@ -74,8 +68,7 @@ webhook_path = "/discord/interactions"
 
 ## Manifest
 
-The Dispatch channel manifest is stored in `channel-plugin.json`. The host can
-install it with `dispatch channel install`.
+The Dispatch channel manifest is stored in `channel-plugin.json`. The host can install it with `dispatch channel install`.
 
 ## Dispatch usage
 
@@ -91,14 +84,11 @@ dispatch channel call channel-discord \
   --request-json '{"kind":"push","config":{"default_channel_id":"123456789012345678"},"message":{"content":"Dispatch Discord test"}}'
 ```
 
-The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Dispatch operators
-normally use the host CLI rather than writing raw envelopes.
+The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Dispatch operators normally use the host CLI rather than writing raw envelopes.
 
 ## Notes on ingress
 
-Discord does not provide a simple webhook registration flow equivalent to
-Telegram. This plugin therefore treats `start_ingress` as a configuration
-handshake for an interaction-webhook deployment:
+Discord does not provide a simple webhook registration flow equivalent to Telegram. This plugin therefore treats `start_ingress` as a configuration handshake for an interaction-webhook deployment:
 
 1. validate the bot token
 2. validate the configured interaction verification key

@@ -1,7 +1,6 @@
 # channel-twilio-sms
 
-A [Dispatch](https://github.com/serenorg/dispatch) channel plugin
-for Twilio SMS.
+A [Dispatch](https://github.com/serenorg/dispatch) channel plugin for Twilio SMS.
 
 ## Scope
 
@@ -19,8 +18,7 @@ Implemented:
 Behavior:
 
 - outbound delivery uses the Twilio Messages API
-- outbound media uses Twilio MMS `MediaUrl` fields when attachment URLs are
-  supplied
+- outbound media uses Twilio MMS `MediaUrl` fields when attachment URLs are supplied
 - health checks validate account credentials against the Twilio Accounts API
 - ingress verifies Twilio webhook signatures and parses inbound SMS webhooks
 - inbound status callbacks are acknowledged but not turned into Dispatch events
@@ -47,14 +45,12 @@ Required env vars:
 
 Optional env vars:
 
-- `TWILIO_WEBHOOK_AUTH_TOKEN` - not sent by Twilio itself, but useful if your
-  host wants to require an additional shared token at the ingress edge
+- `TWILIO_WEBHOOK_AUTH_TOKEN` - not sent by Twilio itself, but useful if your host wants to require an additional shared token at the ingress edge
 
 Useful config fields:
 
 - `from_number` - source number for outbound SMS
-- `messaging_service_sid` - optional Twilio Messaging Service SID instead of a
-  direct source number
+- `messaging_service_sid` - optional Twilio Messaging Service SID instead of a direct source number
 - `webhook_public_url` - public base URL used for ingress declaration
 - `webhook_path` - ingress route path, default `/twilio/sms`
 
@@ -90,19 +86,15 @@ dispatch channel call channel-twilio-sms \
   --request-json '{"kind":"push","config":{"from_number":"+15551234567"},"message":{"to_number":"+15557654321","content":"Dispatch SMS test"}}'
 ```
 
-The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Dispatch operators
-normally use the host CLI rather than writing raw envelopes.
+The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Dispatch operators normally use the host CLI rather than writing raw envelopes.
 
 ## Notes on ingress
 
-Twilio does not have a webhook registration API shaped like Telegram's
-`setWebhook`. This plugin therefore treats `start_ingress` as a
-configuration handshake:
+Twilio does not have a webhook registration API shaped like Telegram's `setWebhook`. This plugin therefore treats `start_ingress` as a configuration handshake:
 
 1. validate Twilio credentials
 2. validate the declared public route
-3. report the endpoint and Twilio signature-verification requirement to the
-    host
+3. report the endpoint and Twilio signature-verification requirement to the host
 
 That keeps the plugin honest about what it can support.
 

@@ -68,7 +68,7 @@ const HEADER_X_SIGNATURE_TIMESTAMP: &str = "X-Signature-Timestamp";
 
 /// Accept Discord interaction signatures whose timestamp is within this many
 /// seconds of the host clock. The ED25519 signature covers the timestamp, but
-/// the timestamp itself is not bounded by the signature — without a freshness
+/// the timestamp itself is not bounded by the signature - without a freshness
 /// window, an attacker who captured a valid interaction could replay it
 /// indefinitely. Discord's own documentation recommends a small window.
 const DISCORD_MAX_SIGNATURE_AGE_SECS: i64 = 300;

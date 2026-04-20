@@ -19,25 +19,16 @@ Implemented:
 
 Behavior:
 
-- inbound email supports both one-shot `poll_ingress` fetches and background
-  `start_ingress` sessions over Gmail IMAP
+- inbound email supports both one-shot `poll_ingress` fetches and background `start_ingress` sessions over Gmail IMAP
 - outbound mail is sent through Gmail SMTP
 - replies route back to the sender or `Reply-To` address from the inbound mail
-- inbound subjects are surfaced as `thread_id` so Dispatch replies can preserve
-  the thread subject without host changes
+- inbound subjects are surfaced as `thread_id` so Dispatch replies can preserve the thread subject without host changes
 - inbound attachment metadata is surfaced on the normalized event
-- inbound message metadata includes `body_source = text | html | subject` so
-  downstream consumers can tell whether the message body came from a real
-  text/plain part, HTML fallback, or subject-only fallback
+- inbound message metadata includes `body_source = text | html | subject` so downstream consumers can tell whether the message body came from a real text/plain part, HTML fallback, or subject-only fallback
 - outbound attachments require `data_base64`
-- outbound deliveries accept per-message `cc` / `bcc` metadata (comma-separated
-  address lists), with optional `default_cc` / `default_bcc` fallbacks on the
-  channel config
-- inbound messages with only an HTML body are converted to plaintext with a
-  lightweight HTML stripper
-- mailing-list and auto-responder traffic is suppressed at ingress via the
-  `Auto-Submitted`, `Precedence`, and `List-Unsubscribe` headers so agents do
-  not reply to bounces, digests, or bulk mail
+- outbound deliveries accept per-message `cc` / `bcc` metadata (comma-separated address lists), with optional `default_cc` / `default_bcc` fallbacks on the channel config
+- inbound messages with only an HTML body are converted to plaintext with a lightweight HTML stripper
+- mailing-list and auto-responder traffic is suppressed at ingress via the `Auto-Submitted`, `Precedence`, and `List-Unsubscribe` headers so agents do not reply to bounces, digests, or bulk mail
 
 Not implemented:
 
@@ -51,29 +42,23 @@ Not implemented:
 
 Inbound:
 
-- one-shot polling and background ingress are available anywhere the plugin can
-  reach Gmail IMAP
-- Dispatch keeps the plugin subprocess alive while polling is active, and the
-  plugin emits `channel.event` notifications as new mail arrives
+- one-shot polling and background ingress are available anywhere the plugin can reach Gmail IMAP
+- Dispatch keeps the plugin subprocess alive while polling is active, and the plugin emits `channel.event` notifications as new mail arrives
 
 Outbound:
 
 - replies and proactive pushes use Gmail SMTP
-- `default_recipient` and `default_subject` provide routing defaults for
-  operator-triggered sends
+- `default_recipient` and `default_subject` provide routing defaults for operator-triggered sends
 
 ## Configuration
 
-This plugin is intentionally Gmail-specific, but it still uses the standard
-IMAP/SMTP transport rather than the Gmail REST API.
+This plugin is intentionally Gmail-specific, but it still uses the standard IMAP/SMTP transport rather than the Gmail REST API.
 
 Required:
 
 - `imap_username` - usually your Gmail address
-- `smtp_from_email` if you want outbound delivery without relying on the
-  username fallback
-- `GMAIL_APP_PASSWORD` or the env var named by `imap_password_env` /
-  `smtp_password_env`
+- `smtp_from_email` if you want outbound delivery without relying on the username fallback
+- `GMAIL_APP_PASSWORD` or the env var named by `imap_password_env` / `smtp_password_env`
 
 Defaults:
 
@@ -115,18 +100,15 @@ export GMAIL_APP_PASSWORD="replace-me"
 2. Create an app password for Mail in the Google account security settings.
 3. Export that app password as `GMAIL_APP_PASSWORD`.
 4. Configure `imap_username` with the Gmail address to watch.
-5. Optionally set `smtp_from_email` and `smtp_from_name` for clearer outbound
-    identity.
+5. Optionally set `smtp_from_email` and `smtp_from_name` for clearer outbound identity.
 6. Start polling through Dispatch.
 
 Operational notes:
 
 - `poll_ingress` performs one IMAP fetch cycle and returns updated cursor state
-- `start_ingress` records the current IMAP UID cursor and does not replay the
-  full historical mailbox by default
+- `start_ingress` records the current IMAP UID cursor and does not replay the full historical mailbox by default
 - restored Dispatch polling state resumes from the prior IMAP UID
-- if Gmail rotates the mailbox UID validity, the plugin resets its cursor to
-  the current mailbox head instead of replaying stale history
+- if Gmail rotates the mailbox UID validity, the plugin resets its cursor to the current mailbox head instead of replaying stale history
 
 ## Dispatch usage
 
@@ -141,16 +123,12 @@ dispatch channel call channel-gmail \
   --request-json '{"kind":"push","config":{"imap_username":"you@gmail.com","smtp_from_email":"you@gmail.com","default_recipient":"user@example.com","default_subject":"Dispatch Gmail test"},"message":{"content":"Dispatch Gmail test"}}'
 ```
 
-The plugin transport is JSON-RPC 2.0 over JSONL on stdio. The plugin translates
-Gmail's IMAP/SMTP transport into the shared Dispatch channel protocol.
+The plugin transport is JSON-RPC 2.0 over JSONL on stdio. The plugin translates Gmail's IMAP/SMTP transport into the shared Dispatch channel protocol.
 
 ## Notes
 
-- This plugin is for Gmail accounts that should behave like an email channel in
-  Dispatch.
-- If you need Gmail-native APIs such as watch / PubSub, query syntax, or label
-  operations, that should be a separate provider-native plugin rather than
-  overloading this one.
+- This plugin is for Gmail accounts that should behave like an email channel in Dispatch.
+- If you need Gmail-native APIs such as watch / PubSub, query syntax, or label operations, that should be a separate provider-native plugin rather than overloading this one.
 
 ## License
 
