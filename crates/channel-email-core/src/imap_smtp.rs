@@ -72,7 +72,14 @@ pub fn check_imap_health<P: EmailPreset>(config: &ChannelConfig) -> Result<Mailb
     let mut session = client
         .login(&username, &password)
         .map_err(|error| error.0)
-        .with_context(|| format!("failed to login to IMAP mailbox `{mailbox_name}`"))?;
+        .map_err(|error| {
+            anyhow!(format_imap_login_error(
+                &host,
+                &mailbox_name,
+                &username,
+                &error
+            ))
+        })?;
 
     let selected = session
         .select(&mailbox_name)
@@ -99,7 +106,14 @@ pub fn fetch_messages_since<P: EmailPreset>(
     let mut session = client
         .login(&username, &password)
         .map_err(|error| error.0)
-        .with_context(|| format!("failed to login to IMAP mailbox `{mailbox_name}`"))?;
+        .map_err(|error| {
+            anyhow!(format_imap_login_error(
+                &host,
+                &mailbox_name,
+                &username,
+                &error
+            ))
+        })?;
 
     let selected = session
         .select(&mailbox_name)
@@ -388,6 +402,22 @@ fn join_uid_set(uids: &[u32]) -> String {
         .join(",")
 }
 
+fn format_imap_login_error(
+    host: &str,
+    mailbox_name: &str,
+    username: &str,
+    error: &dyn std::fmt::Display,
+) -> String {
+    let detail = error.to_string();
+    if detail.contains("BasicAuthBlocked") {
+        return format!(
+            "failed to login to IMAP mailbox `{mailbox_name}`: server `{host}` rejected password-based IMAP auth for `{username}` (`BasicAuthBlocked`). This mailbox likely requires OAuth / Modern Auth instead of a password or app password. Original server error: {detail}"
+        );
+    }
+
+    format!("failed to login to IMAP mailbox `{mailbox_name}`: {detail}")
+}
+
 fn required_string(value: Option<String>, message: &str) -> Result<String> {
     value
         .filter(|value| !value.trim().is_empty())
@@ -450,4 +480,39 @@ pub fn ensure_configured<P: EmailPreset>(config: &ChannelConfig) -> Result<()> {
         require_smtp_config::<P>(config)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_imap_login_error;
+
+    #[test]
+    fn format_imap_login_error_explains_basic_auth_blocked() {
+        let message = format_imap_login_error(
+            "outlook.office365.com",
+            "INBOX",
+            "cjs412@hotmail.com",
+            &"NO [Error=\"AuthFailed:LogonDenied-BasicAuthBlocked\"] AUTHENTICATE failed.",
+        );
+
+        assert!(message.contains("BasicAuthBlocked"));
+        assert!(message.contains("OAuth / Modern Auth"));
+        assert!(message.contains("cjs412@hotmail.com"));
+        assert!(message.contains("outlook.office365.com"));
+    }
+
+    #[test]
+    fn format_imap_login_error_preserves_generic_errors() {
+        let message = format_imap_login_error(
+            "imap.example.com",
+            "INBOX",
+            "user@example.com",
+            &"authentication failed",
+        );
+
+        assert_eq!(
+            message,
+            "failed to login to IMAP mailbox `INBOX`: authentication failed"
+        );
+    }
 }

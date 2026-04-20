@@ -122,6 +122,20 @@ export OUTLOOK_EMAIL_PASSWORD="replace-me"
     identity.
 6. Start polling through Dispatch.
 
+## Known limitations
+
+- Outlook.com / Hotmail consumer mailboxes now commonly require OAuth /
+  Modern Auth for IMAP and SMTP. This preset currently uses password-based
+  IMAP/SMTP auth, so those mailboxes may fail even when the account password
+  or app password is correct.
+- When Microsoft blocks this auth path, health and polling usually fail with
+  an IMAP login error that includes `BasicAuthBlocked`.
+- This preset is only expected to work where Microsoft still permits
+  password-based IMAP/SMTP auth for the mailbox.
+- If you need Microsoft mail support for accounts that require OAuth, that
+  should be a separate provider-native plugin rather than overloading this
+  IMAP/SMTP preset.
+
 Operational notes:
 
 - `poll_ingress` performs one IMAP fetch cycle and returns updated cursor state
