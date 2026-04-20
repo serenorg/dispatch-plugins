@@ -1,0 +1,53 @@
+{
+  "schema": "https://serenorg.github.io/dispatch/schemas/extension.v1.json",
+  "kind": "channel",
+  "name": "channel-whatsapp",
+  "version": "0.1.0",
+  "protocol": "jsonl",
+  "protocol_version": 1,
+  "description": "WhatsApp channel plugin for Dispatch using the native Rust whatsapp-rust client.",
+  "entrypoint": {
+    "command": "target/release/channel-whatsapp",
+    "args": []
+  },
+  "auth": {
+    "mode": "manual",
+    "provider": "WhatsApp"
+  },
+  "capabilities": {
+    "channel": {
+      "platform": "whatsapp",
+      "ingress_modes": ["polling"],
+      "outbound_message_types": ["text"],
+      "threading_model": "chat_or_thread",
+      "attachment_support": true,
+      "reply_verification_support": false,
+      "account_scoped_config": true,
+      "allow_polling": true,
+      "webhook_secret_support": false,
+      "allowed_paths": [],
+      "ingress": {
+        "polling": {
+          "min_interval_ms": 250,
+          "default_interval_ms": 1000
+        }
+      },
+      "delivery": {
+        "push": true,
+        "status_frames": true,
+        "attachment_sources": ["data_base64"]
+      }
+    }
+  },
+  "requirements": {
+    "optional_secrets": [],
+    "network_domains": [
+      "web.whatsapp.com",
+      "static.whatsapp.net",
+      "mmg.whatsapp.net",
+      "mmg-fna.whatsapp.net",
+      "mmg-fallback.whatsapp.net"
+    ],
+    "platforms": ["whatsapp-rust"]
+  }
+}
