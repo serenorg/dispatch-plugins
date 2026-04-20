@@ -98,8 +98,14 @@ Bot-token mode:
 
 Recommended bot scopes:
 
-- `chat:write`
-- `files:write`
+- `chat:write` - required for `deliver`, `push`, and `status`
+- `app_mentions:read` - required if you subscribe to `app_mention`
+- `channels:history` - required for `message.channels`
+- `im:history` - required for `message.im`
+- `groups:history` - required for `message.groups`
+- `mpim:history` - required for `message.mpim`
+- `files:write` - only required if you want Slack attachment uploads
+- `incoming-webhook` - only required if you want incoming-webhook delivery
 
 Recommended event subscriptions:
 
@@ -108,6 +114,16 @@ Recommended event subscriptions:
 - `message.groups`
 - `message.im`
 - `message.mpim`
+
+Common scope sets:
+
+- mention-only Socket Mode:
+  `chat:write`, `app_mentions:read`
+- public-channel Events API or Socket Mode:
+  `chat:write`, `channels:history`
+- full plugin test setup:
+  `chat:write`, `files:write`, `app_mentions:read`, `channels:history`,
+  `groups:history`, `im:history`, `mpim:history`
 
 Socket Mode setup:
 
@@ -118,6 +134,12 @@ Socket Mode setup:
 5. Export the generated `xapp-...` token as `SLACK_APP_TOKEN`.
 6. Reinstall the app if Slack asks for it after scope or event changes.
 
+Socket Mode notes:
+
+- the app-level `xapp-...` token must have the `connections:write` scope
+- Socket Mode does not require a public Events API request URL
+- `connections:write` belongs on the app-level token, not the bot token
+
 Events API setup:
 
 1. In `Event Subscriptions`, enable events.
@@ -125,6 +147,13 @@ Events API setup:
     example `https://example.com/slack/events`.
 3. Subscribe to the bot events you want to receive.
 4. Export the signing secret as `SLACK_SIGNING_SECRET`.
+
+Events API notes:
+
+- webhook ingress requires `SLACK_SIGNING_SECRET`
+- webhook ingress does not require `SLACK_APP_TOKEN`
+- after changing scopes or event subscriptions, reinstall the app before
+  retesting
 
 Incoming-webhook mode:
 
