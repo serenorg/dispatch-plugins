@@ -102,6 +102,7 @@ fn handle_request(
         PluginRequest::Health { config } => Ok(PluginResponse::Health {
             health: health(config)?,
         }),
+        PluginRequest::PollIngress { config, .. } => poll_ingress(config),
         PluginRequest::StartIngress { config, state } => {
             let started = start_ingress(config)?;
             let started = state.clone().unwrap_or(started);

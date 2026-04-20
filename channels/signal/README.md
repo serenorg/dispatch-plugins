@@ -10,6 +10,7 @@ Implemented:
 - `capabilities`
 - `configure`
 - `health`
+- `poll_ingress`
 - `start_ingress`
 - `stop_ingress`
 - `deliver`
@@ -24,8 +25,8 @@ Behavior:
 - health checks validate connectivity with `GET /v1/about`
 - status frames map to Signal typing indicators with
   `PUT /v1/typing-indicator/{number}`
-- ingress runs as a background receive loop and emits `channel.event`
-  notifications while the Dispatch poller is active
+- ingress supports both one-shot `poll_ingress` fetches and background
+  `start_ingress` sessions
 - the plugin automatically adapts to the backend mode:
   - `native` and `normal` use HTTP receive
   - `json-rpc` uses the websocket receive endpoint
@@ -61,7 +62,7 @@ prefixed forms such as `signal:+15551234567`.
 
 Inbound:
 
-- available only as a background ingress session
+- available as either one-shot polling or a background ingress session
 - there is no webhook mode; the plugin always owns the upstream receive loop
 - upstream transport is HTTP in `native` / `normal` mode and websocket in
   `json-rpc` mode
@@ -142,6 +143,7 @@ does not speak websocket to the plugin directly.
 
 ## Notes
 
+- `poll_ingress` performs one receive cycle against the configured backend
 - `start_ingress` validates the account and backend, then starts the background
   receive worker
 - inbound messages are emitted back to Dispatch as `channel.event`

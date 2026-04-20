@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tungstenite::Message;
 use tungstenite::stream::MaybeTlsStream;
 
@@ -176,11 +176,16 @@ impl SignalClient {
         let url = websocket_receive_url(&self.base_url, &account, timeout_secs)?;
         let (mut socket, _) = tungstenite::connect(url.as_str())
             .with_context(|| format!("signal websocket receive connect failed for {url}"))?;
-        configure_websocket_read_timeout(socket.get_mut(), timeout_secs)
-            .context("configure signal websocket read timeout")?;
+        let deadline = Instant::now() + websocket_timeout_window(timeout_secs);
         let mut events = Vec::new();
 
         loop {
+            let remaining = remaining_websocket_timeout(deadline);
+            if remaining.is_zero() {
+                break;
+            }
+            configure_websocket_read_timeout(socket.get_mut(), remaining)
+                .context("configure signal websocket read timeout")?;
             match socket.read() {
                 Ok(Message::Text(frame)) => {
                     let value: Value = serde_json::from_str(frame.as_str())
@@ -300,15 +305,22 @@ fn websocket_receive_url(base_url: &str, account: &str, timeout_secs: u16) -> Re
 
 fn configure_websocket_read_timeout(
     stream: &mut MaybeTlsStream<std::net::TcpStream>,
-    timeout_secs: u16,
+    timeout: Duration,
 ) -> std::io::Result<()> {
-    let timeout = Some(Duration::from_secs(u64::from(timeout_secs).max(1) + 1));
     let tcp = match stream {
         MaybeTlsStream::Plain(tcp) => tcp,
         MaybeTlsStream::Rustls(tls) => &mut tls.sock,
         _ => return Ok(()),
     };
-    tcp.set_read_timeout(timeout)
+    tcp.set_read_timeout(Some(timeout))
+}
+
+fn websocket_timeout_window(timeout_secs: u16) -> Duration {
+    Duration::from_secs(u64::from(timeout_secs.max(1)) + 1)
+}
+
+fn remaining_websocket_timeout(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
 }
 
 pub fn normalize_base_url(value: &str) -> Result<String> {

@@ -10,6 +10,7 @@ Implemented:
 - `capabilities`
 - `configure`
 - `health`
+- `poll_ingress`
 - `start_ingress`
 - `stop_ingress`
 - `ingress_event`
@@ -25,8 +26,8 @@ Behavior:
   and `sendDocument` for other URLs, file ids, and uploads
 - health checks validate credentials with `getMe`
 - webhook ingress uses Telegram `setWebhook` / `deleteWebhook`
-- polling ingress uses Bot API `getUpdates` from a background worker and emits
-  `channel.event` notifications while the Dispatch poller is active
+- polling ingress supports both one-shot `poll_ingress` fetches and background
+  `start_ingress` sessions via Bot API `getUpdates`
 - inbound webhook and polling updates are normalized into Dispatch events
 - status frames map to Telegram chat actions
 
@@ -175,6 +176,8 @@ format, see Dispatch's `docs/extensions.md`.
 ## Notes on ingress
 
 - `start_ingress` registers the Bot API webhook when configured for webhook
+  mode
+- `poll_ingress` performs one `getUpdates` cycle when configured for polling
   mode
 - `start_ingress` deletes the webhook and starts a background receive loop when
   configured for polling mode

@@ -10,6 +10,7 @@ Implemented:
 - `capabilities`
 - `configure`
 - `health`
+- `poll_ingress`
 - `start_ingress`
 - `stop_ingress`
 - `ingress_event`
@@ -26,9 +27,10 @@ Behavior:
   using bot-token delivery
 - health checks validate the bot token with `auth.test` when configured
 - Events API ingress uses host-managed webhook callbacks
-- Socket Mode ingress opens Slack's websocket via `apps.connections.open` from
-  a background worker and emits `channel.event` notifications while the
-  Dispatch poller is active
+- Socket Mode ingress supports both one-shot `poll_ingress` fetches and
+  background `start_ingress` sessions
+- Socket Mode opens Slack's websocket via `apps.connections.open` and emits
+  normalized inbound events back to Dispatch
 - challenge and acknowledgement replies are returned through `callback_reply`
 - status frames render visible status messages into Slack conversations
 
@@ -180,7 +182,8 @@ into the shared Dispatch channel protocol.
 ## Notes on ingress
 
 - if `SLACK_APP_TOKEN` is configured and `webhook_public_url` is not set,
-  `start_ingress` chooses Socket Mode
+  `poll_ingress` performs one Socket Mode receive cycle and
+  `start_ingress` chooses Socket Mode background-session behavior
 - otherwise `start_ingress` chooses Events API webhook mode and reports the
   public route that the host should expose
 - Socket Mode keeps a background worker alive, acknowledges each `envelope_id`,

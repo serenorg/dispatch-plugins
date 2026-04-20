@@ -23,12 +23,12 @@ Dispatch channel extensions collected under a single parent directory.
 | Plugin | Ingress availability | Upstream receive transport | Outbound delivery |
 | --- | --- | --- | --- |
 | `channel-discord` | Interaction webhook only | Host-managed HTTPS callback | Discord REST bot messages |
-| `channel-email` | Background ingress session only | IMAP polling worker inside the plugin | SMTP delivery |
-| `channel-gmail` | Background ingress session only | Gmail IMAP polling worker inside the plugin | Gmail SMTP delivery |
-| `channel-outlook` | Background ingress session only | Outlook / Microsoft 365 IMAP polling worker inside the plugin | Outlook / Microsoft 365 SMTP delivery |
-| `channel-signal` | Background ingress session only | `signal-cli-rest-api` HTTP receive in `native` / `normal`, websocket receive in `json-rpc` | Signal REST API |
-| `channel-slack` | Events API webhook or Socket Mode | Host-managed HTTPS callback or Slack Socket Mode websocket | `chat.postMessage` or incoming webhook |
-| `channel-telegram` | Bot API webhook or polling | Telegram webhook callback or Bot API `getUpdates` | `sendMessage`, `sendPhoto`, `sendDocument` |
+| `channel-email` | One-shot poll or background ingress session | IMAP polling worker inside the plugin | SMTP delivery |
+| `channel-gmail` | One-shot poll or background ingress session | Gmail IMAP polling worker inside the plugin | Gmail SMTP delivery |
+| `channel-outlook` | One-shot poll or background ingress session | Outlook / Microsoft 365 IMAP polling worker inside the plugin | Outlook / Microsoft 365 SMTP delivery |
+| `channel-signal` | One-shot poll or background ingress session | `signal-cli-rest-api` HTTP receive in `native` / `normal`, websocket receive in `json-rpc` | Signal REST API |
+| `channel-slack` | Events API webhook, one-shot Socket Mode poll, or background Socket Mode session | Host-managed HTTPS callback or Slack Socket Mode websocket | `chat.postMessage` or incoming webhook |
+| `channel-telegram` | Bot API webhook, one-shot poll, or background poll session | Telegram webhook callback or Bot API `getUpdates` | `sendMessage`, `sendPhoto`, `sendDocument` |
 | `channel-twilio-sms` | Twilio webhook only | Host-managed HTTPS callback | Twilio Messages API |
 | `channel-webhook` | Generic webhook only | Host-managed HTTPS callback | JSON `POST` to configured endpoint |
 | `channel-whatsapp` | Meta webhook only | Host-managed HTTPS callback | WhatsApp Cloud API |
@@ -44,8 +44,9 @@ In practice:
 - `dispatch channel call` exercises one-shot operations such as `configure`,
   `health`, `deliver`, `push`, and `status`
 - `dispatch channel listen` runs webhook-style ingress bindings
-- `dispatch channel poll` runs background-ingress bindings for polling or
-  sessioned upstream transports
+- `dispatch channel poll --once` issues a one-shot `poll_ingress` request
+- `dispatch channel poll` without `--once` runs background-ingress bindings for
+  polling or sessioned upstream transports
 - `dispatch up` manages project-level channel bindings from `dispatch.toml`
 
 While an ingress session is active, Dispatch keeps the plugin subprocess alive

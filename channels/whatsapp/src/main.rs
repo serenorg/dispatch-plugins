@@ -104,6 +104,10 @@ fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
         PluginRequest::Health { config } => Ok(PluginResponse::Health {
             health: health(config)?,
         }),
+        PluginRequest::PollIngress { .. } => Ok(plugin_error(
+            "polling_not_supported",
+            "whatsapp ingress is webhook-only; use ingress_event or listen bindings",
+        )),
         PluginRequest::StartIngress { config, .. } => Ok(PluginResponse::IngressStarted {
             state: start_ingress(config)?,
         }),

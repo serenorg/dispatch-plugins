@@ -2,7 +2,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{io::Read, net::TcpStream, time::Duration};
+use std::{
+    io::Read,
+    net::TcpStream,
+    time::{Duration, Instant},
+};
 use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
 
 const DEFAULT_API_BASE: &str = "https://slack.com/api";
@@ -249,9 +253,14 @@ impl SlackSocketModeClient {
         let (mut socket, _) = tungstenite::connect(websocket_url.as_str()).with_context(|| {
             format!("failed to connect Slack socket mode websocket: {websocket_url}")
         })?;
-        configure_websocket_read_timeout(socket.get_mut(), timeout_secs)?;
+        let deadline = Instant::now() + websocket_timeout_window(timeout_secs);
 
         loop {
+            let remaining = remaining_websocket_timeout(deadline);
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            configure_websocket_read_timeout(socket.get_mut(), remaining)?;
             match socket.read() {
                 Ok(Message::Text(text)) => {
                     if let Some(envelope) =
@@ -398,16 +407,23 @@ fn acknowledge_socket_envelope(
 
 fn configure_websocket_read_timeout(
     stream: &mut MaybeTlsStream<TcpStream>,
-    timeout_secs: u16,
+    timeout: Duration,
 ) -> Result<()> {
-    let timeout = Some(Duration::from_secs(u64::from(timeout_secs.max(1)) + 1));
     let tcp = match stream {
         MaybeTlsStream::Plain(tcp) => tcp,
         MaybeTlsStream::Rustls(tls) => &mut tls.sock,
         _ => return Ok(()),
     };
-    tcp.set_read_timeout(timeout)
+    tcp.set_read_timeout(Some(timeout))
         .context("failed to configure Slack socket mode read timeout")
+}
+
+fn websocket_timeout_window(timeout_secs: u16) -> Duration {
+    Duration::from_secs(u64::from(timeout_secs.max(1)) + 1)
+}
+
+fn remaining_websocket_timeout(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
 }
 
 fn slack_api_base_url() -> String {

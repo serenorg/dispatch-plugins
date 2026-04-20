@@ -119,6 +119,7 @@ fn handle_request(
         PluginRequest::Health { config } => Ok(PluginResponse::Health {
             health: health(config)?,
         }),
+        PluginRequest::PollIngress { config, state } => poll_ingress(config, state.clone()),
         PluginRequest::StartIngress { config, state } => {
             let started = start_ingress(config)?;
             let started = match (&started.mode, state.clone()) {

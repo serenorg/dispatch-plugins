@@ -224,6 +224,7 @@ fn handle_request<P: EmailPreset>(
         PluginRequest::Health { config } => Ok(PluginResponse::Health {
             health: health::<P>(config)?,
         }),
+        PluginRequest::PollIngress { config, state } => poll_ingress::<P>(config, state.clone()),
         PluginRequest::StartIngress { config, state } => {
             let started = start_ingress::<P>(config)?;
             let started = match (&started.mode, state.clone()) {

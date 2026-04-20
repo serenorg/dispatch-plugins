@@ -15,6 +15,7 @@ Implemented:
 - `capabilities`
 - `configure`
 - `health`
+- `poll_ingress`
 - `start_ingress`
 - `stop_ingress`
 - `deliver`
@@ -24,7 +25,8 @@ Implemented:
 
 Behavior:
 
-- inbound email is fetched from IMAP through a background polling worker
+- inbound email supports both one-shot `poll_ingress` fetches and background
+  `start_ingress` sessions over IMAP
 - outbound email is sent through SMTP
 - replies route back to the sender or `Reply-To` address from the inbound mail
 - inbound subjects are surfaced as `thread_id` so Dispatch replies can preserve
@@ -60,7 +62,8 @@ that; POP does not.
 
 Inbound:
 
-- background ingress is available anywhere the plugin can reach the IMAP server
+- one-shot polling and background ingress are available anywhere the plugin can
+  reach the IMAP server
 - Dispatch keeps the plugin subprocess alive while polling is active, and the
   plugin emits `channel.event` notifications as new mail arrives
 
@@ -150,6 +153,7 @@ Examples:
 
 Operational notes:
 
+- `poll_ingress` performs one IMAP fetch cycle and returns updated cursor state
 - `start_ingress` records the current IMAP UID cursor and does not replay the
   full historical mailbox by default
 - restored Dispatch polling state resumes from the prior IMAP UID
