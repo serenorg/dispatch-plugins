@@ -1,0 +1,61 @@
+{
+  "schema": "https://serenorg.github.io/dispatch/schemas/extension.v1.json",
+  "kind": "channel",
+  "name": "channel-signal",
+  "version": "0.1.0",
+  "protocol": "jsonl",
+  "protocol_version": 1,
+  "description": "Signal channel plugin for Dispatch using the native Rust presage client.",
+  "entrypoint": {
+    "command": "target/release/channel-signal",
+    "args": []
+  },
+  "auth": {
+    "mode": "manual",
+    "provider": "Signal"
+  },
+  "capabilities": {
+    "channel": {
+      "platform": "signal",
+      "ingress_modes": ["polling"],
+      "outbound_message_types": ["text"],
+      "threading_model": "chat_or_thread",
+      "attachment_support": true,
+      "reply_verification_support": false,
+      "account_scoped_config": true,
+      "allow_polling": true,
+      "webhook_secret_support": false,
+      "allowed_paths": [],
+      "ingress": {
+        "polling": {
+          "min_interval_ms": 250,
+          "default_interval_ms": 1000
+        }
+      },
+      "delivery": {
+        "push": true,
+        "status_frames": true,
+        "attachment_sources": ["data_base64"]
+      }
+    }
+  },
+  "requirements": {
+    "optional_secrets": [],
+    "network_domains": [
+      "cdn.signal.org",
+      "cdn2.signal.org",
+      "cdn3.signal.org",
+      "cdn-staging.signal.org",
+      "cdn2-staging.signal.org",
+      "cdn3-staging.signal.org",
+      "chat.signal.org",
+      "chat.staging.signal.org",
+      "cdsi.signal.org",
+      "cdsi.staging.signal.org",
+      "storage.signal.org",
+      "storage-staging.signal.org",
+      "signal.org"
+    ],
+    "platforms": ["presage"]
+  }
+}
