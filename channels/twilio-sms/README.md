@@ -41,11 +41,11 @@ cargo build --release
 Required env vars:
 
 - `TWILIO_ACCOUNT_SID`
-- `TWILIO_AUTH_TOKEN`
+- either `TWILIO_AUTH_TOKEN` or the pair `TWILIO_API_KEY_SID` and `TWILIO_API_KEY_SECRET`. If both are set, API-key credentials take precedence for outbound REST calls.
 
 Optional env vars:
 
-- `TWILIO_WEBHOOK_AUTH_TOKEN` - not sent by Twilio itself, but useful if your host wants to require an additional shared token at the ingress edge
+- `TWILIO_WEBHOOK_AUTH_TOKEN` - override the secret used to verify `X-Twilio-Signature`; if omitted, the plugin uses `TWILIO_AUTH_TOKEN`
 
 Useful config fields:
 
@@ -60,9 +60,12 @@ To obtain the required Twilio credentials:
 
 1. Create or open a Twilio project in the Twilio Console.
 2. Copy the Account SID and export it as `TWILIO_ACCOUNT_SID`.
-3. Copy the Auth Token and export it as `TWILIO_AUTH_TOKEN`.
+3. For REST API authentication, either:
+  - copy the Auth Token and export it as `TWILIO_AUTH_TOKEN`, or
+  - create an API key and export `TWILIO_API_KEY_SID` plus `TWILIO_API_KEY_SECRET`
 4. Provision a Twilio phone number or Messaging Service for outbound SMS.
 5. Set `from_number` or `messaging_service_sid` in the plugin config.
+6. If you want inbound webhook verification while using API-key auth, also provide the account Auth Token via `TWILIO_WEBHOOK_AUTH_TOKEN` or `TWILIO_AUTH_TOKEN`.
 
 Minimal config:
 
@@ -97,6 +100,8 @@ Twilio does not have a webhook registration API shaped like Telegram's `setWebho
 3. report the endpoint and Twilio signature-verification requirement to the host
 
 That keeps the plugin honest about what it can support.
+
+When using `TWILIO_API_KEY_SID` and `TWILIO_API_KEY_SECRET`, the plugin validates REST access against the Messages API instead of the account identity endpoint. Twilio webhook signature verification still uses the account Auth Token, so inbound SMS handling needs `TWILIO_WEBHOOK_AUTH_TOKEN` or `TWILIO_AUTH_TOKEN` even when outbound requests use API-key auth.
 
 ## License
 

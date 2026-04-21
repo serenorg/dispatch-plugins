@@ -35,8 +35,13 @@
     }
   },
   "requirements": {
-    "secrets": ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"],
-    "optional_secrets": ["TWILIO_WEBHOOK_AUTH_TOKEN"],
+    "secrets": ["TWILIO_ACCOUNT_SID"],
+    "optional_secrets": [
+      "TWILIO_AUTH_TOKEN",
+      "TWILIO_API_KEY_SID",
+      "TWILIO_API_KEY_SECRET",
+      "TWILIO_WEBHOOK_AUTH_TOKEN"
+    ],
     "network_domains": ["api.twilio.com"]
   }
 }

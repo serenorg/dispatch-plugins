@@ -20,12 +20,15 @@ use protocol::{
     OutboundAttachment, OutboundMessage, PluginRequest, PluginRequestEnvelope, PluginResponse,
     StatusAcceptance, capabilities, parse_jsonrpc_request, plugin_error, response_to_jsonrpc,
 };
-use twilio_api::TwilioClient;
+use twilio_api::{TwilioAuthMode, TwilioClient};
 
 const META_REASON: &str = "reason";
 const META_PLATFORM: &str = "platform";
 const META_ACCOUNT_SID_ENV: &str = "account_sid_env";
 const META_AUTH_TOKEN_ENV: &str = "auth_token_env";
+const META_API_KEY_SID_ENV: &str = "api_key_sid_env";
+const META_API_KEY_SECRET_ENV: &str = "api_key_secret_env";
+const META_AUTH_MODE: &str = "auth_mode";
 const META_FROM_NUMBER: &str = "from_number";
 const META_MESSAGING_SERVICE_SID: &str = "messaging_service_sid";
 const META_INGRESS_MODE: &str = "ingress_mode";
@@ -60,6 +63,8 @@ const TRANSPORT_WEBHOOK: &str = "webhook";
 const TWIML_EMPTY_RESPONSE: &str = "<Response></Response>";
 const CONVERSATION_KIND_PHONE_NUMBER: &str = "phone_number";
 const EVENT_TYPE_INCOMING_MESSAGE: &str = "incoming_message";
+const AUTH_MODE_ACCOUNT_TOKEN: &str = "account_token";
+const AUTH_MODE_API_KEY: &str = "api_key";
 
 fn main() -> Result<()> {
     let stdin = io::stdin().lock();
@@ -153,6 +158,14 @@ fn configure(config: &ChannelConfig) -> Result<ConfiguredChannel> {
         META_AUTH_TOKEN_ENV.to_string(),
         auth_token_env(config).to_string(),
     );
+    metadata.insert(
+        META_API_KEY_SID_ENV.to_string(),
+        api_key_sid_env(config).to_string(),
+    );
+    metadata.insert(
+        META_API_KEY_SECRET_ENV.to_string(),
+        api_key_secret_env(config).to_string(),
+    );
     if let Some(from_number) = &config.from_number {
         metadata.insert(META_FROM_NUMBER.to_string(), from_number.clone());
     }
@@ -191,14 +204,14 @@ fn configure(config: &ChannelConfig) -> Result<ConfiguredChannel> {
 }
 
 fn health(config: &ChannelConfig) -> Result<HealthReport> {
-    let client = TwilioClient::from_env(account_sid_env(config), auth_token_env(config))?;
-    let identity = client.identity()?;
+    let client = client_from_env(config)?;
 
     let mut metadata = BTreeMap::new();
     metadata.insert(META_PLATFORM.to_string(), PLATFORM_TWILIO_SMS.to_string());
-    if let Some(status) = &identity.status {
-        metadata.insert(META_ACCOUNT_STATUS.to_string(), status.clone());
-    }
+    metadata.insert(
+        META_AUTH_MODE.to_string(),
+        auth_mode_name(client.auth_mode()).to_string(),
+    );
     if let Some(from_number) = &config.from_number {
         metadata.insert(META_FROM_NUMBER.to_string(), from_number.clone());
     }
@@ -209,15 +222,33 @@ fn health(config: &ChannelConfig) -> Result<HealthReport> {
         );
     }
 
+    let (account_id, display_name) = match client.auth_mode() {
+        TwilioAuthMode::AccountToken => {
+            let identity = client.identity()?;
+            if let Some(status) = &identity.status {
+                metadata.insert(META_ACCOUNT_STATUS.to_string(), status.clone());
+            }
+            (
+                identity.sid,
+                identity
+                    .friendly_name
+                    .unwrap_or_else(|| "twilio-account".to_string()),
+            )
+        }
+        TwilioAuthMode::ApiKey => {
+            client.validate_access()?;
+            (
+                client.account_sid().to_string(),
+                "twilio-account".to_string(),
+            )
+        }
+    };
+
     Ok(HealthReport {
         ok: true,
         status: "ok".to_string(),
-        account_id: Some(identity.sid),
-        display_name: Some(
-            identity
-                .friendly_name
-                .unwrap_or_else(|| "twilio-account".to_string()),
-        ),
+        account_id: Some(account_id),
+        display_name: Some(display_name),
         metadata,
     })
 }
@@ -227,8 +258,7 @@ fn start_ingress(config: &ChannelConfig) -> Result<IngressState> {
         .ok_or_else(|| anyhow!("twilio ingress requires webhook_public_url"))?;
     validate_url(&endpoint, "twilio webhook endpoint")?;
 
-    let client = TwilioClient::from_env(account_sid_env(config), auth_token_env(config))?;
-    let identity = client.identity()?;
+    let client = client_from_env(config)?;
 
     let mut metadata = BTreeMap::new();
     metadata.insert(META_PLATFORM.to_string(), PLATFORM_TWILIO_SMS.to_string());
@@ -240,9 +270,22 @@ fn start_ingress(config: &ChannelConfig) -> Result<IngressState> {
         META_SIGNATURE_HEADER.to_string(),
         HEADER_X_TWILIO_SIGNATURE.to_string(),
     );
-    metadata.insert(META_ACCOUNT_SID.to_string(), identity.sid);
-    if let Some(status) = identity.status {
-        metadata.insert(META_ACCOUNT_STATUS.to_string(), status);
+    metadata.insert(
+        META_ACCOUNT_SID.to_string(),
+        client.account_sid().to_string(),
+    );
+    metadata.insert(
+        META_AUTH_MODE.to_string(),
+        auth_mode_name(client.auth_mode()).to_string(),
+    );
+    match client.auth_mode() {
+        TwilioAuthMode::AccountToken => {
+            let identity = client.identity()?;
+            if let Some(status) = identity.status {
+                metadata.insert(META_ACCOUNT_STATUS.to_string(), status);
+            }
+        }
+        TwilioAuthMode::ApiKey => client.validate_access()?,
     }
     if has_optional_env(webhook_auth_token_env(config)) {
         metadata.insert(
@@ -280,7 +323,7 @@ fn stop_ingress(config: &ChannelConfig, state: Option<IngressState>) -> Result<I
 fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<DeliveryReceipt> {
     let to_number = resolve_to_number(message)?;
     let media_urls = outbound_media_urls(message)?;
-    let client = TwilioClient::from_env(account_sid_env(config), auth_token_env(config))?;
+    let client = client_from_env(config)?;
     let sent = client.send_message(
         &to_number,
         &message.content,
@@ -654,6 +697,20 @@ fn auth_token_env(config: &ChannelConfig) -> &str {
         .unwrap_or("TWILIO_AUTH_TOKEN")
 }
 
+fn api_key_sid_env(config: &ChannelConfig) -> &str {
+    config
+        .api_key_sid_env
+        .as_deref()
+        .unwrap_or("TWILIO_API_KEY_SID")
+}
+
+fn api_key_secret_env(config: &ChannelConfig) -> &str {
+    config
+        .api_key_secret_env
+        .as_deref()
+        .unwrap_or("TWILIO_API_KEY_SECRET")
+}
+
 fn webhook_auth_token_env(config: &ChannelConfig) -> &str {
     config
         .webhook_auth_token_env
@@ -663,6 +720,22 @@ fn webhook_auth_token_env(config: &ChannelConfig) -> &str {
 
 fn has_optional_env(name: &str) -> bool {
     std::env::var(name).is_ok()
+}
+
+fn client_from_env(config: &ChannelConfig) -> Result<TwilioClient> {
+    TwilioClient::from_env(
+        account_sid_env(config),
+        auth_token_env(config),
+        api_key_sid_env(config),
+        api_key_secret_env(config),
+    )
+}
+
+fn auth_mode_name(mode: TwilioAuthMode) -> &'static str {
+    match mode {
+        TwilioAuthMode::AccountToken => AUTH_MODE_ACCOUNT_TOKEN,
+        TwilioAuthMode::ApiKey => AUTH_MODE_API_KEY,
+    }
 }
 
 fn validate_url(url: &str, field: &str) -> Result<()> {
