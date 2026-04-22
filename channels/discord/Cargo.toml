@@ -15,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
-dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", rev = "936b61eb2dd44de66e474d62ba99d23376c0cff2" }
+dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", tag = "v0.3.0" }
 ed25519-dalek = "2.2"
 hex = "0.4"
 jiff = "0.2"
