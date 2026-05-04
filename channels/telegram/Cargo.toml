@@ -16,7 +16,7 @@ path = "src/main.rs"
 anyhow = "1"
 base64 = "0.22"
 dispatch-channel-runtime = { path = "../../crates/dispatch-channel-runtime" }
-dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", tag = "v0.3.0" }
+dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", tag = "v0.4.0" }
 jiff = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
