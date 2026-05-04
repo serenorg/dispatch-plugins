@@ -23,7 +23,8 @@
       "tags": [
         "messaging",
         "discord",
-        "webhook"
+        "webhook",
+        "websocket"
       ],
       "install_hint": "dispatch channel install channels/discord/channel-plugin.json",
       "auth": {
@@ -39,7 +40,8 @@
           "DISCORD_INTERACTION_PUBLIC_KEY"
         ],
         "network_domains": [
-          "discord.com"
+          "discord.com",
+          "gateway.discord.gg"
         ],
         "platforms": []
       },

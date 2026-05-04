@@ -1,13 +1,29 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use dispatch_channel_protocol::{
+    ChannelEventNotification, PluginNotificationEnvelope, notification_to_jsonrpc,
+};
+use dispatch_channel_runtime::write_stdout_line;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    io::{self, BufRead, Write},
+    io::{self, BufRead},
+    net::TcpStream,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+use tungstenite::{
+    Message, WebSocket,
+    protocol::{CloseFrame, frame::coding::CloseCode},
+    stream::MaybeTlsStream,
 };
 
 mod discord_api;
@@ -61,7 +77,9 @@ const ROUTE_CONVERSATION_ID: &str = "conversation_id";
 const ROUTE_THREAD_ID: &str = "thread_id";
 const ROUTE_REPLY_TO_MESSAGE_ID: &str = "reply_to_message_id";
 const TRANSPORT_INTERACTION_WEBHOOK: &str = "interaction_webhook";
+const TRANSPORT_WEBSOCKET: &str = "websocket";
 const DISCORD_STATUS_TEXT: &str = "discord_status_text";
+const DISCORD_GATEWAY_BASE_URL: &str = "wss://gateway.discord.gg";
 
 const HEADER_X_SIGNATURE_ED25519: &str = "X-Signature-Ed25519";
 const HEADER_X_SIGNATURE_TIMESTAMP: &str = "X-Signature-Timestamp";
@@ -91,9 +109,15 @@ const COMPONENT_KIND_ROLE_SELECT: u8 = 6;
 const COMPONENT_KIND_MENTIONABLE_SELECT: u8 = 7;
 const COMPONENT_KIND_CHANNEL_SELECT: u8 = 8;
 
+const DISCORD_GATEWAY_VERSION: u8 = 10;
+const DISCORD_GATEWAY_BASE_INTENTS: u64 = 1 | (1 << 9) | (1 << 12);
+const DISCORD_GATEWAY_MESSAGE_CONTENT_INTENT: u64 = 1 << 15;
+const DISCORD_GATEWAY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn main() -> Result<()> {
     let stdin = io::stdin().lock();
-    let mut stdout = io::stdout().lock();
+    let stdout_lock = Arc::new(Mutex::new(()));
+    let mut ingress_worker: Option<DiscordIngressWorker> = None;
 
     for line in stdin.lines() {
         let line = line.context("failed to read stdin")?;
@@ -103,21 +127,29 @@ fn main() -> Result<()> {
 
         let (request_id, envelope) = parse_jsonrpc_request(&line)
             .map_err(|error| anyhow!("failed to parse channel request: {error}"))?;
+        let should_exit = matches!(envelope.request, PluginRequest::Shutdown);
 
-        let response = match handle_request(&envelope) {
+        let response = match handle_request(&envelope, &stdout_lock, &mut ingress_worker) {
             Ok(response) => response,
             Err(error) => plugin_error("internal_error", error.to_string()),
         };
 
         let json = response_to_jsonrpc(&request_id, &response).map_err(|error| anyhow!(error))?;
-        writeln!(stdout, "{json}")?;
-        stdout.flush()?;
+        write_stdout_line(&stdout_lock, &json)?;
+        if should_exit {
+            break;
+        }
     }
 
+    let _ = stop_ingress_worker(&mut ingress_worker);
     Ok(())
 }
 
-fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
+fn handle_request(
+    envelope: &PluginRequestEnvelope,
+    stdout_lock: &Arc<Mutex<()>>,
+    ingress_worker: &mut Option<DiscordIngressWorker>,
+) -> Result<PluginResponse> {
     if envelope.protocol_version != CHANNEL_PLUGIN_PROTOCOL_VERSION {
         return Ok(plugin_error(
             "unsupported_protocol_version",
@@ -138,15 +170,34 @@ fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
         PluginRequest::Health { config } => Ok(PluginResponse::Health {
             health: health(config)?,
         }),
-        PluginRequest::PollIngress { .. } => Ok(plugin_error(
-            "polling_not_supported",
-            "discord ingress is webhook-only; use ingress_event or listen bindings",
-        )),
-        PluginRequest::StartIngress { config, .. } => Ok(PluginResponse::IngressStarted {
-            state: start_ingress(config)?,
-        }),
+        PluginRequest::PollIngress { config, state } => {
+            handle_websocket_receive(config, state.as_ref())
+        }
+        PluginRequest::StartIngress { config, state } => {
+            let started = start_ingress(config)?;
+            let started = match (&started.mode, state.clone()) {
+                (IngressMode::Websocket, Some(state)) if state.mode == IngressMode::Websocket => {
+                    state
+                }
+                _ => started,
+            };
+            if matches!(started.mode, IngressMode::Websocket) {
+                restart_ingress_worker(
+                    ingress_worker,
+                    config.clone(),
+                    started.clone(),
+                    Arc::clone(stdout_lock),
+                );
+            } else {
+                let _ = stop_ingress_worker(ingress_worker);
+            }
+            Ok(PluginResponse::IngressStarted { state: started })
+        }
         PluginRequest::StopIngress { config, state } => Ok(PluginResponse::IngressStopped {
-            state: stop_ingress(config, state.clone())?,
+            state: stop_ingress(
+                config,
+                stop_ingress_worker(ingress_worker).or(state.clone()),
+            )?,
         }),
         PluginRequest::Deliver { config, message } => Ok(PluginResponse::Delivered {
             delivery: deliver(config, message)?,
@@ -160,7 +211,10 @@ fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
         PluginRequest::Status { config, update } => Ok(PluginResponse::StatusAccepted {
             status: send_status(config, update)?,
         }),
-        PluginRequest::Shutdown => Ok(PluginResponse::Ok),
+        PluginRequest::Shutdown => {
+            let _ = stop_ingress_worker(ingress_worker);
+            Ok(PluginResponse::Ok)
+        }
     }
 }
 
@@ -219,6 +273,40 @@ fn channel_policy(config: &ChannelConfig) -> ChannelPolicy {
     }
 }
 
+struct DiscordIngressWorker {
+    stop: Arc<AtomicBool>,
+    state: Arc<Mutex<Option<IngressState>>>,
+    handle: JoinHandle<()>,
+}
+
+fn restart_ingress_worker(
+    worker: &mut Option<DiscordIngressWorker>,
+    config: ChannelConfig,
+    state: IngressState,
+    stdout_lock: Arc<Mutex<()>>,
+) {
+    let _ = stop_ingress_worker(worker);
+    let stop = Arc::new(AtomicBool::new(false));
+    let shared_state = Arc::new(Mutex::new(Some(state.clone())));
+    let worker_stop = Arc::clone(&stop);
+    let worker_state = Arc::clone(&shared_state);
+    let handle = thread::spawn(move || {
+        run_discord_websocket_worker(config, state, worker_stop, worker_state, stdout_lock);
+    });
+    *worker = Some(DiscordIngressWorker {
+        stop,
+        state: shared_state,
+        handle,
+    });
+}
+
+fn stop_ingress_worker(worker: &mut Option<DiscordIngressWorker>) -> Option<IngressState> {
+    let worker = worker.take()?;
+    worker.stop.store(true, Ordering::Relaxed);
+    let _ = worker.handle.join();
+    worker.state.lock().ok().and_then(|state| (*state).clone())
+}
+
 fn health(config: &ChannelConfig) -> Result<HealthReport> {
     let client = DiscordClient::from_env(bot_token_env(config))?;
     let identity = client.identity()?;
@@ -243,29 +331,38 @@ fn health(config: &ChannelConfig) -> Result<HealthReport> {
 
 fn start_ingress(config: &ChannelConfig) -> Result<IngressState> {
     read_required_env(bot_token_env(config))?;
-    read_required_env(interaction_public_key_env(config))?;
 
-    let endpoint = resolved_endpoint(config).ok_or_else(|| {
-        anyhow!(
-            "discord ingress requires webhook_public_url because this plugin uses interaction webhooks instead of a long-lived gateway connection"
-        )
-    })?;
+    if let Some(endpoint) = resolved_endpoint(config) {
+        read_required_env(interaction_public_key_env(config))?;
+        let mut metadata = BTreeMap::new();
+        metadata.insert(META_PLATFORM.to_string(), PLATFORM_DISCORD.to_string());
+        metadata.insert(
+            META_VERIFICATION_KEY_ENV.to_string(),
+            interaction_public_key_env(config).to_string(),
+        );
+        metadata.insert(
+            META_HOST_ACTION.to_string(),
+            "route Discord interaction POSTs to the reported endpoint and verify signatures with the configured public key".to_string(),
+        );
 
-    let mut metadata = BTreeMap::new();
-    metadata.insert(META_PLATFORM.to_string(), PLATFORM_DISCORD.to_string());
-    metadata.insert(
-        META_VERIFICATION_KEY_ENV.to_string(),
-        interaction_public_key_env(config).to_string(),
-    );
+        return Ok(IngressState {
+            mode: IngressMode::InteractionWebhook,
+            status: "configured".to_string(),
+            endpoint: Some(endpoint),
+            metadata,
+        });
+    }
+
+    let mut metadata = websocket_state_metadata();
     metadata.insert(
         META_HOST_ACTION.to_string(),
-        "route Discord interaction POSTs to the reported endpoint and verify signatures with the configured public key".to_string(),
+        "keep a Discord websocket connection open and emit message events as channel.event notifications".to_string(),
     );
 
     Ok(IngressState {
-        mode: IngressMode::InteractionWebhook,
-        status: "configured".to_string(),
-        endpoint: Some(endpoint),
+        mode: IngressMode::Websocket,
+        status: "running".to_string(),
+        endpoint: None,
         metadata,
     })
 }
@@ -273,11 +370,17 @@ fn start_ingress(config: &ChannelConfig) -> Result<IngressState> {
 fn stop_ingress(config: &ChannelConfig, state: Option<IngressState>) -> Result<IngressState> {
     read_required_env(bot_token_env(config))?;
 
-    let mut stopped = state.unwrap_or(IngressState {
-        mode: IngressMode::InteractionWebhook,
-        status: "configured".to_string(),
-        endpoint: resolved_endpoint(config),
-        metadata: BTreeMap::new(),
+    let mut stopped = state.unwrap_or_else(|| {
+        if let Some(endpoint) = resolved_endpoint(config) {
+            IngressState {
+                mode: IngressMode::InteractionWebhook,
+                status: "configured".to_string(),
+                endpoint: Some(endpoint),
+                metadata: BTreeMap::new(),
+            }
+        } else {
+            websocket_state("running", None, None, None)
+        }
     });
     stopped.status = "stopped".to_string();
     stopped
@@ -359,6 +462,802 @@ fn handle_ingress_event(
         state: None,
         poll_after_ms: None,
     })
+}
+
+fn handle_websocket_receive(
+    config: &ChannelConfig,
+    state: Option<&IngressState>,
+) -> Result<PluginResponse> {
+    discord_websocket_receive(config, state.cloned())
+}
+
+fn discord_websocket_receive(
+    config: &ChannelConfig,
+    state: Option<IngressState>,
+) -> Result<PluginResponse> {
+    let client = DiscordClient::from_env(bot_token_env(config))?;
+    let mut session = DiscordGatewaySession::from_state(state.as_ref());
+    let gateway_url =
+        discord_gateway_base_url(&session, || Ok(DISCORD_GATEWAY_BASE_URL.to_string()))?;
+    let websocket_url = discord_gateway_websocket_url(&gateway_url);
+    let (mut socket, _) = tungstenite::connect(websocket_url.as_str())
+        .with_context(|| format!("failed to connect Discord websocket: {websocket_url}"))?;
+    let deadline = Instant::now() + discord_websocket_timeout_window();
+
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(PluginResponse::IngressEventsReceived {
+                events: Vec::new(),
+                callback_reply: None,
+                state: Some(session.to_state("running")),
+                poll_after_ms: Some(1000),
+            });
+        }
+        if now >= session.next_heartbeat {
+            if session.awaiting_heartbeat_ack {
+                close_discord_websocket_for_reconnect(&mut socket);
+                return Ok(discord_gateway_action_response(
+                    DiscordGatewayAction::Reconnect,
+                    &session,
+                ));
+            }
+            send_discord_session_heartbeat(&mut socket, &mut session)?;
+        }
+        configure_websocket_read_timeout(
+            socket.get_mut(),
+            std::cmp::min(
+                DISCORD_GATEWAY_READ_TIMEOUT,
+                deadline.saturating_duration_since(now),
+            ),
+        )?;
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                if let Some(action) = handle_discord_gateway_text(
+                    config,
+                    &mut socket,
+                    text.as_str(),
+                    &mut session,
+                    client.bot_token(),
+                )? {
+                    return Ok(discord_gateway_action_response(action, &session));
+                }
+            }
+            Ok(Message::Binary(bytes)) => {
+                let text = std::str::from_utf8(bytes.as_ref())
+                    .context("Discord websocket binary frame was not valid UTF-8")?;
+                if let Some(action) = handle_discord_gateway_text(
+                    config,
+                    &mut socket,
+                    text,
+                    &mut session,
+                    client.bot_token(),
+                )? {
+                    return Ok(discord_gateway_action_response(action, &session));
+                }
+            }
+            Ok(Message::Ping(payload)) => {
+                socket.send(Message::Pong(payload))?;
+            }
+            Ok(Message::Pong(_)) => {}
+            Ok(Message::Close(frame)) => {
+                let close_action = handle_discord_close_frame(&mut session, frame.as_ref());
+                return Ok(PluginResponse::IngressEventsReceived {
+                    events: Vec::new(),
+                    callback_reply: None,
+                    state: Some(session.to_state(discord_close_status(close_action))),
+                    poll_after_ms: discord_close_poll_after(close_action),
+                });
+            }
+            Ok(Message::Frame(_)) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                return Ok(PluginResponse::IngressEventsReceived {
+                    events: Vec::new(),
+                    callback_reply: None,
+                    state: Some(session.to_state("closed")),
+                    poll_after_ms: Some(1000),
+                });
+            }
+            Err(error) => return Err(error).context("failed to read Discord websocket frame"),
+        }
+    }
+}
+
+fn run_discord_websocket_worker(
+    config: ChannelConfig,
+    initial_state: IngressState,
+    stop: Arc<AtomicBool>,
+    shared_state: Arc<Mutex<Option<IngressState>>>,
+    stdout_lock: Arc<Mutex<()>>,
+) {
+    let mut state = Some(initial_state);
+    let mut failure_backoff = Duration::from_secs(1);
+    while !stop.load(Ordering::Relaxed) {
+        match run_discord_websocket_session(
+            &config,
+            state.clone(),
+            &stop,
+            &shared_state,
+            &stdout_lock,
+        ) {
+            Ok(next_state) => {
+                let should_stop = next_state.status == "stopped";
+                state = Some(next_state);
+                failure_backoff = Duration::from_secs(1);
+                if should_stop {
+                    break;
+                }
+            }
+            Err(error) => {
+                eprintln!("discord websocket worker reconnecting after receive failure: {error:#}");
+                sleep_until_stopped(&stop, failure_backoff);
+                failure_backoff = std::cmp::min(failure_backoff * 2, Duration::from_secs(60));
+                continue;
+            }
+        }
+        sleep_until_stopped(&stop, Duration::from_secs(1));
+    }
+}
+
+fn run_discord_websocket_session(
+    config: &ChannelConfig,
+    state: Option<IngressState>,
+    stop: &AtomicBool,
+    shared_state: &Arc<Mutex<Option<IngressState>>>,
+    stdout_lock: &Arc<Mutex<()>>,
+) -> Result<IngressState> {
+    let client = DiscordClient::from_env(bot_token_env(config))?;
+    let mut session = DiscordGatewaySession::from_state(state.as_ref());
+    let gateway_url =
+        discord_gateway_base_url(&session, || Ok(DISCORD_GATEWAY_BASE_URL.to_string()))?;
+    let websocket_url = discord_gateway_websocket_url(&gateway_url);
+    let (mut socket, _) = tungstenite::connect(websocket_url.as_str())
+        .with_context(|| format!("failed to connect Discord websocket: {websocket_url}"))?;
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            close_discord_websocket_for_stop(&mut socket);
+            return Ok(session.to_state("running"));
+        }
+        let now = Instant::now();
+        if now >= session.next_heartbeat {
+            if session.awaiting_heartbeat_ack {
+                let state = session.to_state("reconnect");
+                set_worker_state(shared_state, state.clone());
+                close_discord_websocket_for_reconnect(&mut socket);
+                return Ok(state);
+            }
+            send_discord_session_heartbeat(&mut socket, &mut session)?;
+        }
+        configure_websocket_read_timeout(socket.get_mut(), DISCORD_GATEWAY_READ_TIMEOUT)?;
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                if let Some(action) = handle_discord_gateway_text(
+                    config,
+                    &mut socket,
+                    text.as_str(),
+                    &mut session,
+                    client.bot_token(),
+                )? {
+                    match action {
+                        DiscordGatewayAction::Event(event) => {
+                            let state = session.to_state("running");
+                            set_worker_state(shared_state, state.clone());
+                            emit_channel_event_notification(
+                                stdout_lock,
+                                vec![*event],
+                                Some(state),
+                                Some(0),
+                            )?;
+                        }
+                        DiscordGatewayAction::Reconnect => {
+                            let state = session.to_state("reconnect");
+                            set_worker_state(shared_state, state.clone());
+                            return Ok(state);
+                        }
+                    }
+                }
+            }
+            Ok(Message::Binary(bytes)) => {
+                let text = std::str::from_utf8(bytes.as_ref())
+                    .context("Discord websocket binary frame was not valid UTF-8")?;
+                if let Some(action) = handle_discord_gateway_text(
+                    config,
+                    &mut socket,
+                    text,
+                    &mut session,
+                    client.bot_token(),
+                )? {
+                    match action {
+                        DiscordGatewayAction::Event(event) => {
+                            let state = session.to_state("running");
+                            set_worker_state(shared_state, state.clone());
+                            emit_channel_event_notification(
+                                stdout_lock,
+                                vec![*event],
+                                Some(state),
+                                Some(0),
+                            )?;
+                        }
+                        DiscordGatewayAction::Reconnect => {
+                            let state = session.to_state("reconnect");
+                            set_worker_state(shared_state, state.clone());
+                            return Ok(state);
+                        }
+                    }
+                }
+            }
+            Ok(Message::Ping(payload)) => {
+                socket.send(Message::Pong(payload))?;
+            }
+            Ok(Message::Pong(_)) => {}
+            Ok(Message::Close(frame)) => {
+                let close_action = handle_discord_close_frame(&mut session, frame.as_ref());
+                let state = session.to_state(discord_close_status(close_action));
+                set_worker_state(shared_state, state.clone());
+                return Ok(state);
+            }
+            Ok(Message::Frame(_)) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                let state = session.to_state("closed");
+                set_worker_state(shared_state, state.clone());
+                return Ok(state);
+            }
+            Err(error) => return Err(error).context("failed to read Discord websocket frame"),
+        }
+    }
+}
+
+fn set_worker_state(shared_state: &Arc<Mutex<Option<IngressState>>>, state: IngressState) {
+    if let Ok(mut guard) = shared_state.lock() {
+        *guard = Some(state);
+    }
+}
+
+fn sleep_until_stopped(stop: &AtomicBool, duration: Duration) {
+    let mut slept = Duration::ZERO;
+    while slept < duration && !stop.load(Ordering::Relaxed) {
+        let step = std::cmp::min(Duration::from_millis(250), duration - slept);
+        thread::sleep(step);
+        slept += step;
+    }
+}
+
+fn emit_channel_event_notification(
+    stdout_lock: &Arc<Mutex<()>>,
+    events: Vec<InboundEventEnvelope>,
+    state: Option<IngressState>,
+    poll_after_ms: Option<u64>,
+) -> Result<()> {
+    let envelope = PluginNotificationEnvelope {
+        protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+        notification: ChannelEventNotification {
+            events,
+            state,
+            poll_after_ms,
+        },
+    };
+    let json = notification_to_jsonrpc(&envelope)
+        .map_err(|error| anyhow!("failed to encode channel event notification: {error}"))?;
+    write_stdout_line(stdout_lock, &json).context("failed to write channel event notification")
+}
+
+struct DiscordGatewaySession {
+    last_sequence: Option<u64>,
+    session_id: Option<String>,
+    resume_gateway_url: Option<String>,
+    heartbeat_interval: Duration,
+    next_heartbeat: Instant,
+    awaiting_heartbeat_ack: bool,
+    identified: bool,
+}
+
+impl DiscordGatewaySession {
+    fn from_state(state: Option<&IngressState>) -> Self {
+        Self {
+            last_sequence: state
+                .and_then(|state| state.metadata.get("sequence"))
+                .and_then(|value| value.parse::<u64>().ok()),
+            session_id: state
+                .and_then(|state| state.metadata.get("session_id"))
+                .cloned(),
+            resume_gateway_url: state
+                .and_then(|state| state.metadata.get("resume_gateway_url"))
+                .cloned(),
+            heartbeat_interval: Duration::from_secs(45),
+            next_heartbeat: Instant::now() + Duration::from_secs(45),
+            awaiting_heartbeat_ack: false,
+            identified: false,
+        }
+    }
+
+    fn can_resume(&self) -> bool {
+        self.session_id.is_some()
+            && self.last_sequence.is_some()
+            && self.resume_gateway_url.is_some()
+    }
+
+    fn reset_resume(&mut self) {
+        self.session_id = None;
+        self.last_sequence = None;
+        self.resume_gateway_url = None;
+    }
+
+    fn to_state(&self, status: &str) -> IngressState {
+        websocket_state(
+            status,
+            self.last_sequence,
+            self.session_id.as_deref(),
+            self.resume_gateway_url.as_deref(),
+        )
+    }
+}
+
+enum DiscordGatewayAction {
+    Event(Box<InboundEventEnvelope>),
+    Reconnect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiscordGatewayCloseAction {
+    Resume,
+    Reidentify,
+    Stop,
+}
+
+fn discord_gateway_action_response(
+    action: DiscordGatewayAction,
+    session: &DiscordGatewaySession,
+) -> PluginResponse {
+    match action {
+        DiscordGatewayAction::Event(event) => PluginResponse::IngressEventsReceived {
+            events: vec![*event],
+            callback_reply: None,
+            state: Some(session.to_state("running")),
+            poll_after_ms: Some(0),
+        },
+        DiscordGatewayAction::Reconnect => PluginResponse::IngressEventsReceived {
+            events: Vec::new(),
+            callback_reply: None,
+            state: Some(session.to_state("reconnect")),
+            poll_after_ms: Some(1000),
+        },
+    }
+}
+
+fn handle_discord_gateway_text(
+    config: &ChannelConfig,
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    text: &str,
+    session: &mut DiscordGatewaySession,
+    bot_token: &str,
+) -> Result<Option<DiscordGatewayAction>> {
+    let payload: DiscordGatewayPayload =
+        serde_json::from_str(text).context("failed to parse Discord websocket payload")?;
+    if let Some(sequence) = payload.sequence {
+        session.last_sequence = Some(sequence);
+    }
+
+    match payload.op {
+        0 => {
+            match payload.event_type.as_deref() {
+                Some("READY") => {
+                    debug_discord_gateway(format_args!("received READY"));
+                    if let Some(session_id) = payload.data.get("session_id").and_then(Value::as_str)
+                    {
+                        session.session_id = Some(session_id.to_string());
+                    }
+                    if let Some(resume_gateway_url) = payload
+                        .data
+                        .get("resume_gateway_url")
+                        .and_then(Value::as_str)
+                    {
+                        session.resume_gateway_url = Some(resume_gateway_url.to_string());
+                    }
+                    return Ok(None);
+                }
+                Some("RESUMED") => return Ok(None),
+                Some("MESSAGE_CREATE") => {}
+                other => {
+                    debug_discord_gateway(format_args!("ignoring gateway event {:?}", other));
+                    return Ok(None);
+                }
+            }
+            let message: DiscordGatewayMessage = serde_json::from_value(payload.data)
+                .context("failed to parse Discord MESSAGE_CREATE payload")?;
+            let Some(event) = build_websocket_inbound_event(config, &message)? else {
+                return Ok(None);
+            };
+            Ok(Some(DiscordGatewayAction::Event(Box::new(event))))
+        }
+        1 => {
+            send_discord_session_heartbeat(socket, session)?;
+            Ok(None)
+        }
+        7 => Ok(Some(DiscordGatewayAction::Reconnect)),
+        9 => {
+            if !payload.data.as_bool().unwrap_or(false) {
+                session.reset_resume();
+            }
+            Ok(Some(DiscordGatewayAction::Reconnect))
+        }
+        10 => {
+            if let Some(interval) = payload
+                .data
+                .get("heartbeat_interval")
+                .and_then(Value::as_u64)
+            {
+                session.heartbeat_interval = Duration::from_millis(interval);
+                session.next_heartbeat = Instant::now() + session.heartbeat_interval;
+            }
+            if !session.identified {
+                if session.can_resume() {
+                    send_discord_resume(socket, bot_token, session)?;
+                } else {
+                    send_discord_identify(socket, bot_token, config)?;
+                }
+                session.identified = true;
+            }
+            Ok(None)
+        }
+        11 => {
+            session.awaiting_heartbeat_ack = false;
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn send_discord_identify(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    token: &str,
+    config: &ChannelConfig,
+) -> Result<()> {
+    let payload = json!({
+        "op": 2,
+        "d": {
+            "token": token,
+            "intents": discord_gateway_intents(config),
+            "properties": {
+                "os": "linux",
+                "browser": "dispatch",
+                "device": "dispatch"
+            }
+        }
+    });
+    socket
+        .send(Message::Text(payload.to_string().into()))
+        .context("failed to identify Discord websocket")
+}
+
+fn discord_gateway_intents(config: &ChannelConfig) -> u64 {
+    let mut intents = DISCORD_GATEWAY_BASE_INTENTS;
+    if config.message_content_intent.unwrap_or(false) {
+        intents |= DISCORD_GATEWAY_MESSAGE_CONTENT_INTENT;
+    }
+    intents
+}
+
+fn handle_discord_close_frame(
+    session: &mut DiscordGatewaySession,
+    frame: Option<&CloseFrame>,
+) -> DiscordGatewayCloseAction {
+    let action = discord_gateway_close_action(frame);
+    if matches!(
+        action,
+        DiscordGatewayCloseAction::Reidentify | DiscordGatewayCloseAction::Stop
+    ) {
+        session.reset_resume();
+    }
+    log_discord_close_frame(frame, action);
+    action
+}
+
+fn discord_gateway_close_action(frame: Option<&CloseFrame>) -> DiscordGatewayCloseAction {
+    let Some(frame) = frame else {
+        return DiscordGatewayCloseAction::Resume;
+    };
+    match u16::from(frame.code) {
+        4003 | 4007 | 4009 => DiscordGatewayCloseAction::Reidentify,
+        4004 | 4010 | 4011 | 4012 | 4013 | 4014 => DiscordGatewayCloseAction::Stop,
+        _ => DiscordGatewayCloseAction::Resume,
+    }
+}
+
+fn discord_close_status(action: DiscordGatewayCloseAction) -> &'static str {
+    match action {
+        DiscordGatewayCloseAction::Resume | DiscordGatewayCloseAction::Reidentify => "closed",
+        DiscordGatewayCloseAction::Stop => "stopped",
+    }
+}
+
+fn discord_close_poll_after(action: DiscordGatewayCloseAction) -> Option<u64> {
+    match action {
+        DiscordGatewayCloseAction::Resume | DiscordGatewayCloseAction::Reidentify => Some(1000),
+        DiscordGatewayCloseAction::Stop => None,
+    }
+}
+
+fn log_discord_close_frame(frame: Option<&CloseFrame>, action: DiscordGatewayCloseAction) {
+    if let Some(frame) = frame {
+        eprintln!(
+            "discord websocket closed: code={} reason={} action={:?}",
+            u16::from(frame.code),
+            frame.reason,
+            action
+        );
+    } else {
+        eprintln!("discord websocket closed without a close frame action={action:?}");
+    }
+}
+
+fn debug_discord_gateway(args: std::fmt::Arguments<'_>) {
+    let enabled = std::env::var("DISCORD_GATEWAY_DEBUG")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if enabled {
+        eprintln!("discord gateway debug: {args}");
+    }
+}
+
+fn send_discord_resume(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    token: &str,
+    session: &DiscordGatewaySession,
+) -> Result<()> {
+    let payload = json!({
+        "op": 6,
+        "d": {
+            "token": token,
+            "session_id": session.session_id.as_deref().unwrap_or_default(),
+            "seq": session.last_sequence,
+        }
+    });
+    socket
+        .send(Message::Text(payload.to_string().into()))
+        .context("failed to resume Discord websocket")
+}
+
+fn send_discord_heartbeat(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    last_sequence: Option<u64>,
+) -> Result<()> {
+    socket
+        .send(Message::Text(
+            json!({ "op": 1, "d": last_sequence }).to_string().into(),
+        ))
+        .context("failed to send Discord websocket heartbeat")
+}
+
+fn send_discord_session_heartbeat(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    session: &mut DiscordGatewaySession,
+) -> Result<()> {
+    send_discord_heartbeat(socket, session.last_sequence)?;
+    session.awaiting_heartbeat_ack = true;
+    session.next_heartbeat = Instant::now() + session.heartbeat_interval;
+    Ok(())
+}
+
+fn close_discord_websocket_for_stop(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
+    let close = CloseFrame {
+        code: CloseCode::Normal,
+        reason: "stopping".into(),
+    };
+    let _ = socket.close(Some(close));
+}
+
+fn close_discord_websocket_for_reconnect(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
+    let _ = socket.close(None);
+}
+
+fn build_websocket_inbound_event(
+    config: &ChannelConfig,
+    message: &DiscordGatewayMessage,
+) -> Result<Option<InboundEventEnvelope>> {
+    if message.author.bot.unwrap_or(false) {
+        debug_discord_gateway(format_args!(
+            "ignoring bot-authored message id={} channel={}",
+            message.id, message.channel_id
+        ));
+        return Ok(None);
+    }
+    if !guild_is_allowed(config, message.guild_id.as_deref()) {
+        debug_discord_gateway(format_args!(
+            "ignoring message id={} from disallowed guild={:?}",
+            message.id, message.guild_id
+        ));
+        return Ok(None);
+    }
+    if !sender_is_allowed(config, &message.author.id, message.guild_id.as_deref()) {
+        debug_discord_gateway(format_args!(
+            "ignoring message id={} from disallowed sender={}",
+            message.id, message.author.id
+        ));
+        return Ok(None);
+    }
+    debug_discord_gateway(format_args!(
+        "accepting message id={} channel={} guild={:?} content_bytes={}",
+        message.id,
+        message.channel_id,
+        message.guild_id,
+        message.content.len()
+    ));
+
+    let mut event_metadata = BTreeMap::new();
+    event_metadata.insert(META_TRANSPORT.to_string(), TRANSPORT_WEBSOCKET.to_string());
+    if let Some(guild_id) = &message.guild_id {
+        event_metadata.insert(META_GUILD_ID.to_string(), guild_id.clone());
+    }
+    let mut actor_metadata = BTreeMap::new();
+    actor_metadata.insert(META_ACTOR_KIND.to_string(), "user".to_string());
+
+    Ok(Some(InboundEventEnvelope {
+        event_id: message.id.clone(),
+        platform: PLATFORM_DISCORD.to_string(),
+        event_type: "message.created".to_string(),
+        received_at: message
+            .timestamp
+            .clone()
+            .unwrap_or_else(|| Timestamp::now().to_string()),
+        conversation: InboundConversationRef {
+            id: message.channel_id.clone(),
+            kind: if message.guild_id.is_some() {
+                "channel".to_string()
+            } else {
+                "direct_message".to_string()
+            },
+            thread_id: None,
+            parent_message_id: message
+                .message_reference
+                .as_ref()
+                .and_then(|reference| reference.message_id.clone()),
+        },
+        actor: InboundActor {
+            id: message.author.id.clone(),
+            display_name: message
+                .author
+                .global_name
+                .clone()
+                .or_else(|| Some(message.author.username.clone())),
+            username: Some(message.author.username.clone()),
+            is_bot: false,
+            metadata: actor_metadata,
+        },
+        message: InboundMessage {
+            id: message.id.clone(),
+            content: message.content.clone(),
+            content_type: "text/plain".to_string(),
+            reply_to_message_id: message
+                .message_reference
+                .as_ref()
+                .and_then(|reference| reference.message_id.clone()),
+            attachments: message.attachments.iter().map(gateway_attachment).collect(),
+            metadata: BTreeMap::new(),
+        },
+        account_id: None,
+        metadata: event_metadata,
+    }))
+}
+
+fn gateway_attachment(attachment: &DiscordGatewayAttachment) -> InboundAttachment {
+    InboundAttachment {
+        id: Some(attachment.id.clone()),
+        kind: "file".to_string(),
+        url: Some(attachment.url.clone()),
+        mime_type: attachment.content_type.clone(),
+        size_bytes: attachment.size,
+        name: Some(attachment.filename.clone()),
+        storage_key: None,
+        extracted_text: None,
+        extras: BTreeMap::new(),
+    }
+}
+
+fn websocket_state(
+    status: &str,
+    sequence: Option<u64>,
+    session_id: Option<&str>,
+    resume_gateway_url: Option<&str>,
+) -> IngressState {
+    let mut state = IngressState {
+        mode: IngressMode::Websocket,
+        status: status.to_string(),
+        endpoint: None,
+        metadata: websocket_state_metadata(),
+    };
+    if let Some(sequence) = sequence {
+        state
+            .metadata
+            .insert("sequence".to_string(), sequence.to_string());
+    }
+    if let Some(session_id) = session_id {
+        state
+            .metadata
+            .insert("session_id".to_string(), session_id.to_string());
+    }
+    if let Some(resume_gateway_url) = resume_gateway_url {
+        state.metadata.insert(
+            "resume_gateway_url".to_string(),
+            resume_gateway_url.to_string(),
+        );
+    }
+    state
+}
+
+fn websocket_state_metadata() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (META_PLATFORM.to_string(), PLATFORM_DISCORD.to_string()),
+        (META_TRANSPORT.to_string(), TRANSPORT_WEBSOCKET.to_string()),
+    ])
+}
+
+fn discord_websocket_timeout_window() -> Duration {
+    std::env::var("DISCORD_GATEWAY_RECEIVE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(300))
+}
+
+fn configure_websocket_read_timeout(
+    stream: &mut MaybeTlsStream<TcpStream>,
+    timeout: Duration,
+) -> Result<()> {
+    let tcp = match stream {
+        MaybeTlsStream::Plain(tcp) => tcp,
+        MaybeTlsStream::Rustls(tls) => &mut tls.sock,
+        _ => return Ok(()),
+    };
+    tcp.set_read_timeout(Some(timeout))
+        .context("failed to configure Discord websocket read timeout")
+}
+
+fn discord_gateway_base_url<F>(session: &DiscordGatewaySession, fallback: F) -> Result<String>
+where
+    F: FnOnce() -> Result<String>,
+{
+    session
+        .resume_gateway_url
+        .clone()
+        .filter(|_| session.can_resume())
+        .map(Ok)
+        .unwrap_or_else(fallback)
+}
+
+fn discord_gateway_websocket_url(gateway_url: &str) -> String {
+    let mut base = gateway_url.to_string();
+    if !base.contains('?') && !base.ends_with('/') {
+        base.push('/');
+    }
+    format!(
+        "{}{}v={}&encoding=json",
+        base,
+        if base.contains('?') { "&" } else { "?" },
+        DISCORD_GATEWAY_VERSION
+    )
 }
 
 fn send_status(config: &ChannelConfig, update: &StatusFrame) -> Result<StatusAcceptance> {
@@ -1161,6 +2060,50 @@ struct DiscordSourceAttachment {
 }
 
 #[derive(Debug, Deserialize)]
+struct DiscordGatewayPayload {
+    op: u64,
+    #[serde(default, rename = "s")]
+    sequence: Option<u64>,
+    #[serde(default, rename = "t")]
+    event_type: Option<String>,
+    #[serde(default, rename = "d")]
+    data: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordGatewayMessage {
+    id: String,
+    channel_id: String,
+    content: String,
+    #[serde(default)]
+    timestamp: Option<String>,
+    #[serde(default)]
+    guild_id: Option<String>,
+    author: DiscordUser,
+    #[serde(default)]
+    attachments: Vec<DiscordGatewayAttachment>,
+    #[serde(default)]
+    message_reference: Option<DiscordGatewayMessageReference>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordGatewayAttachment {
+    id: String,
+    filename: String,
+    url: String,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordGatewayMessageReference {
+    #[serde(default)]
+    message_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct DiscordComponentRow {
     #[serde(default)]
     components: Vec<DiscordComponentValue>,
@@ -1183,6 +2126,33 @@ mod tests {
     use super::*;
     use crate::protocol::OutboundAttachment;
     use ed25519_dalek::{Signer, SigningKey};
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     fn base_payload(body: &str) -> IngressPayload {
         IngressPayload {
@@ -1297,6 +2267,223 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn websocket_message_maps_to_inbound_event() {
+        let config = ChannelConfig::default();
+        let message = DiscordGatewayMessage {
+            id: "msg-1".to_string(),
+            channel_id: "channel-1".to_string(),
+            content: "hello websocket".to_string(),
+            timestamp: Some("2026-05-04T00:00:00Z".to_string()),
+            guild_id: Some("guild-1".to_string()),
+            author: DiscordUser {
+                id: "user-1".to_string(),
+                username: "sender".to_string(),
+                global_name: Some("Sender".to_string()),
+                bot: Some(false),
+            },
+            attachments: Vec::new(),
+            message_reference: None,
+        };
+
+        let event = build_websocket_inbound_event(&config, &message)
+            .unwrap()
+            .expect("message should map");
+
+        assert_eq!(event.event_id, "msg-1");
+        assert_eq!(event.event_type, "message.created");
+        assert_eq!(event.message.content, "hello websocket");
+        assert_eq!(event.conversation.id, "channel-1");
+        assert_eq!(
+            event.metadata.get(META_TRANSPORT).map(String::as_str),
+            Some(TRANSPORT_WEBSOCKET)
+        );
+    }
+
+    #[test]
+    fn start_ingress_without_webhook_uses_websocket_mode() {
+        let guard = EnvGuard::set("DISCORD_BOT_TOKEN", "token");
+        let config = ChannelConfig::default();
+
+        let state = start_ingress(&config).unwrap();
+
+        assert_eq!(state.mode, IngressMode::Websocket);
+        assert_eq!(
+            state.metadata.get(META_TRANSPORT).map(String::as_str),
+            Some(TRANSPORT_WEBSOCKET)
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn websocket_intents_do_not_request_message_content_by_default() {
+        let config = ChannelConfig::default();
+
+        assert_eq!(
+            discord_gateway_intents(&config),
+            DISCORD_GATEWAY_BASE_INTENTS
+        );
+    }
+
+    #[test]
+    fn websocket_intents_can_request_message_content() {
+        let config = ChannelConfig {
+            message_content_intent: Some(true),
+            ..ChannelConfig::default()
+        };
+
+        assert_eq!(
+            discord_gateway_intents(&config),
+            DISCORD_GATEWAY_BASE_INTENTS | DISCORD_GATEWAY_MESSAGE_CONTENT_INTENT
+        );
+    }
+
+    #[test]
+    fn websocket_state_preserves_resume_metadata() {
+        let state = websocket_state(
+            "running",
+            Some(42),
+            Some("session-1"),
+            Some("wss://resume.discord.gg"),
+        );
+        let session = DiscordGatewaySession::from_state(Some(&state));
+
+        assert_eq!(session.last_sequence, Some(42));
+        assert_eq!(session.session_id.as_deref(), Some("session-1"));
+        assert_eq!(
+            session.resume_gateway_url.as_deref(),
+            Some("wss://resume.discord.gg")
+        );
+        assert!(session.can_resume());
+    }
+
+    #[test]
+    fn websocket_resume_url_is_preferred_over_gateway_lookup() {
+        let state = websocket_state(
+            "running",
+            Some(42),
+            Some("session-1"),
+            Some("wss://resume.discord.gg"),
+        );
+        let session = DiscordGatewaySession::from_state(Some(&state));
+
+        let gateway_url = discord_gateway_base_url(&session, || {
+            Err(anyhow!(
+                "gateway lookup should not be used when resume URL exists"
+            ))
+        })
+        .expect("resume URL");
+
+        assert_eq!(gateway_url, "wss://resume.discord.gg");
+        assert_eq!(
+            discord_gateway_websocket_url(&gateway_url),
+            "wss://resume.discord.gg/?v=10&encoding=json"
+        );
+    }
+
+    #[test]
+    fn websocket_resume_requires_resume_gateway_url() {
+        let state = websocket_state("running", Some(42), Some("session-1"), None);
+        let session = DiscordGatewaySession::from_state(Some(&state));
+
+        let gateway_url =
+            discord_gateway_base_url(&session, || Ok("wss://gateway.discord.gg".to_string()))
+                .expect("fallback URL");
+
+        assert!(!session.can_resume());
+        assert_eq!(gateway_url, "wss://gateway.discord.gg");
+    }
+
+    #[test]
+    fn websocket_non_reconnectable_close_stops_worker() {
+        let state = websocket_state(
+            "running",
+            Some(42),
+            Some("session-1"),
+            Some("wss://resume.discord.gg"),
+        );
+        let mut session = DiscordGatewaySession::from_state(Some(&state));
+        let frame = CloseFrame {
+            code: CloseCode::from(4014),
+            reason: "disallowed intents".into(),
+        };
+
+        let action = handle_discord_close_frame(&mut session, Some(&frame));
+
+        assert_eq!(action, DiscordGatewayCloseAction::Stop);
+        assert!(!session.can_resume());
+        assert_eq!(discord_close_status(action), "stopped");
+        assert_eq!(discord_close_poll_after(action), None);
+    }
+
+    #[test]
+    fn websocket_invalid_sequence_close_reidentifies() {
+        let state = websocket_state(
+            "running",
+            Some(42),
+            Some("session-1"),
+            Some("wss://resume.discord.gg"),
+        );
+        let mut session = DiscordGatewaySession::from_state(Some(&state));
+        let frame = CloseFrame {
+            code: CloseCode::from(4007),
+            reason: "invalid seq".into(),
+        };
+
+        let action = handle_discord_close_frame(&mut session, Some(&frame));
+
+        assert_eq!(action, DiscordGatewayCloseAction::Reidentify);
+        assert!(!session.can_resume());
+        assert_eq!(discord_close_status(action), "closed");
+        assert_eq!(discord_close_poll_after(action), Some(1000));
+    }
+
+    #[test]
+    fn websocket_missing_close_code_preserves_resume_metadata() {
+        let state = websocket_state(
+            "running",
+            Some(42),
+            Some("session-1"),
+            Some("wss://resume.discord.gg"),
+        );
+        let mut session = DiscordGatewaySession::from_state(Some(&state));
+
+        let action = handle_discord_close_frame(&mut session, None);
+
+        assert_eq!(action, DiscordGatewayCloseAction::Resume);
+        assert!(session.can_resume());
+        assert_eq!(
+            session.resume_gateway_url.as_deref(),
+            Some("wss://resume.discord.gg")
+        );
+    }
+
+    #[test]
+    fn websocket_message_ignores_bot_author() {
+        let config = ChannelConfig::default();
+        let message = DiscordGatewayMessage {
+            id: "msg-1".to_string(),
+            channel_id: "channel-1".to_string(),
+            content: "ignore me".to_string(),
+            timestamp: None,
+            guild_id: None,
+            author: DiscordUser {
+                id: "bot-1".to_string(),
+                username: "bot".to_string(),
+                global_name: None,
+                bot: Some(true),
+            },
+            attachments: Vec::new(),
+            message_reference: None,
+        };
+
+        assert!(
+            build_websocket_inbound_event(&config, &message)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -25,6 +25,8 @@ pub struct ChannelConfig {
     pub webhook_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_content_intent: Option<bool>,
     #[serde(default)]
     pub allowed_guild_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -57,7 +59,7 @@ pub fn capabilities() -> ChannelCapabilities {
     ChannelCapabilities {
         plugin_id: "discord".to_string(),
         platform: "discord".to_string(),
-        ingress_modes: vec![IngressMode::InteractionWebhook],
+        ingress_modes: vec![IngressMode::InteractionWebhook, IngressMode::Websocket],
         outbound_message_types: vec!["text".to_string()],
         threading_model: ThreadingModel::ChannelOrThread,
         attachment_support: true,

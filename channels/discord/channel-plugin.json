@@ -18,7 +18,7 @@
   "capabilities": {
     "channel": {
       "platform": "discord",
-      "ingress_modes": ["interaction_webhook"],
+      "ingress_modes": ["interaction_webhook", "websocket"],
       "outbound_message_types": ["text"],
       "threading_model": "channel_or_thread",
       "attachment_support": true,
@@ -37,6 +37,6 @@
   "requirements": {
     "secrets": ["DISCORD_BOT_TOKEN"],
     "optional_secrets": ["DISCORD_INTERACTION_PUBLIC_KEY"],
-    "network_domains": ["discord.com"]
+    "network_domains": ["discord.com", "gateway.discord.gg"]
   }
 }

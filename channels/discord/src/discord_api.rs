@@ -73,6 +73,10 @@ impl DiscordClient {
         })
     }
 
+    pub fn bot_token(&self) -> &str {
+        &self.bot_token
+    }
+
     pub fn send_message(
         &self,
         channel_id: &str,

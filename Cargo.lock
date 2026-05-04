@@ -98,11 +98,13 @@ dependencies = [
  "base64",
  "channel-schema",
  "dispatch-channel-protocol",
+ "dispatch-channel-runtime",
  "ed25519-dalek",
  "hex",
  "jiff",
  "serde",
  "serde_json",
+ "tungstenite",
  "ureq",
 ]
 

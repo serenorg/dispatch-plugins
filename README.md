@@ -6,7 +6,7 @@ Dispatch channel extensions collected under a single parent directory.
 
 - `catalog/extensions.json` - machine-readable extension catalog index
 - `channels/schema` - shared manifest and catalog schema for channel plugins
-- `channels/discord` - Discord interaction-webhook plugin
+- `channels/discord` - Discord interaction-webhook and websocket plugin
 - `channels/email` - IMAP + SMTP email plugin
 - `channels/gmail` - Gmail-focused IMAP + SMTP email plugin
 - `channels/outlook` - Outlook / Microsoft 365 IMAP + SMTP email plugin
@@ -20,7 +20,7 @@ Dispatch channel extensions collected under a single parent directory.
 
 | Plugin | Ingress availability | Upstream receive transport | Outbound delivery |
 | --- | --- | --- | --- |
-| `channel-discord` | Interaction webhook only | Host-managed HTTPS callback | Discord REST bot messages |
+| `channel-discord` | Interaction webhook or websocket session | Host-managed HTTPS callback or Discord Gateway websocket | Discord REST bot messages |
 | `channel-email` | One-shot poll or background ingress session | IMAP polling worker inside the plugin | SMTP delivery |
 | `channel-gmail` | One-shot poll or background ingress session | Gmail IMAP polling worker inside the plugin | Gmail SMTP delivery |
 | `channel-outlook` | One-shot poll or background ingress session | Outlook / Microsoft 365 IMAP polling worker inside the plugin | Outlook / Microsoft 365 SMTP delivery |
@@ -41,7 +41,7 @@ In practice:
 - `dispatch channel poll` without `--once` runs background-ingress bindings for polling or sessioned upstream transports
 - `dispatch up` manages project-level channel bindings from `dispatch.toml`
 
-While an ingress session is active, Dispatch keeps the plugin subprocess alive and receives inbound activity as `channel.event` notifications. The upstream transport is plugin-specific: a plugin may translate that into repeated HTTP polling, an upstream websocket, or plain webhook callbacks.
+While an ingress session is active, Dispatch keeps the plugin subprocess alive and receives inbound activity as `channel.event` notifications. There is no central gateway process; each plugin owns its upstream receive transport directly and may translate that into repeated HTTP polling, an upstream websocket, or plain webhook callbacks.
 
 ## Build layout
 
