@@ -107,8 +107,66 @@ fn resolve_default_catalog_path() -> Result<PathBuf> {
 fn load_catalog(path: &Path) -> Result<ExtensionCatalog> {
     let body = fs::read_to_string(path)
         .with_context(|| format!("failed to read catalog file {}", path.display()))?;
-    serde_json::from_str(&body)
-        .with_context(|| format!("failed to parse catalog file {}", path.display()))
+    let catalog: ExtensionCatalog = serde_json::from_str(&body)
+        .with_context(|| format!("failed to parse catalog file {}", path.display()))?;
+    validate_catalog_identity(&catalog).with_context(|| {
+        format!(
+            "catalog file {} has invalid identity metadata",
+            path.display()
+        )
+    })?;
+    Ok(catalog)
+}
+
+fn validate_catalog_identity(catalog: &ExtensionCatalog) -> Result<()> {
+    validate_catalog_identifier("catalog_id", &catalog.catalog_id)?;
+    let entry_id_prefix = format!("{}.", catalog.catalog_id);
+    let mut seen_entry_ids = std::collections::BTreeSet::new();
+    let mut seen_entry_names = std::collections::BTreeSet::new();
+
+    for entry in &catalog.entries {
+        validate_catalog_identifier("entry id", &entry.id)
+            .with_context(|| format!("catalog entry `{}` has invalid id", entry.name))?;
+        if !entry.id.starts_with(&entry_id_prefix) {
+            bail!(
+                "catalog entry `{}` id `{}` must start with catalog_id prefix `{entry_id_prefix}`",
+                entry.name,
+                entry.id
+            );
+        }
+        if !seen_entry_ids.insert(entry.id.clone()) {
+            bail!("duplicate catalog entry id `{}`", entry.id);
+        }
+        if !seen_entry_names.insert(entry.name.clone()) {
+            bail!("duplicate catalog entry name `{}`", entry.name);
+        }
+    }
+    Ok(())
+}
+
+fn validate_catalog_identifier(field: &str, value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("{field} must not be empty");
+    }
+    if trimmed != value {
+        bail!("{field} must not contain leading or trailing whitespace");
+    }
+    if value.len() > 80 {
+        bail!("{field} must be at most 80 characters");
+    }
+    if value.starts_with('.') || value.ends_with('.') {
+        bail!("{field} must not start or end with `.`");
+    }
+    if value.split('.').any(str::is_empty) {
+        bail!("{field} must not contain empty `.`-separated segments");
+    }
+    if !value.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
+    }) {
+        bail!("{field} must use lowercase ASCII letters, digits, `.`, `-`, or `_`");
+    }
+    Ok(())
 }
 
 fn parse_kind(value: &str) -> Result<ManifestKind> {
@@ -426,6 +484,7 @@ mod tests {
 
     fn sample_entry() -> CatalogEntry {
         CatalogEntry {
+            id: "seren.channel.slack".to_string(),
             name: "channel-slack".to_string(),
             display_name: "Slack Channel".to_string(),
             kind: ManifestKind::Channel,
@@ -440,9 +499,7 @@ mod tests {
             ),
             keywords: vec!["slack".to_string(), "workspace".to_string()],
             tags: vec!["messaging".to_string(), "webhook".to_string()],
-            install_hint: Some(
-                "dispatch channel install channels/slack/channel-plugin.json".to_string(),
-            ),
+            install_hint: Some("dispatch extension install channel-slack".to_string()),
             source: Some(CatalogInstallSource::GithubRelease {
                 repo: "serenorg/dispatch-plugins".to_string(),
                 tag: "v0.1.0".to_string(),
@@ -493,6 +550,7 @@ mod tests {
         let entry = sample_entry();
         let catalog = ExtensionCatalog {
             schema: None,
+            catalog_id: "seren".to_string(),
             repository: "serenorg/dispatch-plugins".to_string(),
             generated_at: None,
             entries: vec![entry.clone()],
@@ -501,6 +559,137 @@ mod tests {
         let found = find_entry(&catalog, "channel-slack").expect("find entry");
 
         assert_eq!(found, &entry);
+    }
+
+    #[test]
+    fn load_catalog_rejects_invalid_entry_id() {
+        let root = unique_test_dir();
+        fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("extensions.json");
+        fs::write(
+            &path,
+            r#"{
+                "catalog_id": "seren",
+                "repository": "serenorg/dispatch-plugins",
+                "entries": [
+                    {
+                        "id": "Seren/channel.slack",
+                        "name": "channel-slack",
+                        "display_name": "Slack Channel",
+                        "kind": "channel",
+                        "version": "0.1.0",
+                        "description": "Slack messaging bridge",
+                        "protocol": "jsonl",
+                        "protocol_version": 1,
+                        "source_dir": "channels/slack",
+                        "manifest_path": "channels/slack/channel-plugin.json"
+                    }
+                ]
+            }"#,
+        )
+        .expect("write catalog");
+
+        let error = load_catalog(&path).expect_err("invalid id should fail");
+        let chain = error
+            .chain()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(error.to_string().contains("invalid identity metadata"));
+        assert!(chain.contains("catalog entry `channel-slack`"));
+        fs::remove_dir_all(root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn load_catalog_rejects_entry_id_from_another_catalog() {
+        let root = unique_test_dir();
+        fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("extensions.json");
+        fs::write(
+            &path,
+            r#"{
+                "catalog_id": "seren",
+                "repository": "serenorg/dispatch-plugins",
+                "entries": [
+                    {
+                        "id": "other.channel.slack",
+                        "name": "channel-slack",
+                        "display_name": "Slack Channel",
+                        "kind": "channel",
+                        "version": "0.1.0",
+                        "description": "Slack messaging bridge",
+                        "protocol": "jsonl",
+                        "protocol_version": 1,
+                        "source_dir": "channels/slack",
+                        "manifest_path": "channels/slack/channel-plugin.json"
+                    }
+                ]
+            }"#,
+        )
+        .expect("write catalog");
+
+        let error = load_catalog(&path).expect_err("wrong catalog prefix should fail");
+
+        assert!(error.to_string().contains("invalid identity metadata"));
+        assert!(
+            error
+                .chain()
+                .map(ToString::to_string)
+                .any(|message| message.contains("must start with catalog_id prefix `seren.`"))
+        );
+        fs::remove_dir_all(root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn load_catalog_rejects_duplicate_entry_ids() {
+        let root = unique_test_dir();
+        fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("extensions.json");
+        fs::write(
+            &path,
+            r#"{
+                "catalog_id": "seren",
+                "repository": "serenorg/dispatch-plugins",
+                "entries": [
+                    {
+                        "id": "seren.channel.slack",
+                        "name": "channel-slack",
+                        "display_name": "Slack Channel",
+                        "kind": "channel",
+                        "version": "0.1.0",
+                        "description": "Slack messaging bridge",
+                        "protocol": "jsonl",
+                        "protocol_version": 1,
+                        "source_dir": "channels/slack",
+                        "manifest_path": "channels/slack/channel-plugin.json"
+                    },
+                    {
+                        "id": "seren.channel.slack",
+                        "name": "channel-slack-copy",
+                        "display_name": "Slack Copy Channel",
+                        "kind": "channel",
+                        "version": "0.1.0",
+                        "description": "Slack messaging bridge",
+                        "protocol": "jsonl",
+                        "protocol_version": 1,
+                        "source_dir": "channels/slack",
+                        "manifest_path": "channels/slack/channel-plugin.json"
+                    }
+                ]
+            }"#,
+        )
+        .expect("write catalog");
+
+        let error = load_catalog(&path).expect_err("duplicate id should fail");
+
+        assert!(
+            error
+                .chain()
+                .map(ToString::to_string)
+                .any(|message| message.contains("duplicate catalog entry id"))
+        );
+        fs::remove_dir_all(root).expect("remove temp dir");
     }
 
     #[test]
@@ -529,8 +718,7 @@ mod tests {
                 entry.manifest_path,
                 format!("{}/channel-plugin.json", entry.source_dir)
             );
-            let expected_install_hint =
-                Some(format!("dispatch channel install {}", entry.manifest_path));
+            let expected_install_hint = Some(format!("dispatch extension install {}", entry.name));
             assert_eq!(entry.install_hint, expected_install_hint);
         }
     }
@@ -595,6 +783,7 @@ mod tests {
     fn release_assets_emit_catalog_binaries_for_linux_and_extras() {
         let catalog = ExtensionCatalog {
             schema: None,
+            catalog_id: "seren".to_string(),
             repository: "serenorg/dispatch-plugins".to_string(),
             generated_at: None,
             entries: vec![sample_entry()],
@@ -643,6 +832,7 @@ mod tests {
     fn release_assets_require_target_match() {
         let catalog = ExtensionCatalog {
             schema: None,
+            catalog_id: "seren".to_string(),
             repository: "serenorg/dispatch-plugins".to_string(),
             generated_at: None,
             entries: vec![sample_entry()],
@@ -679,6 +869,7 @@ mod tests {
 
         let catalog = ExtensionCatalog {
             schema: None,
+            catalog_id: "seren".to_string(),
             repository: "serenorg/dispatch-plugins".to_string(),
             generated_at: None,
             entries: vec![sample_entry()],

@@ -6,6 +6,7 @@ use crate::{ExtensionRequirements, ManifestKind};
 pub struct ExtensionCatalog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
+    pub catalog_id: String,
     pub repository: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_at: Option<String>,
@@ -15,6 +16,7 @@ pub struct ExtensionCatalog {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CatalogEntry {
+    pub id: String,
     pub name: String,
     pub display_name: String,
     pub kind: ManifestKind,

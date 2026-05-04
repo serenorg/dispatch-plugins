@@ -1,9 +1,11 @@
 {
   "schema": "https://serenorg.github.io/dispatch/schemas/extension-catalog.v1.json",
+  "catalog_id": "seren",
   "repository": "dispatch-plugins",
   "generated_at": "2026-04-18T00:00:00Z",
   "entries": [
     {
+      "id": "seren.channel.discord",
       "name": "channel-discord",
       "display_name": "Discord Channel",
       "kind": "channel",
@@ -26,7 +28,7 @@
         "webhook",
         "websocket"
       ],
-      "install_hint": "dispatch channel install channels/discord/channel-plugin.json",
+      "install_hint": "dispatch extension install channel-discord",
       "auth": {
         "method": "manual",
         "provider": "Discord",
@@ -91,6 +93,7 @@
       }
     },
     {
+      "id": "seren.channel.email",
       "name": "channel-email",
       "display_name": "Email Channel",
       "kind": "channel",
@@ -112,7 +115,7 @@
         "imap",
         "smtp"
       ],
-      "install_hint": "dispatch channel install channels/email/channel-plugin.json",
+      "install_hint": "dispatch extension install channel-email",
       "auth": {
         "method": "manual",
         "provider": "Email"
@@ -177,6 +180,7 @@
       }
     },
     {
+      "id": "seren.channel.gmail",
       "name": "channel-gmail",
       "display_name": "Gmail Channel",
       "kind": "channel",
@@ -199,7 +203,7 @@
         "imap",
         "smtp"
       ],
-      "install_hint": "dispatch channel install channels/gmail/channel-plugin.json",
+      "install_hint": "dispatch extension install channel-gmail",
       "auth": {
         "method": "manual",
         "provider": "Google",
@@ -266,6 +270,7 @@
       }
     },
     {
+      "id": "seren.channel.outlook",
       "name": "channel-outlook",
       "display_name": "Outlook Channel",
       "kind": "channel",
@@ -288,7 +293,7 @@
         "office365",
         "smtp"
       ],
-      "install_hint": "dispatch channel install channels/outlook/channel-plugin.json",
+      "install_hint": "dispatch extension install channel-outlook",
       "auth": {
         "method": "manual",
         "provider": "Outlook / Microsoft 365",
@@ -356,6 +361,7 @@
       }
     },
     {
+      "id": "seren.channel.slack",
       "name": "channel-slack",
       "display_name": "Slack Channel",
       "kind": "channel",
@@ -377,7 +383,7 @@
         "slack",
         "webhook"
       ],
-      "install_hint": "dispatch channel install channels/slack/channel-plugin.json",
+      "install_hint": "dispatch extension install channel-slack",
       "auth": {
         "method": "manual",
         "provider": "Slack",
@@ -447,6 +453,7 @@
       }
     },
     {
+      "id": "seren.channel.telegram",
       "name": "channel-telegram",
       "display_name": "Telegram Channel",
       "kind": "channel",
@@ -468,7 +475,7 @@
         "telegram",
         "webhook"
       ],
-      "install_hint": "dispatch channel install channels/telegram/channel-plugin.json",
+      "install_hint": "dispatch extension install channel-telegram",
       "auth": {
         "method": "manual",
         "provider": "Telegram",
@@ -532,6 +539,7 @@
       }
     },
     {
+      "id": "seren.channel.twilio_sms",
       "name": "channel-twilio-sms",
       "display_name": "Twilio SMS Channel",
       "kind": "channel",
@@ -554,7 +562,7 @@
         "twilio",
         "webhook"
       ],
-      "install_hint": "dispatch channel install channels/twilio-sms/channel-plugin.json",
+      "install_hint": "dispatch extension install channel-twilio-sms",
       "auth": {
         "method": "manual",
         "provider": "Twilio",
@@ -621,6 +629,7 @@
       }
     },
     {
+      "id": "seren.channel.webhook",
       "name": "channel-webhook",
       "display_name": "Generic Webhook Channel",
       "kind": "channel",
@@ -642,7 +651,7 @@
         "transport",
         "generic"
       ],
-      "install_hint": "dispatch channel install channels/webhook/channel-plugin.json",
+      "install_hint": "dispatch extension install channel-webhook",
       "auth": {
         "method": "manual",
         "provider": "HTTP Webhook"
