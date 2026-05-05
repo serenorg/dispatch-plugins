@@ -2,7 +2,7 @@
   "schema": "https://serenorg.github.io/dispatch/schemas/extension.v1.json",
   "kind": "channel",
   "name": "channel-twilio-sms",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "protocol": "jsonl",
   "protocol_version": 1,
   "description": "Twilio SMS channel plugin for Dispatch.",

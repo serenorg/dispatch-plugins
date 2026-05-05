@@ -2,6 +2,22 @@
 
 All notable changes to Dispatch Plugins are documented in this file.
 
+## [0.2.0] - 2026-05-05
+
+### Added
+
+- Discord Gateway websocket ingress mode for the Discord channel, including session resume, heartbeat handling, optional Message Content intent support, and automatic reconnects
+
+### Changed
+
+- Catalog entries now carry stable `id` values such as `seren.channel.discord`, and the catalog now declares a top-level `catalog_id`
+- Catalog `install_hint` values now use `dispatch extension install <name>` instead of `dispatch channel install <path>`
+- Pinned `dispatch-channel-protocol` to the `v0.4.0` tag from the `dispatch` repository
+
+### Fixed
+
+- Catalog loading now rejects invalid catalog identifiers, duplicate entry IDs, duplicate entry names, and entry IDs that do not belong to the declared catalog
+
 ## [0.1.0] - 2026-04-22
 
 Initial release.

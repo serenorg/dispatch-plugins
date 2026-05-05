@@ -83,7 +83,10 @@ fn post_json(
 ) -> Result<()> {
     let mut request = ureq::post(destination)
         .header("Content-Type", "application/json")
-        .header("User-Agent", "channel-webhook/0.1.0");
+        .header(
+            "User-Agent",
+            concat!("channel-webhook/", env!("CARGO_PKG_VERSION")),
+        );
 
     for (name, value) in &config.static_headers {
         request = request.header(name, value);
