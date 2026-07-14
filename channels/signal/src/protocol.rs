@@ -48,7 +48,7 @@ pub struct ChannelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_recipient: Option<String>,
     /// Receive timeout in seconds for a single `poll_ingress` cycle.
-    /// Clamped to at least 1 second when set.
+    /// Zero falls back to the default timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_timeout_secs: Option<u16>,
 }
