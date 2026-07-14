@@ -50,9 +50,15 @@ impl IngressWorker {
             while !handle.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(25));
             }
-            if handle.is_finished() {
-                let _ = handle.join();
+            if !handle.is_finished() {
+                tracing::warn!(
+                    grace_ms = STOP_JOIN_GRACE.as_millis() as u64,
+                    "channel-whatsapp receive worker did not stop within grace period; joining anyway - shutdown may block until the current WhatsApp call returns"
+                );
             }
+            // Join unconditionally so a slow worker cannot detach and keep
+            // consuming inbound messages after a restart replaces it.
+            let _ = handle.join();
         }
     }
 }
@@ -163,9 +169,15 @@ fn join_receive_thread(handle: JoinHandle<()>) {
     while !handle.is_finished() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
-    if handle.is_finished() {
-        let _ = handle.join();
+    if !handle.is_finished() {
+        tracing::warn!(
+            grace_ms = STOP_JOIN_GRACE.as_millis() as u64,
+            "channel-whatsapp receive worker did not finish within grace period; joining anyway"
+        );
     }
+    // Join unconditionally so a slow worker cannot detach and keep
+    // consuming inbound messages after a restart replaces it.
+    let _ = handle.join();
 }
 
 async fn run_receive_loop(
