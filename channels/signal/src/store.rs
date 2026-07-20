@@ -105,20 +105,26 @@ pub fn to_sqlite_url(path: &Path) -> String {
 
 /// Resolve an optional store passphrase from the configured env var.
 pub fn resolve_passphrase(config: &ChannelConfig) -> Result<Option<String>> {
-    let Some(env_name) = config
-        .passphrase_env
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+    let Some(configured_env_name) = config.passphrase_env.as_deref() else {
         return Ok(None);
     };
+    let env_name = configured_env_name.trim();
+    if env_name.is_empty() {
+        return Err(anyhow!(
+            "channel-signal passphrase_env must name an environment variable"
+        ));
+    }
 
     use anyhow::Context as _;
 
     let value = std::env::var(env_name).with_context(|| {
         format!("channel-signal passphrase_env `{env_name}` is set but not readable")
     })?;
+    if value.trim().is_empty() {
+        return Err(anyhow!(
+            "channel-signal passphrase env `{env_name}` must not be empty"
+        ));
+    }
     Ok(Some(value))
 }
 
@@ -240,5 +246,30 @@ mod tests {
             resolve_passphrase(&config).unwrap(),
             Some("secret".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_passphrase_rejects_empty_env_name() {
+        let config = ChannelConfig {
+            passphrase_env: Some("  ".to_string()),
+            ..ChannelConfig::default()
+        };
+
+        assert!(resolve_passphrase(&config).is_err());
+    }
+
+    #[test]
+    fn resolve_passphrase_rejects_empty_value() {
+        let _guard = lock_env();
+        // SAFETY: ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::set_var("CHANNEL_SIGNAL_TEST_EMPTY_PASSPHRASE", "");
+        }
+        let config = ChannelConfig {
+            passphrase_env: Some("CHANNEL_SIGNAL_TEST_EMPTY_PASSPHRASE".to_string()),
+            ..ChannelConfig::default()
+        };
+
+        assert!(resolve_passphrase(&config).is_err());
     }
 }
