@@ -9,7 +9,6 @@ Implemented:
 - `capabilities`
 - `configure`
 - `health`
-- `poll_ingress`
 - `start_ingress`
 - `stop_ingress`
 - `ingress_event`
@@ -25,7 +24,7 @@ Behavior:
 - outbound attachments support one inline `data_base64` upload per message when using bot-token delivery
 - health checks validate the bot token with `auth.test` when configured
 - Events API ingress uses host-managed webhook callbacks
-- Socket Mode ingress supports both one-shot `poll_ingress` fetches and background `start_ingress` sessions
+- Socket Mode ingress requires a supervised background `start_ingress` session
 - Socket Mode opens Slack's websocket via `apps.connections.open` and emits normalized inbound events back to Dispatch
 - accepted inbound messages receive an immediate `:eyes:` reaction when bot-token delivery is configured
 - challenge and acknowledgement replies are returned through `callback_reply`
@@ -181,9 +180,6 @@ dispatch channel listen channel-slack \
   --listen 127.0.0.1:8787 \
   --config-file ./slack-events.toml
 
-dispatch channel poll channel-slack \
-  --config-file ./slack-socket-mode.toml --once
-
 dispatch channel call channel-slack \
   --request-json '{"kind":"push","config":{"bot_token_env":"SLACK_BOT_TOKEN","default_channel_id":"C1234567890"},"message":{"content":"Dispatch Slack test"}}'
 ```
@@ -192,13 +188,14 @@ The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Events API and Socket 
 
 ## Notes on ingress
 
-- if `SLACK_APP_TOKEN` is configured and `webhook_public_url` is not set, `poll_ingress` performs one Socket Mode receive cycle and `start_ingress` chooses Socket Mode background-session behavior
+- if `SLACK_APP_TOKEN` is configured and `webhook_public_url` is not set, `start_ingress` chooses Socket Mode background-session behavior
 - otherwise `start_ingress` chooses Events API webhook mode and reports the public route that the host should expose
 - Socket Mode keeps a background worker alive, acknowledges each `envelope_id`, and emits normalized inbound notifications to Dispatch
 
 Common failure modes:
 
 - `polling_not_supported` means `SLACK_APP_TOKEN` was not available to the plugin process
+- `supervised_ingress_required` means the caller attempted one-shot Socket Mode polling; use `start_ingress` so the plugin can write each event before acknowledging its Slack envelope
 - `failed to connect Slack socket mode websocket` usually means the app-level token is invalid or the binary was built without websocket TLS support
 - repeated self-replies usually mean the app is receiving its own bot messages; the plugin filters bot-authored events, so verify the running binary is up to date if this appears again
 

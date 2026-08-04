@@ -24,7 +24,7 @@ Dispatch channel extensions collected under a single parent directory.
 | `channel-email` | One-shot poll or background ingress session | IMAP polling worker inside the plugin | SMTP delivery |
 | `channel-gmail` | One-shot poll or background ingress session | Gmail IMAP polling worker inside the plugin | Gmail SMTP delivery |
 | `channel-outlook` | One-shot poll or background ingress session | Outlook / Microsoft 365 IMAP polling worker inside the plugin | Outlook / Microsoft 365 SMTP delivery |
-| `channel-slack` | Events API webhook, one-shot Socket Mode poll, or background Socket Mode session | Host-managed HTTPS callback or Slack Socket Mode websocket | `chat.postMessage` or incoming webhook |
+| `channel-slack` | Events API webhook or background Socket Mode session | Host-managed HTTPS callback or Slack Socket Mode websocket | `chat.postMessage` or incoming webhook |
 | `channel-telegram` | Bot API webhook, one-shot poll, or background poll session | Telegram webhook callback or Bot API `getUpdates` | `sendMessage`, `sendPhoto`, `sendDocument` |
 | `channel-twilio-sms` | Twilio webhook only | Host-managed HTTPS callback | Twilio Messages API |
 | `channel-webhook` | Generic webhook only | Host-managed HTTPS callback | JSON `POST` to configured endpoint |

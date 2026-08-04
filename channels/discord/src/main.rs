@@ -113,6 +113,9 @@ const DISCORD_GATEWAY_VERSION: u8 = 10;
 const DISCORD_GATEWAY_BASE_INTENTS: u64 = 1 | (1 << 9) | (1 << 12);
 const DISCORD_GATEWAY_MESSAGE_CONTENT_INTENT: u64 = 1 << 15;
 const DISCORD_GATEWAY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Minimum healthy session duration required to clear reconnect history.
+const DISCORD_SESSION_STABILITY_WINDOW: Duration = Duration::from_secs(60);
+const DISCORD_MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
 fn main() -> Result<()> {
     let stdin = io::stdin().lock();
@@ -580,23 +583,63 @@ fn run_discord_websocket_worker(
 ) {
     let mut state = Some(initial_state);
     let mut failure_backoff = Duration::from_secs(1);
+    let mut consecutive_failures = 0_u32;
     while !stop.load(Ordering::Relaxed) {
-        match run_discord_websocket_session(
+        let mut healthy_since = None;
+        let session = run_discord_websocket_session(
             &config,
             state.clone(),
             &stop,
             &shared_state,
             &stdout_lock,
-        ) {
+            &mut healthy_since,
+        );
+        // Clear retry history only after a sustained gateway session.
+        if discord_session_was_stable(healthy_since) {
+            consecutive_failures = 0;
+            failure_backoff = Duration::from_secs(1);
+        }
+        // Do not classify host-requested shutdown as a gateway failure.
+        if stop.load(Ordering::Relaxed) {
+            if let Ok(next_state) = session {
+                set_worker_state(&shared_state, next_state);
+            }
+            break;
+        }
+        match session {
             Ok(next_state) => {
                 let should_stop = next_state.status == "stopped";
+                let should_reconnect = matches!(next_state.status.as_str(), "closed" | "reconnect");
                 state = Some(next_state);
-                failure_backoff = Duration::from_secs(1);
                 if should_stop {
-                    break;
+                    eprintln!(
+                        "discord websocket worker terminated after an unrecoverable gateway close"
+                    );
+                    std::process::exit(1);
                 }
+                if should_reconnect {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= DISCORD_MAX_CONSECUTIVE_FAILURES {
+                        eprintln!(
+                            "discord websocket worker terminated after {consecutive_failures} consecutive disconnects"
+                        );
+                        std::process::exit(1);
+                    }
+                    sleep_until_stopped(&stop, failure_backoff);
+                    failure_backoff = std::cmp::min(failure_backoff * 2, Duration::from_secs(60));
+                    continue;
+                }
+                consecutive_failures = 0;
+                failure_backoff = Duration::from_secs(1);
             }
             Err(error) => {
+                consecutive_failures += 1;
+                if consecutive_failures >= DISCORD_MAX_CONSECUTIVE_FAILURES {
+                    eprintln!(
+                        "discord websocket worker terminated after {consecutive_failures} receive failures: {error:#}"
+                    );
+                    std::process::exit(1);
+                }
                 eprintln!("discord websocket worker reconnecting after receive failure: {error:#}");
                 sleep_until_stopped(&stop, failure_backoff);
                 failure_backoff = std::cmp::min(failure_backoff * 2, Duration::from_secs(60));
@@ -613,6 +656,7 @@ fn run_discord_websocket_session(
     stop: &AtomicBool,
     shared_state: &Arc<Mutex<Option<IngressState>>>,
     stdout_lock: &Arc<Mutex<()>>,
+    healthy_since: &mut Option<Instant>,
 ) -> Result<IngressState> {
     let client = DiscordClient::from_env(bot_token_env(config))?;
     let mut session = DiscordGatewaySession::from_state(state.as_ref());
@@ -649,11 +693,23 @@ fn run_discord_websocket_session(
                 )? {
                     match action {
                         DiscordGatewayAction::Event(event) => {
+                            healthy_since.get_or_insert_with(Instant::now);
                             let state = session.to_state("running");
                             set_worker_state(shared_state, state.clone());
                             emit_channel_event_notification(
                                 stdout_lock,
                                 vec![*event],
+                                Some(state),
+                                Some(0),
+                            )?;
+                        }
+                        DiscordGatewayAction::Heartbeat => {
+                            healthy_since.get_or_insert_with(Instant::now);
+                            let state = session.to_state("running");
+                            set_worker_state(shared_state, state.clone());
+                            emit_channel_event_notification(
+                                stdout_lock,
+                                Vec::new(),
                                 Some(state),
                                 Some(0),
                             )?;
@@ -678,11 +734,23 @@ fn run_discord_websocket_session(
                 )? {
                     match action {
                         DiscordGatewayAction::Event(event) => {
+                            healthy_since.get_or_insert_with(Instant::now);
                             let state = session.to_state("running");
                             set_worker_state(shared_state, state.clone());
                             emit_channel_event_notification(
                                 stdout_lock,
                                 vec![*event],
+                                Some(state),
+                                Some(0),
+                            )?;
+                        }
+                        DiscordGatewayAction::Heartbeat => {
+                            healthy_since.get_or_insert_with(Instant::now);
+                            let state = session.to_state("running");
+                            set_worker_state(shared_state, state.clone());
+                            emit_channel_event_notification(
+                                stdout_lock,
+                                Vec::new(),
                                 Some(state),
                                 Some(0),
                             )?;
@@ -722,6 +790,11 @@ fn run_discord_websocket_session(
             Err(error) => return Err(error).context("failed to read Discord websocket frame"),
         }
     }
+}
+
+fn discord_session_was_stable(healthy_since: Option<Instant>) -> bool {
+    healthy_since
+        .is_some_and(|healthy_since| healthy_since.elapsed() >= DISCORD_SESSION_STABILITY_WINDOW)
 }
 
 fn set_worker_state(shared_state: &Arc<Mutex<Option<IngressState>>>, state: IngressState) {
@@ -811,6 +884,7 @@ impl DiscordGatewaySession {
 
 enum DiscordGatewayAction {
     Event(Box<InboundEventEnvelope>),
+    Heartbeat,
     Reconnect,
 }
 
@@ -828,6 +902,12 @@ fn discord_gateway_action_response(
     match action {
         DiscordGatewayAction::Event(event) => PluginResponse::IngressEventsReceived {
             events: vec![*event],
+            callback_reply: None,
+            state: Some(session.to_state("running")),
+            poll_after_ms: Some(0),
+        },
+        DiscordGatewayAction::Heartbeat => PluginResponse::IngressEventsReceived {
+            events: Vec::new(),
             callback_reply: None,
             state: Some(session.to_state("running")),
             poll_after_ms: Some(0),
@@ -870,9 +950,9 @@ fn handle_discord_gateway_text(
                     {
                         session.resume_gateway_url = Some(resume_gateway_url.to_string());
                     }
-                    return Ok(None);
+                    return Ok(Some(DiscordGatewayAction::Heartbeat));
                 }
-                Some("RESUMED") => return Ok(None),
+                Some("RESUMED") => return Ok(Some(DiscordGatewayAction::Heartbeat)),
                 Some("MESSAGE_CREATE") => {}
                 other => {
                     debug_discord_gateway(format_args!("ignoring gateway event {:?}", other));
@@ -918,7 +998,7 @@ fn handle_discord_gateway_text(
         }
         11 => {
             session.awaiting_heartbeat_ack = false;
-            Ok(None)
+            Ok(Some(DiscordGatewayAction::Heartbeat))
         }
         _ => Ok(None),
     }
@@ -2189,6 +2269,39 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn gateway_heartbeat_action_emits_an_empty_liveness_notification() {
+        let session = DiscordGatewaySession::from_state(None);
+
+        let response = discord_gateway_action_response(DiscordGatewayAction::Heartbeat, &session);
+
+        match response {
+            PluginResponse::IngressEventsReceived {
+                events,
+                state,
+                poll_after_ms,
+                ..
+            } => {
+                assert!(events.is_empty());
+                assert_eq!(
+                    state.as_ref().map(|state| state.status.as_str()),
+                    Some("running")
+                );
+                assert_eq!(poll_after_ms, Some(0));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconnect_history_requires_time_in_a_healthy_gateway_session() {
+        assert!(!discord_session_was_stable(None));
+        assert!(!discord_session_was_stable(Some(Instant::now())));
+        assert!(discord_session_was_stable(Some(
+            Instant::now() - DISCORD_SESSION_STABILITY_WINDOW
+        )));
     }
 
     #[test]

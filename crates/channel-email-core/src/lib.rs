@@ -3,8 +3,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use dispatch_channel_protocol as proto;
 use dispatch_channel_runtime::{
-    IngressWorker, StopSignal, restart_ingress_worker as restart_runtime_ingress_worker,
-    stop_ingress_worker, write_stdout_line,
+    IngressPollContext, IngressWorker, StopSignal,
+    restart_ingress_worker as restart_runtime_ingress_worker, stop_ingress_worker,
+    write_stdout_line,
 };
 use jiff::Timestamp;
 use mail_parser::{MessageParser, MimeHeaders};
@@ -295,6 +296,7 @@ fn restart_ingress_worker<P: EmailPreset>(
 fn email_poll_ingress<P: EmailPreset>(
     config: &ChannelConfig,
     state: Option<IngressState>,
+    _context: &IngressPollContext<'_>,
 ) -> Result<PluginResponse> {
     poll_ingress::<P>(config, state)
 }

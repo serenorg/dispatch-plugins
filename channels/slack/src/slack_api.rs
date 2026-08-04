@@ -3,6 +3,7 @@ use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
+    fmt,
     io::Read,
     net::TcpStream,
     time::{Duration, Instant},
@@ -11,6 +12,9 @@ use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
 
 const DEFAULT_API_BASE: &str = "https://slack.com/api";
 const REACTION_TIMEOUT: Duration = Duration::from_secs(2);
+const MIN_SLACK_RETRY_AFTER: Duration = Duration::from_secs(1);
+const MAX_SLACK_RETRY_AFTER: Duration = Duration::from_secs(60);
+const SLACK_SOCKET_READ_SLICE: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub struct SlackClient {
@@ -22,6 +26,82 @@ pub struct SlackClient {
 pub struct SlackSocketModeClient {
     app_token: String,
     base_url: String,
+}
+
+#[derive(Debug)]
+pub enum SlackSocketModeError {
+    Authentication { code: String },
+    Protocol { code: String },
+    RateLimited { retry_after: Duration },
+    NotificationDelivery { message: String },
+    Transport(anyhow::Error),
+}
+
+impl fmt::Display for SlackSocketModeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Authentication { code } => {
+                write!(formatter, "Slack Socket Mode authentication failed: {code}")
+            }
+            Self::Protocol { code } => {
+                write!(formatter, "Slack Socket Mode protocol error: {code}")
+            }
+            Self::RateLimited { retry_after } => write!(
+                formatter,
+                "Slack Socket Mode connection was rate limited for {} seconds",
+                retry_after.as_secs()
+            ),
+            Self::NotificationDelivery { message } => {
+                write!(formatter, "Slack notification delivery failed: {message}")
+            }
+            Self::Transport(error) => write!(formatter, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for SlackSocketModeError {}
+
+#[derive(Debug, Clone)]
+pub enum SlackSocketReceiveOutcome {
+    /// The delivery callback completed and the envelope was acknowledged.
+    Delivered,
+    Event(SlackSocketEnvelope),
+    Timeout,
+    Stopped,
+    Disconnected,
+}
+
+#[derive(Debug)]
+struct SlackNotificationDeliveryError(String);
+
+impl fmt::Display for SlackNotificationDeliveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SlackNotificationDeliveryError {}
+
+pub fn notification_delivery_error(error: impl fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(SlackNotificationDeliveryError(error.to_string()))
+}
+
+/// Invokes the delivery callback for one `events_api` envelope before acknowledgement.
+pub type SlackEnvelopeDelivery<'a> =
+    &'a dyn Fn(&SlackSocketEnvelope) -> Result<SlackEnvelopeDisposition>;
+
+/// Reports whether an `events_api` envelope was delivered or intentionally ignored.
+pub enum SlackEnvelopeDisposition {
+    Delivered,
+    Ignored,
+}
+
+#[derive(Debug)]
+enum SlackSocketMessageOutcome {
+    Delivered,
+    Event(SlackSocketEnvelope),
+    Continue,
+    Disconnected,
 }
 
 #[derive(Debug, Clone)]
@@ -298,39 +378,85 @@ impl SlackSocketModeClient {
         })
     }
 
-    pub fn receive_event(&self, timeout_secs: u16) -> Result<Option<SlackSocketEnvelope>> {
+    #[cfg(test)]
+    fn new_for_tests(base_url: &str) -> Self {
+        Self {
+            app_token: "test-app-token".to_string(),
+            base_url: base_url.to_string(),
+        }
+    }
+
+    /// Receive one envelope and invoke the optional delivery callback before acknowledgement.
+    pub fn receive_event(
+        &self,
+        timeout_secs: u16,
+        deliver: Option<SlackEnvelopeDelivery<'_>>,
+        is_stopped: Option<&dyn Fn() -> bool>,
+    ) -> std::result::Result<SlackSocketReceiveOutcome, SlackSocketModeError> {
         let websocket_url = self.open_connection_url()?;
-        let (mut socket, _) = tungstenite::connect(websocket_url.as_str()).with_context(|| {
-            format!("failed to connect Slack socket mode websocket: {websocket_url}")
-        })?;
+        let (mut socket, _) = tungstenite::connect(websocket_url.as_str())
+            .context("failed to connect Slack socket mode websocket")
+            .map_err(SlackSocketModeError::Transport)?;
         let deadline = Instant::now() + websocket_timeout_window(timeout_secs);
 
         loop {
+            if is_stopped.is_some_and(|is_stopped| is_stopped()) {
+                return Ok(SlackSocketReceiveOutcome::Stopped);
+            }
             let remaining = remaining_websocket_timeout(deadline);
             if remaining.is_zero() {
-                return Ok(None);
+                return Ok(SlackSocketReceiveOutcome::Timeout);
             }
-            configure_websocket_read_timeout(socket.get_mut(), remaining)?;
+            configure_websocket_read_timeout(
+                socket.get_mut(),
+                std::cmp::min(remaining, SLACK_SOCKET_READ_SLICE),
+            )
+            .map_err(SlackSocketModeError::Transport)?;
             match socket.read() {
                 Ok(Message::Text(text)) => {
-                    if let Some(envelope) =
-                        self.handle_socket_message(&mut socket, text.as_str())?
+                    match self
+                        .handle_socket_message(&mut socket, text.as_str(), deliver)
+                        .map_err(classify_socket_message_error)?
                     {
-                        return Ok(Some(envelope));
+                        SlackSocketMessageOutcome::Delivered => {
+                            return Ok(SlackSocketReceiveOutcome::Delivered);
+                        }
+                        SlackSocketMessageOutcome::Event(envelope) => {
+                            return Ok(SlackSocketReceiveOutcome::Event(envelope));
+                        }
+                        SlackSocketMessageOutcome::Disconnected => {
+                            return Ok(SlackSocketReceiveOutcome::Disconnected);
+                        }
+                        SlackSocketMessageOutcome::Continue => {}
                     }
                 }
                 Ok(Message::Binary(bytes)) => {
                     let text = std::str::from_utf8(bytes.as_ref())
-                        .context("Slack socket mode frame was not valid UTF-8")?;
-                    if let Some(envelope) = self.handle_socket_message(&mut socket, text)? {
-                        return Ok(Some(envelope));
+                        .context("Slack socket mode frame was not valid UTF-8")
+                        .map_err(SlackSocketModeError::Transport)?;
+                    match self
+                        .handle_socket_message(&mut socket, text, deliver)
+                        .map_err(classify_socket_message_error)?
+                    {
+                        SlackSocketMessageOutcome::Delivered => {
+                            return Ok(SlackSocketReceiveOutcome::Delivered);
+                        }
+                        SlackSocketMessageOutcome::Event(envelope) => {
+                            return Ok(SlackSocketReceiveOutcome::Event(envelope));
+                        }
+                        SlackSocketMessageOutcome::Disconnected => {
+                            return Ok(SlackSocketReceiveOutcome::Disconnected);
+                        }
+                        SlackSocketMessageOutcome::Continue => {}
                     }
                 }
                 Ok(Message::Ping(payload)) => {
-                    socket.send(Message::Pong(payload))?;
+                    socket
+                        .send(Message::Pong(payload))
+                        .map_err(|error| SlackSocketModeError::Transport(error.into()))?;
                 }
                 Ok(Message::Pong(_)) => {}
-                Ok(Message::Close(_)) => return Ok(None),
+                Ok(Message::Close(_)) => return Ok(SlackSocketReceiveOutcome::Disconnected),
                 Ok(Message::Frame(_)) => {}
                 Err(tungstenite::Error::Io(error))
                     if matches!(
@@ -338,55 +464,155 @@ impl SlackSocketModeClient {
                         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                     ) =>
                 {
-                    return Ok(None);
+                    if is_stopped.is_some_and(|is_stopped| is_stopped()) {
+                        return Ok(SlackSocketReceiveOutcome::Stopped);
+                    }
+                    if Instant::now() >= deadline {
+                        return Ok(SlackSocketReceiveOutcome::Timeout);
+                    }
                 }
                 Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
-                    return Ok(None);
+                    return Ok(SlackSocketReceiveOutcome::Disconnected);
                 }
-                Err(error) => return Err(error).context("failed to read Slack socket mode frame"),
+                Err(error) => {
+                    return Err(SlackSocketModeError::Transport(
+                        anyhow!(error).context("failed to read Slack socket mode frame"),
+                    ));
+                }
             }
         }
     }
 
-    pub fn open_connection_url(&self) -> Result<String> {
+    pub fn open_connection_url(&self) -> std::result::Result<String, SlackSocketModeError> {
         let url = format!("{}/apps.connections.open", self.base_url);
-        let mut response = ureq::post(&url)
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut response = agent
+            .post(&url)
             .header("Authorization", &format!("Bearer {}", self.app_token))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .send("")
-            .map_err(|error| anyhow!("failed to open Slack socket mode connection: {error}"))?;
-        let body = read_json_body(&mut response, "failed to open Slack socket mode connection")?;
+            .map_err(|error| {
+                SlackSocketModeError::Transport(anyhow!(
+                    "failed to open Slack socket mode connection: {error}"
+                ))
+            })?;
+        if response.status().as_u16() == 429 {
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_retry_after_seconds)
+                .unwrap_or(Duration::from_secs(1))
+                .clamp(MIN_SLACK_RETRY_AFTER, MAX_SLACK_RETRY_AFTER);
+            return Err(SlackSocketModeError::RateLimited { retry_after });
+        }
+        if !response.status().is_success() {
+            return Err(SlackSocketModeError::Transport(anyhow!(
+                "failed to open Slack socket mode connection: HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        let body = read_json_body(&mut response, "failed to open Slack socket mode connection")
+            .map_err(SlackSocketModeError::Transport)?;
+        let ok = body.get("ok").and_then(Value::as_bool).ok_or_else(|| {
+            SlackSocketModeError::Protocol {
+                code: "missing_ok".to_string(),
+            }
+        })?;
+        if !ok {
+            let code = body
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown_slack_error")
+                .to_string();
+            if is_slack_authentication_error(&code) {
+                return Err(SlackSocketModeError::Authentication { code });
+            }
+            if code == "ratelimited" {
+                return Err(SlackSocketModeError::RateLimited {
+                    retry_after: Duration::from_secs(1),
+                });
+            }
+            return Err(SlackSocketModeError::Protocol { code });
+        }
         body.get("url")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
-            .ok_or_else(|| anyhow!("Slack apps.connections.open response missing url"))
+            .ok_or_else(|| SlackSocketModeError::Protocol {
+                code: "missing_url".to_string(),
+            })
     }
 
     fn handle_socket_message(
         &self,
         socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
         text: &str,
-    ) -> Result<Option<SlackSocketEnvelope>> {
+        deliver: Option<SlackEnvelopeDelivery<'_>>,
+    ) -> Result<SlackSocketMessageOutcome> {
         let envelope: SlackSocketEnvelope =
             serde_json::from_str(text).context("failed to parse Slack socket mode envelope")?;
 
         match envelope.envelope_type.as_str() {
-            "hello" => Ok(None),
-            "disconnect" => Ok(None),
+            "hello" => Ok(SlackSocketMessageOutcome::Continue),
+            "disconnect" => Ok(SlackSocketMessageOutcome::Disconnected),
             "events_api" => {
+                let Some(deliver) = deliver else {
+                    if let Some(envelope_id) = envelope.envelope_id.as_deref() {
+                        acknowledge_socket_envelope(socket, envelope_id)?;
+                    }
+                    return Ok(SlackSocketMessageOutcome::Event(envelope));
+                };
+                // Delivery errors leave the envelope available for redelivery.
+                let disposition = deliver(&envelope)?;
                 if let Some(envelope_id) = envelope.envelope_id.as_deref() {
                     acknowledge_socket_envelope(socket, envelope_id)?;
                 }
-                Ok(Some(envelope))
+                match disposition {
+                    SlackEnvelopeDisposition::Delivered => Ok(SlackSocketMessageOutcome::Delivered),
+                    SlackEnvelopeDisposition::Ignored => Ok(SlackSocketMessageOutcome::Continue),
+                }
             }
             _ => {
                 if let Some(envelope_id) = envelope.envelope_id.as_deref() {
                     acknowledge_socket_envelope(socket, envelope_id)?;
                 }
-                Ok(None)
+                Ok(SlackSocketMessageOutcome::Continue)
             }
         }
     }
+}
+
+fn classify_socket_message_error(error: anyhow::Error) -> SlackSocketModeError {
+    match error.downcast::<SlackNotificationDeliveryError>() {
+        Ok(error) => SlackSocketModeError::NotificationDelivery { message: error.0 },
+        Err(error) => SlackSocketModeError::Transport(error),
+    }
+}
+
+/// Parse Slack `Retry-After` delta-seconds, including fractional values.
+fn parse_retry_after_seconds(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let seconds = value.parse::<f64>().ok()?;
+    (seconds.is_finite() && seconds >= 0.0).then(|| Duration::from_secs(seconds.ceil() as u64))
+}
+
+fn is_slack_authentication_error(code: &str) -> bool {
+    matches!(
+        code,
+        "account_inactive"
+            | "invalid_auth"
+            | "missing_scope"
+            | "not_authed"
+            | "not_allowed_token_type"
+            | "token_expired"
+            | "token_revoked"
+    )
 }
 
 pub fn send_incoming_webhook(url: &str, content: &str) -> Result<SlackMessage> {
@@ -486,7 +712,11 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::mpsc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
     use std::thread;
     use std::time::Duration;
 
@@ -637,6 +867,153 @@ mod tests {
         server.join().expect("server thread");
     }
 
+    #[test]
+    fn socket_connection_rejects_invalid_auth_as_terminal() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("listener addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let _request = read_request(&mut stream);
+            write_raw_response(
+                &mut stream,
+                "200 OK",
+                &[],
+                r#"{"ok":false,"error":"invalid_auth"}"#,
+            );
+        });
+
+        let client = SlackSocketModeClient::new_for_tests(&format!("http://{address}/api"));
+        let error = client
+            .open_connection_url()
+            .expect_err("invalid credentials must fail");
+
+        assert!(matches!(
+            error,
+            SlackSocketModeError::Authentication { ref code } if code == "invalid_auth"
+        ));
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn socket_connection_honors_retry_after() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("listener addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let _request = read_request(&mut stream);
+            write_raw_response(
+                &mut stream,
+                "429 Too Many Requests",
+                &[("Retry-After", "17")],
+                r#"{"ok":false,"error":"ratelimited"}"#,
+            );
+        });
+
+        let client = SlackSocketModeClient::new_for_tests(&format!("http://{address}/api"));
+        let error = client
+            .open_connection_url()
+            .expect_err("rate limit must delay retry");
+
+        assert!(matches!(
+            error,
+            SlackSocketModeError::RateLimited { retry_after }
+                if retry_after == Duration::from_secs(17)
+        ));
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn retry_after_accepts_the_forms_slack_sends() {
+        assert_eq!(
+            parse_retry_after_seconds("30"),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_retry_after_seconds("  12  "),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(
+            parse_retry_after_seconds("1.5"),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(parse_retry_after_seconds("later"), None);
+        assert_eq!(parse_retry_after_seconds("-3"), None);
+    }
+
+    #[test]
+    fn events_api_envelope_is_acknowledged_only_after_delivery() {
+        let (mut socket, server) = connected_socket_pair();
+        let client = SlackSocketModeClient::new_for_tests("http://127.0.0.1/api");
+        let delivered = Arc::new(AtomicBool::new(false));
+        let delivered_for_callback = Arc::clone(&delivered);
+
+        let outcome = client
+            .handle_socket_message(
+                &mut socket,
+                r#"{"type":"events_api","envelope_id":"env-1","payload":{}}"#,
+                Some(&|_: &SlackSocketEnvelope| {
+                    delivered_for_callback.store(true, Ordering::SeqCst);
+                    Ok(SlackEnvelopeDisposition::Delivered)
+                }),
+            )
+            .expect("delivered envelope should be acknowledged");
+
+        assert!(matches!(outcome, SlackSocketMessageOutcome::Delivered));
+        assert!(delivered.load(Ordering::SeqCst));
+        let ack = server.join().expect("server thread");
+        assert_eq!(
+            ack.as_deref(),
+            Some(r#"{"envelope_id":"env-1"}"#),
+            "Slack must be acknowledged after the host has the event"
+        );
+    }
+
+    #[test]
+    fn failed_delivery_leaves_the_envelope_unacknowledged_for_redelivery() {
+        let (mut socket, server) = connected_socket_pair();
+        let client = SlackSocketModeClient::new_for_tests("http://127.0.0.1/api");
+
+        let error = client
+            .handle_socket_message(
+                &mut socket,
+                r#"{"type":"events_api","envelope_id":"env-1","payload":{}}"#,
+                Some(&|_: &SlackSocketEnvelope| bail!("host pipe closed")),
+            )
+            .expect_err("a failed delivery must not be acknowledged");
+
+        assert!(error.to_string().contains("host pipe closed"));
+        assert_eq!(
+            server.join().expect("server thread"),
+            None,
+            "an unacknowledged envelope is what makes Slack redeliver it"
+        );
+    }
+
+    fn connected_socket_pair() -> (
+        WebSocket<MaybeTlsStream<TcpStream>>,
+        thread::JoinHandle<Option<String>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("listener addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept connection");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .expect("server read timeout");
+            let mut socket = tungstenite::accept(stream).expect("websocket handshake");
+            match socket.read() {
+                Ok(Message::Text(text)) => Some(text.to_string()),
+                _ => None,
+            }
+        });
+
+        let stream = TcpStream::connect(address).expect("connect to test server");
+        let (socket, _) =
+            tungstenite::client(format!("ws://{address}/"), MaybeTlsStream::Plain(stream))
+                .expect("client websocket handshake");
+        (socket, server)
+    }
+
     fn read_request(stream: &mut std::net::TcpStream) -> CapturedRequest {
         stream
             .set_read_timeout(Some(Duration::from_millis(500)))
@@ -699,6 +1076,26 @@ mod tests {
         )
         .expect("write response headers");
         stream.write_all(body).expect("write response body");
+        stream.flush().expect("flush response");
+    }
+
+    fn write_raw_response(
+        stream: &mut std::net::TcpStream,
+        status: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) {
+        write!(stream, "HTTP/1.1 {status}\r\n").expect("write response status");
+        for (name, value) in headers {
+            write!(stream, "{name}: {value}\r\n").expect("write response header");
+        }
+        write!(
+            stream,
+            "Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write response body");
         stream.flush().expect("flush response");
     }
 }

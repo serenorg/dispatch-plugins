@@ -2,8 +2,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use dispatch_channel_runtime::{
-    IngressWorker, no_after_cycle, restart_ingress_worker as restart_runtime_ingress_worker,
-    stop_ingress_worker, write_stdout_line,
+    IngressPollContext, IngressWorker, no_after_cycle,
+    restart_ingress_worker as restart_runtime_ingress_worker, stop_ingress_worker,
+    write_stdout_line,
 };
 use jiff::Timestamp;
 use serde::Deserialize;
@@ -183,6 +184,7 @@ fn restart_ingress_worker(
 fn telegram_poll_ingress(
     config: &ChannelConfig,
     state: Option<IngressState>,
+    _context: &IngressPollContext<'_>,
 ) -> Result<PluginResponse> {
     poll_ingress(config, state)
 }

@@ -2,8 +2,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use dispatch_channel_runtime::{
-    IngressWorker, no_after_cycle, restart_ingress_worker as restart_runtime_ingress_worker,
-    stop_ingress_worker, write_stdout_line,
+    IngressPollContext, IngressWorker, no_after_cycle,
+    restart_ingress_worker as restart_runtime_ingress_worker, stop_ingress_worker,
+    write_stdout_line,
 };
 use hmac::{Hmac, Mac};
 use jiff::Timestamp;
@@ -27,7 +28,10 @@ use protocol::{
     response_to_jsonrpc,
 };
 use slack_api::{SlackClient, SlackUpload, send_incoming_webhook};
-use slack_api::{SlackSocketEnvelope, SlackSocketModeClient};
+use slack_api::{
+    SlackEnvelopeDelivery, SlackEnvelopeDisposition, SlackSocketEnvelope, SlackSocketModeClient,
+    SlackSocketModeError, SlackSocketReceiveOutcome,
+};
 
 const META_REASON: &str = "reason";
 const META_PLATFORM: &str = "platform";
@@ -133,7 +137,10 @@ fn handle_request(
         PluginRequest::Health { config } => Ok(PluginResponse::Health {
             health: health(config)?,
         }),
-        PluginRequest::PollIngress { config, state } => handle_poll_ingress(config, state.as_ref()),
+        PluginRequest::PollIngress { .. } => Ok(plugin_error(
+            "supervised_ingress_required",
+            "Slack Socket Mode requires start_ingress supervision for delivery-before-acknowledgement",
+        )),
         PluginRequest::StartIngress { config, state } => {
             let started = start_ingress(config)?;
             let started = match (&started.mode, state.clone()) {
@@ -199,8 +206,9 @@ fn restart_ingress_worker(
 fn slack_poll_ingress(
     config: &ChannelConfig,
     state: Option<IngressState>,
+    context: &IngressPollContext<'_>,
 ) -> Result<PluginResponse> {
-    handle_poll_ingress(config, state.as_ref())
+    handle_poll_ingress(config, state.as_ref(), context)
 }
 
 fn configure(config: &ChannelConfig) -> Result<ConfiguredChannel> {
@@ -625,6 +633,7 @@ fn handle_ingress_event(
 fn handle_poll_ingress(
     config: &ChannelConfig,
     state: Option<&IngressState>,
+    context: &IngressPollContext<'_>,
 ) -> Result<PluginResponse> {
     if !has_optional_env(app_token_env(config)) {
         return Ok(plugin_error(
@@ -634,8 +643,94 @@ fn handle_poll_ingress(
     }
 
     let client = SlackSocketModeClient::from_env(app_token_env(config))?;
-    let socket_envelope = client.receive_event(poll_timeout_secs(config))?;
     let next_state = Some(polling_state(config, "running", state)?);
+
+    // Supervised polling writes each event before acknowledging its envelope.
+    let deliver = {
+        let next_state = next_state.clone();
+        move |envelope: &SlackSocketEnvelope| -> Result<SlackEnvelopeDisposition> {
+            let Some(inbound_event) = build_socket_mode_event(config, state, envelope)? else {
+                return Ok(SlackEnvelopeDisposition::Ignored);
+            };
+            if socket_mode_event_was_delivered(&inbound_event.event_id) {
+                return Ok(SlackEnvelopeDisposition::Ignored);
+            }
+            let event_id = inbound_event.event_id.clone();
+            context
+                .deliver(vec![inbound_event], next_state.clone(), Some(1000))
+                .map_err(slack_api::notification_delivery_error)?;
+            record_socket_mode_event_delivered(&event_id);
+            Ok(SlackEnvelopeDisposition::Delivered)
+        }
+    };
+    let is_stopped = || context.is_stopped();
+
+    let socket_envelope = match client.receive_event(
+        poll_timeout_secs(config),
+        Some(&deliver as SlackEnvelopeDelivery<'_>),
+        Some(&is_stopped),
+    ) {
+        Ok(SlackSocketReceiveOutcome::Delivered) => {
+            // Refresh state after in-cycle delivery and acknowledgement.
+            return Ok(PluginResponse::IngressEventsReceived {
+                events: Vec::new(),
+                callback_reply: None,
+                state: next_state,
+                poll_after_ms: Some(1000),
+            });
+        }
+        Ok(SlackSocketReceiveOutcome::Event(envelope)) => Some(envelope),
+        Ok(SlackSocketReceiveOutcome::Timeout) => None,
+        Ok(SlackSocketReceiveOutcome::Stopped) => {
+            bail!("Slack Socket Mode polling stopped")
+        }
+        Ok(SlackSocketReceiveOutcome::Disconnected) => {
+            bail!("Slack Socket Mode disconnected before the poll deadline")
+        }
+        Err(SlackSocketModeError::Authentication { .. }) => {
+            return Ok(plugin_error(
+                "slack_authentication_failed",
+                "Slack rejected the configured Socket Mode credentials",
+            ));
+        }
+        Err(SlackSocketModeError::Protocol { .. }) => {
+            return Ok(plugin_error(
+                "slack_socket_protocol_error",
+                "Slack returned an invalid Socket Mode connection response",
+            ));
+        }
+        Err(SlackSocketModeError::RateLimited { retry_after }) => {
+            // Publish recovery liveness on both sides of a provider-directed wait.
+            if context
+                .deliver(Vec::new(), next_state.clone(), Some(1000))
+                .is_err()
+            {
+                return Ok(plugin_error(
+                    "notification_delivery_failed",
+                    "Slack could not flush the recovery notification",
+                ));
+            }
+            context.sleep_until_stopped(retry_after);
+            if !context.is_stopped()
+                && context
+                    .deliver(Vec::new(), next_state.clone(), Some(1000))
+                    .is_err()
+            {
+                return Ok(plugin_error(
+                    "notification_delivery_failed",
+                    "Slack could not flush the recovery notification",
+                ));
+            }
+            bail!("Slack rate limited the Socket Mode connection request")
+        }
+        Err(SlackSocketModeError::NotificationDelivery { .. }) => {
+            return Ok(plugin_error(
+                "notification_delivery_failed",
+                "Slack could not flush the inbound event notification",
+            ));
+        }
+        Err(SlackSocketModeError::Transport(error)) => return Err(error),
+    };
 
     let Some(socket_envelope) = socket_envelope else {
         return Ok(PluginResponse::IngressEventsReceived {
@@ -661,6 +756,45 @@ fn handle_poll_ingress(
         state: next_state,
         poll_after_ms: Some(1000),
     })
+}
+
+type DeliveredEventHistory = (
+    std::collections::HashSet<String>,
+    std::collections::VecDeque<String>,
+);
+
+fn delivered_event_history() -> &'static Mutex<DeliveredEventHistory> {
+    use std::collections::{HashSet, VecDeque};
+    use std::sync::OnceLock;
+
+    static DELIVERED: OnceLock<Mutex<DeliveredEventHistory>> = OnceLock::new();
+    DELIVERED.get_or_init(|| Mutex::new((HashSet::new(), VecDeque::new())))
+}
+
+fn socket_mode_event_was_delivered(event_id: &str) -> bool {
+    delivered_event_history()
+        .lock()
+        .map(|history| history.0.contains(event_id))
+        .unwrap_or(false)
+}
+
+/// Record successful stdout delivery for Slack redelivery suppression.
+fn record_socket_mode_event_delivered(event_id: &str) {
+    const DELIVERED_EVENT_HISTORY_LIMIT: usize = 512;
+
+    let Ok(mut delivered) = delivered_event_history().lock() else {
+        // Preserve at-least-once delivery when local deduplication is unavailable.
+        return;
+    };
+    let (seen, order) = &mut *delivered;
+    if seen.insert(event_id.to_string()) {
+        order.push_back(event_id.to_string());
+    }
+    if order.len() > DELIVERED_EVENT_HISTORY_LIMIT
+        && let Some(evicted) = order.pop_front()
+    {
+        seen.remove(&evicted);
+    }
 }
 
 fn build_socket_mode_event(
@@ -1431,6 +1565,14 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_redelivered_event_is_not_handed_to_the_host_twice() {
+        assert!(!socket_mode_event_was_delivered("Ev-dedupe-first"));
+        record_socket_mode_event_delivered("Ev-dedupe-first");
+        assert!(socket_mode_event_was_delivered("Ev-dedupe-first"));
+        assert!(!socket_mode_event_was_delivered("Ev-dedupe-second"));
     }
 
     #[test]
