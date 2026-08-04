@@ -10,6 +10,7 @@ use std::{
 use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
 
 const DEFAULT_API_BASE: &str = "https://slack.com/api";
+const REACTION_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub struct SlackClient {
@@ -133,6 +134,38 @@ impl SlackClient {
         })
     }
 
+    pub fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_ts: &str,
+        reaction_name: &str,
+    ) -> Result<()> {
+        let agent = ureq::Agent::config_builder()
+            .timeout_global(Some(REACTION_TIMEOUT))
+            .build()
+            .new_agent();
+        let body = self
+            .post_json_response(
+                Some(&agent),
+                "reactions.add",
+                json!({
+                    "channel": channel_id,
+                    "timestamp": message_ts,
+                    "name": reaction_name,
+                }),
+                "failed to add Slack reaction",
+            )
+            .map_err(|_| anyhow!("failed to add Slack reaction"))?;
+
+        match body.get("ok").and_then(Value::as_bool) {
+            Some(true) => Ok(()),
+            Some(false) if body.get("error").and_then(Value::as_str) == Some("already_reacted") => {
+                Ok(())
+            }
+            _ => bail!("failed to add Slack reaction"),
+        }
+    }
+
     fn upload_file(
         &self,
         channel_id: &str,
@@ -200,13 +233,7 @@ impl SlackClient {
     }
 
     fn post_json(&self, method: &str, payload: Value, context: &str) -> Result<Value> {
-        let url = format!("{}/{}", self.base_url, method);
-        let mut response = ureq::post(&url)
-            .header("Authorization", &format!("Bearer {}", self.bot_token))
-            .header("Content-Type", "application/json")
-            .send_json(payload)
-            .map_err(|error| anyhow!("{context}: {error}"))?;
-        let body = read_json_body(&mut response, context)?;
+        let body = self.post_json_response(None, method, payload, context)?;
         let ok = body
             .get("ok")
             .and_then(Value::as_bool)
@@ -219,6 +246,29 @@ impl SlackClient {
             bail!("{context}: {error}");
         }
         Ok(body)
+    }
+
+    fn post_json_response(
+        &self,
+        agent: Option<&ureq::Agent>,
+        method: &str,
+        payload: Value,
+        context: &str,
+    ) -> Result<Value> {
+        let url = format!("{}/{}", self.base_url, method);
+        let mut response = match agent {
+            Some(agent) => agent
+                .post(&url)
+                .header("Authorization", &format!("Bearer {}", self.bot_token))
+                .header("Content-Type", "application/json")
+                .send_json(payload),
+            None => ureq::post(&url)
+                .header("Authorization", &format!("Bearer {}", self.bot_token))
+                .header("Content-Type", "application/json")
+                .send_json(payload),
+        }
+        .map_err(|error| anyhow!("{context}: {error}"))?;
+        read_json_body(&mut response, context)
     }
 
     fn upload_file_bytes(&self, upload_url: &str, upload: &SlackUpload) -> Result<()> {

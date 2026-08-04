@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tungstenite::{
@@ -51,11 +53,21 @@ fn run_request(request: Value) -> Value {
 }
 
 fn run_request_with_env(request: Value, envs: BTreeMap<String, String>) -> Value {
+    run_request_with_env_and_stderr(request, envs).0
+}
+
+fn run_request_with_env_and_stderr(
+    request: Value,
+    envs: BTreeMap<String, String>,
+) -> (Value, String) {
     let binary = std::env::var("CARGO_BIN_EXE_channel-slack").expect("channel-slack binary path");
     let mut child = Command::new(binary)
+        .env_remove("SLACK_BOT_TOKEN")
+        .env_remove("SLACK_API_BASE_URL")
         .envs(envs)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn channel-slack");
 
@@ -77,7 +89,90 @@ fn run_request_with_env(request: Value, envs: BTreeMap<String, String>) -> Value
         .find(|line| !line.trim().is_empty())
         .expect("response line");
     let response: Value = serde_json::from_str(line).expect("parse response");
-    response["result"].clone()
+    (
+        response["result"].clone(),
+        String::from_utf8(output.stderr).expect("stderr utf-8"),
+    )
+}
+
+#[derive(Debug)]
+struct CapturedApiRequest {
+    request_line: String,
+    authorization: Option<String>,
+    body: Value,
+}
+
+fn serve_slack_api(
+    responses: Vec<Value>,
+) -> (String, Receiver<CapturedApiRequest>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind Slack API test listener");
+    let address = listener.local_addr().expect("Slack API listener address");
+    let (request_tx, request_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        for response in responses {
+            let (mut stream, _) = listener.accept().expect("accept Slack API request");
+            let request = read_api_request(&mut stream);
+            request_tx.send(request).expect("capture Slack API request");
+
+            let body = response.to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write Slack API response");
+        }
+    });
+
+    (format!("http://{address}/api"), request_rx, server)
+}
+
+fn read_api_request(stream: &mut std::net::TcpStream) -> CapturedApiRequest {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set Slack API request timeout");
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let header_end = loop {
+        let read = stream.read(&mut chunk).expect("read Slack API request");
+        assert!(read > 0, "Slack API connection closed before headers");
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position;
+        }
+    };
+
+    let header_text = String::from_utf8(buffer[..header_end].to_vec()).expect("header utf-8");
+    let mut lines = header_text.split("\r\n");
+    let request_line = lines.next().expect("request line").to_string();
+    let mut authorization = None;
+    let mut content_length = 0_usize;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("authorization") {
+            authorization = Some(value.trim().to_string());
+        } else if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.trim().parse().expect("content length");
+        }
+    }
+
+    let body_start = header_end + 4;
+    while buffer.len() < body_start + content_length {
+        let read = stream.read(&mut chunk).expect("read Slack API body");
+        assert!(read > 0, "Slack API connection closed before request body");
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    let body = serde_json::from_slice(&buffer[body_start..body_start + content_length])
+        .expect("Slack API request JSON");
+
+    CapturedApiRequest {
+        request_line,
+        authorization,
+        body,
+    }
 }
 
 fn read_message(reader: &mut BufReader<std::process::ChildStdout>) -> Value {
@@ -98,6 +193,8 @@ fn read_message(reader: &mut BufReader<std::process::ChildStdout>) -> Value {
 fn run_start_ingress_cycle(config: Value, envs: BTreeMap<String, String>) -> (Value, Value) {
     let binary = std::env::var("CARGO_BIN_EXE_channel-slack").expect("channel-slack binary path");
     let mut child = Command::new(binary)
+        .env_remove("SLACK_BOT_TOKEN")
+        .env_remove("SLACK_API_BASE_URL")
         .envs(envs)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -293,6 +390,159 @@ fn ingress_event_round_trips_slack_message_event() {
     assert_eq!(event["message"]["content"], "hello from slack");
     assert_eq!(event["metadata"]["transport"], "events_webhook");
     assert_eq!(event["metadata"]["endpoint_id"], "slack-events");
+}
+
+#[test]
+fn accepted_ingress_reacts_after_policy_checks_with_slack_timestamp() {
+    let bot_token_env = "SLACK_TEST_BOT_TOKEN_REACTIONS";
+    let bot_token = "xoxb-test-reaction-token";
+    let (base_url, request_rx, server) = serve_slack_api(vec![
+        json!({ "ok": true }),
+        json!({ "ok": false, "error": "already_reacted" }),
+    ]);
+    let envs = BTreeMap::from([
+        (bot_token_env.to_string(), bot_token.to_string()),
+        ("SLACK_API_BASE_URL".to_string(), base_url),
+    ]);
+    let event_body = |user: &str| {
+        json!({
+            "type": "event_callback",
+            "team_id": "T123",
+            "event_id": "EvReaction123",
+            "event_time": 1712860000,
+            "event": {
+                "type": "app_mention",
+                "channel": "C123",
+                "channel_type": "channel",
+                "user": user,
+                "text": "hello from slack",
+                "client_msg_id": "client-generated-id",
+                "ts": "1712860000.100200",
+                "event_ts": "1712860000.100200"
+            }
+        })
+        .to_string()
+    };
+    let request = |body: String| {
+        json!({
+            "protocol_version": 1,
+            "request": {
+                "kind": "ingress_event",
+                "config": {
+                    "bot_token_env": bot_token_env,
+                    "owner_id": "U123"
+                },
+                "payload": {
+                    "endpoint_id": "slack-events",
+                    "method": "POST",
+                    "path": "/slack/events",
+                    "headers": {},
+                    "query": {},
+                    "body": body,
+                    "trust_verified": true,
+                    "received_at": "2026-04-11T18:00:00Z"
+                }
+            }
+        })
+    };
+
+    let rejected = run_request_with_env(request(event_body("U999")), envs.clone());
+    assert!(
+        rejected["events"]
+            .as_array()
+            .expect("events array")
+            .is_empty()
+    );
+    assert!(request_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+    for _ in 0..2 {
+        let (accepted, stderr) =
+            run_request_with_env_and_stderr(request(event_body("U123")), envs.clone());
+        let event = &accepted["events"][0];
+        assert_eq!(event["message"]["id"], "client-generated-id");
+        assert_eq!(event["metadata"]["message_ts"], "1712860000.100200");
+        assert!(!stderr.contains("slack inbound acknowledgement failed"));
+    }
+
+    for _ in 0..2 {
+        let api_request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reactions.add request");
+        assert_eq!(api_request.request_line, "POST /api/reactions.add HTTP/1.1");
+        assert_eq!(
+            api_request.authorization.as_deref(),
+            Some("Bearer xoxb-test-reaction-token")
+        );
+        assert_eq!(api_request.body["channel"], "C123");
+        assert_eq!(api_request.body["timestamp"], "1712860000.100200");
+        assert_eq!(api_request.body["name"], "eyes");
+        assert!(api_request.body.get("client_msg_id").is_none());
+    }
+    server.join().expect("Slack API server");
+}
+
+#[test]
+fn reaction_failure_is_fail_open_and_diagnostic_is_content_free() {
+    let bot_token_env = "SLACK_TEST_BOT_TOKEN_REACTION_FAILURE";
+    let bot_token = "xoxb-sensitive-test-token";
+    let (base_url, request_rx, server) =
+        serve_slack_api(vec![json!({ "ok": false, "error": "missing_scope" })]);
+    let body = json!({
+        "type": "event_callback",
+        "team_id": "T123",
+        "event_id": "EvReactionFailure",
+        "event_time": 1712860000,
+        "event": {
+            "type": "app_mention",
+            "channel": "C-sensitive-test",
+            "channel_type": "channel",
+            "user": "U123",
+            "text": "sensitive message body",
+            "ts": "1712860000.100200"
+        }
+    })
+    .to_string();
+    let (response, stderr) = run_request_with_env_and_stderr(
+        json!({
+            "protocol_version": 1,
+            "request": {
+                "kind": "ingress_event",
+                "config": { "bot_token_env": bot_token_env },
+                "payload": {
+                    "endpoint_id": "slack-events",
+                    "method": "POST",
+                    "path": "/slack/events",
+                    "headers": {},
+                    "query": {},
+                    "body": body,
+                    "trust_verified": true,
+                    "received_at": "2026-04-11T18:00:00Z"
+                }
+            }
+        }),
+        BTreeMap::from([
+            (bot_token_env.to_string(), bot_token.to_string()),
+            ("SLACK_API_BASE_URL".to_string(), base_url),
+        ]),
+    );
+
+    assert_eq!(
+        response["events"].as_array().expect("events array").len(),
+        1
+    );
+    request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("reactions.add request");
+    assert_eq!(stderr.trim(), "slack inbound acknowledgement failed");
+    for sensitive in [
+        bot_token,
+        "C-sensitive-test",
+        "sensitive message body",
+        "missing_scope",
+    ] {
+        assert!(!stderr.contains(sensitive));
+    }
+    server.join().expect("Slack API server");
 }
 
 #[test]
