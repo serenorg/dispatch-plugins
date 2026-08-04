@@ -712,8 +712,17 @@ fn validate_ingress_secret(
     }
 
     let Ok(expected_secret) = std::env::var(webhook_secret_env(config)) else {
-        return Ok(None);
+        return Ok(Some(callback_reply(
+            403,
+            "telegram request verification is unavailable",
+        )));
     };
+    if expected_secret.trim().is_empty() {
+        return Ok(Some(callback_reply(
+            403,
+            "telegram request verification is unavailable",
+        )));
+    }
 
     let Some(actual_secret) = header_value(&payload.headers, "X-Telegram-Bot-Api-Secret-Token")
     else {

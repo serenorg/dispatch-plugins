@@ -554,15 +554,6 @@ fn handle_ingress_event(
         Err(_) => return Ok(ingress_rejection(400, "invalid Slack event payload")),
     };
 
-    if !team_is_allowed(config, envelope.team_id.as_deref()) {
-        return Ok(PluginResponse::IngressEventsReceived {
-            events: Vec::new(),
-            callback_reply: None,
-            state: None,
-            poll_after_ms: None,
-        });
-    }
-
     match envelope.envelope_type.as_str() {
         "url_verification" => {
             let Some(challenge) = envelope.challenge else {
@@ -583,6 +574,14 @@ fn handle_ingress_event(
             })
         }
         "event_callback" => {
+            if !team_is_allowed(config, envelope.team_id.as_deref()) {
+                return Ok(PluginResponse::IngressEventsReceived {
+                    events: Vec::new(),
+                    callback_reply: None,
+                    state: None,
+                    poll_after_ms: None,
+                });
+            }
             let Some(event) = envelope.event.as_ref() else {
                 return Ok(ingress_rejection(
                     400,
@@ -961,8 +960,17 @@ fn validate_ingress_signature(
     }
 
     let Ok(secret) = std::env::var(signing_secret_env(config)) else {
-        return Ok(None);
+        return Ok(Some(callback_reply(
+            403,
+            "slack request verification is unavailable",
+        )));
     };
+    if secret.trim().is_empty() {
+        return Ok(Some(callback_reply(
+            403,
+            "slack request verification is unavailable",
+        )));
+    }
 
     validate_slack_signature(&secret, payload, current_unix_timestamp()?)
 }
@@ -978,9 +986,12 @@ fn validate_slack_signature(
             "slack request timestamp header missing",
         )));
     };
-    let timestamp = timestamp_header
-        .parse::<i64>()
-        .map_err(|_| anyhow!("invalid X-Slack-Request-Timestamp header"))?;
+    let Ok(timestamp) = timestamp_header.parse::<i64>() else {
+        return Ok(Some(callback_reply(
+            403,
+            "slack request timestamp header is invalid",
+        )));
+    };
     if (now_epoch_secs - timestamp).abs() > MAX_SIGNATURE_AGE_SECS {
         return Ok(Some(callback_reply(
             403,
@@ -1001,8 +1012,12 @@ fn validate_slack_signature(
         )));
     };
 
-    let signature =
-        hex::decode(signature_hex).map_err(|_| anyhow!("invalid X-Slack-Signature header"))?;
+    let Ok(signature) = hex::decode(signature_hex) else {
+        return Ok(Some(callback_reply(
+            403,
+            "slack request signature header is invalid",
+        )));
+    };
     let signing_input = format!("v0:{timestamp_header}:{}", payload.body);
 
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
@@ -1410,6 +1425,28 @@ mod tests {
                 ..
             } => {
                 assert!(events.is_empty());
+                let reply = callback_reply.expect("challenge reply");
+                assert_eq!(reply.status, 200);
+                assert_eq!(reply.body, "challenge-token");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn url_verification_is_not_blocked_by_the_event_team_allowlist() {
+        let payload = base_payload(
+            r#"{"type":"url_verification","challenge":"challenge-token","team_id":"T123"}"#,
+        );
+        let config = ChannelConfig {
+            allowed_team_ids: vec!["T456".to_string()],
+            ..Default::default()
+        };
+
+        let response = handle_ingress_event(&config, None, &payload).expect("handle ingress");
+
+        match response {
+            PluginResponse::IngressEventsReceived { callback_reply, .. } => {
                 let reply = callback_reply.expect("challenge reply");
                 assert_eq!(reply.status, 200);
                 assert_eq!(reply.body, "challenge-token");

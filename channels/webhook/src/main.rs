@@ -352,7 +352,10 @@ fn validate_ingress_secret(
     }
 
     let Ok(expected_secret) = webhook_api::ingress_secret(config) else {
-        return Ok(None);
+        return Ok(Some(callback_reply(
+            403,
+            "webhook request verification is unavailable",
+        )));
     };
 
     let Some(actual_secret) = header_value(&payload.headers, ingress_secret_header(config)) else {
@@ -362,11 +365,22 @@ fn validate_ingress_secret(
         )));
     };
 
-    if actual_secret != expected_secret {
+    if !constant_time_eq(actual_secret.as_bytes(), expected_secret.as_bytes()) {
         return Ok(Some(callback_reply(403, "webhook ingress secret mismatch")));
     }
 
     Ok(None)
+}
+
+fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
+    let max_len = lhs.len().max(rhs.len());
+    let mut diff = lhs.len() ^ rhs.len();
+    for index in 0..max_len {
+        let left = lhs.get(index).copied().unwrap_or_default();
+        let right = rhs.get(index).copied().unwrap_or_default();
+        diff |= usize::from(left ^ right);
+    }
+    diff == 0
 }
 
 fn build_inbound_event(

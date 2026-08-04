@@ -545,7 +545,15 @@ fn validate_ingress_signature(
         return Ok(None);
     }
 
-    let auth_token = webhook_auth_token(config)?;
+    let auth_token = match webhook_auth_token(config) {
+        Ok(auth_token) => auth_token,
+        Err(_) => {
+            return Ok(Some(callback_reply(
+                403,
+                "twilio request verification is unavailable",
+            )));
+        }
+    };
     let params = incoming_params(payload);
     validate_twilio_signature(
         &auth_token,
@@ -557,20 +565,28 @@ fn validate_ingress_signature(
 
 fn webhook_auth_token(config: &ChannelConfig) -> Result<String> {
     if has_optional_env(webhook_auth_token_env(config)) {
-        return std::env::var(webhook_auth_token_env(config)).with_context(|| {
+        let value = std::env::var(webhook_auth_token_env(config)).with_context(|| {
             format!(
                 "{} is required for twilio sms ingress",
                 webhook_auth_token_env(config)
             )
-        });
+        })?;
+        if value.trim().is_empty() {
+            bail!("twilio sms ingress auth token must not be empty");
+        }
+        return Ok(value);
     }
 
-    std::env::var(auth_token_env(config)).with_context(|| {
+    let value = std::env::var(auth_token_env(config)).with_context(|| {
         format!(
             "{} is required for twilio sms ingress",
             auth_token_env(config)
         )
-    })
+    })?;
+    if value.trim().is_empty() {
+        bail!("twilio sms ingress auth token must not be empty");
+    }
+    Ok(value)
 }
 
 fn validate_twilio_signature(
@@ -587,9 +603,11 @@ fn validate_twilio_signature(
     };
 
     let mut signing_input = request_url;
-    for (name, value) in params {
-        signing_input.push_str(name);
-        signing_input.push_str(value);
+    if payload.method.eq_ignore_ascii_case("POST") {
+        for (name, value) in params {
+            signing_input.push_str(name);
+            signing_input.push_str(value);
+        }
     }
 
     let mut mac =
@@ -719,7 +737,9 @@ fn webhook_auth_token_env(config: &ChannelConfig) -> &str {
 }
 
 fn has_optional_env(name: &str) -> bool {
-    std::env::var(name).is_ok()
+    std::env::var(name)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn client_from_env(config: &ChannelConfig) -> Result<TwilioClient> {
@@ -966,6 +986,32 @@ mod tests {
 
         let reply = validate_twilio_signature("secret", &payload, &params, request_url)
             .expect("validate signature");
+
+        assert!(reply.is_none());
+    }
+
+    #[test]
+    fn get_signature_uses_the_query_only_as_part_of_the_request_url() {
+        let mut payload = base_payload("GET");
+        payload.trust_verified = false;
+        payload.raw_query = Some("MessageSid=SM123&Body=hello".to_string());
+        payload
+            .query
+            .insert("MessageSid".to_string(), "SM123".to_string());
+        payload
+            .query
+            .insert("Body".to_string(), "hello".to_string());
+        let request_url = "https://example.com/twilio/sms?MessageSid=SM123&Body=hello".to_string();
+        let mut mac = Hmac::<Sha1>::new_from_slice(b"secret").expect("valid HMAC key");
+        mac.update(request_url.as_bytes());
+        payload.headers.insert(
+            HEADER_X_TWILIO_SIGNATURE.to_string(),
+            BASE64_STANDARD.encode(mac.finalize().into_bytes()),
+        );
+
+        let reply =
+            validate_twilio_signature("secret", &payload, &incoming_params(&payload), request_url)
+                .expect("validate signature");
 
         assert!(reply.is_none());
     }

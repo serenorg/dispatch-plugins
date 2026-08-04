@@ -28,6 +28,7 @@ pub fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<(Str
         .ok_or_else(|| {
             anyhow!("webhook delivery requires message.destination_url or config.outbound_url")
         })?;
+    validate_destination(destination)?;
 
     let timestamp_ms = Timestamp::now().as_millisecond();
     let message_id = format!("webhook-{timestamp_ms}");
@@ -58,6 +59,7 @@ pub fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<(Str
 }
 
 pub fn send_status(config: &ChannelConfig, destination: &str, update: &StatusFrame) -> Result<()> {
+    validate_destination(destination)?;
     let payload = json!({
         "kind": "status",
         "status_kind": update.kind,
@@ -81,18 +83,25 @@ fn post_json(
     payload: serde_json::Value,
     error_context: &str,
 ) -> Result<()> {
+    // Keep each delivery bound to the validated destination.
     let mut request = ureq::post(destination)
+        .config()
+        .max_redirects(0)
+        .build()
         .header("Content-Type", "application/json")
         .header(
             "User-Agent",
             concat!("channel-webhook/", env!("CARGO_PKG_VERSION")),
         );
 
-    for (name, value) in &config.static_headers {
-        request = request.header(name, value);
-    }
-    if let Ok(token) = outbound_bearer_token(config) {
-        request = request.header("Authorization", &format!("Bearer {token}"));
+    // Configured endpoint credentials do not apply to dynamic destinations.
+    if destination_uses_configured_credentials(config, destination) {
+        for (name, value) in &config.static_headers {
+            request = request.header(name, value);
+        }
+        if let Ok(token) = outbound_bearer_token(config) {
+            request = request.header("Authorization", &format!("Bearer {token}"));
+        }
     }
 
     let mut response = request
@@ -109,13 +118,30 @@ fn post_json(
     Ok(())
 }
 
+fn destination_uses_configured_credentials(config: &ChannelConfig, destination: &str) -> bool {
+    config.outbound_url.as_deref() == Some(destination)
+}
+
+fn validate_destination(destination: &str) -> Result<()> {
+    let parsed = ureq::http::Uri::try_from(destination)
+        .map_err(|error| anyhow!("webhook destination is not a valid URI: {error}"))?;
+    if !matches!(parsed.scheme_str(), Some("http" | "https")) || parsed.host().is_none() {
+        bail!("webhook destination must be an absolute http or https URL");
+    }
+    Ok(())
+}
+
 pub fn outbound_bearer_token(config: &ChannelConfig) -> Result<String> {
     let env_name = config
         .outbound_bearer_token_env
         .as_deref()
         .unwrap_or("WEBHOOK_OUTBOUND_BEARER_TOKEN");
-    std::env::var(env_name)
-        .with_context(|| format!("{env_name} is required for outbound webhook auth"))
+    let value = std::env::var(env_name)
+        .with_context(|| format!("{env_name} is required for outbound webhook auth"))?;
+    if value.trim().is_empty() {
+        bail!("{env_name} must not be empty for outbound webhook auth");
+    }
+    Ok(value)
 }
 
 pub fn ingress_secret(config: &ChannelConfig) -> Result<String> {
@@ -123,7 +149,12 @@ pub fn ingress_secret(config: &ChannelConfig) -> Result<String> {
         .ingress_secret_env
         .as_deref()
         .unwrap_or("WEBHOOK_INGRESS_SECRET");
-    std::env::var(env_name).with_context(|| format!("{env_name} is required for ingress auth"))
+    let value = std::env::var(env_name)
+        .with_context(|| format!("{env_name} is required for ingress auth"))?;
+    if value.trim().is_empty() {
+        bail!("{env_name} must not be empty for ingress auth");
+    }
+    Ok(value)
 }
 
 fn read_body(response: &mut ureq::http::Response<ureq::Body>, context: &str) -> Result<String> {
@@ -136,4 +167,27 @@ fn read_body(response: &mut ureq::http::Response<ureq::Body>, context: &str) -> 
     body.read_to_string(&mut text)
         .with_context(|| context.to_string())?;
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::destination_uses_configured_credentials;
+    use crate::protocol::ChannelConfig;
+
+    #[test]
+    fn dynamic_destinations_do_not_inherit_configured_credentials() {
+        let config = ChannelConfig {
+            outbound_url: Some("https://hooks.example.com/primary".to_string()),
+            ..Default::default()
+        };
+
+        assert!(destination_uses_configured_credentials(
+            &config,
+            "https://hooks.example.com/primary"
+        ));
+        assert!(!destination_uses_configured_credentials(
+            &config,
+            "https://collector.example.net/capture"
+        ));
+    }
 }
