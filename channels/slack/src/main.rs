@@ -60,6 +60,7 @@ const META_PATH: &str = "path";
 const META_API_APP_ID: &str = "api_app_id";
 const META_EVENT_CONTEXT: &str = "event_context";
 const META_CHANNEL_TYPE: &str = "channel_type";
+const META_MESSAGE_TS: &str = "message_ts";
 const META_STATUS_KIND: &str = "status_kind";
 const META_REASON_CODE: &str = "reason_code";
 
@@ -68,6 +69,7 @@ const MODE_INCOMING_WEBHOOK: &str = "incoming_webhook";
 const DELIVERY_MODE_CHAT_POST_MESSAGE: &str = "chat.postMessage";
 const TRANSPORT_EVENTS_WEBHOOK: &str = "events_webhook";
 const TRANSPORT_SOCKET_MODE: &str = "socket_mode";
+const THINKING_REACTION: &str = "eyes";
 const MAX_SIGNATURE_AGE_SECS: i64 = 300;
 
 const ROUTE_CONVERSATION_ID: &str = "conversation_id";
@@ -773,13 +775,16 @@ fn build_inbound_event(
     if let Some(event_context) = &envelope.event_context {
         event_metadata.insert(META_EVENT_CONTEXT.to_string(), event_context.clone());
     }
+    if let Some(message_ts) = &event.ts {
+        event_metadata.insert(META_MESSAGE_TS.to_string(), message_ts.clone());
+    }
 
     let account_id = envelope.team_id.clone();
     if !team_is_allowed(config, account_id.as_deref()) {
         return Ok(None);
     }
 
-    Ok(Some(InboundEventEnvelope {
+    let inbound_event = InboundEventEnvelope {
         event_id: envelope.event_id.clone().unwrap_or_else(|| {
             let ts = event
                 .event_ts
@@ -808,7 +813,30 @@ fn build_inbound_event(
         },
         account_id,
         metadata: event_metadata,
-    }))
+    };
+
+    acknowledge_inbound_event(config, channel_id, event.ts.as_deref());
+
+    Ok(Some(inbound_event))
+}
+
+fn acknowledge_inbound_event(config: &ChannelConfig, channel_id: &str, message_ts: Option<&str>) {
+    if !has_optional_env(bot_token_env(config)) {
+        return;
+    }
+
+    let result = message_ts
+        .ok_or_else(|| anyhow!("Slack event is missing its message timestamp"))
+        .and_then(|message_ts| {
+            SlackClient::from_env(bot_token_env(config)).map(|client| (client, message_ts))
+        })
+        .and_then(|(client, message_ts)| {
+            client.add_reaction(channel_id, message_ts, THINKING_REACTION)
+        });
+
+    if result.is_err() {
+        eprintln!("slack inbound acknowledgement failed");
+    }
 }
 
 fn supports_inbound_event(event: &SlackEventPayload) -> bool {

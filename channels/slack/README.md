@@ -27,6 +27,7 @@ Behavior:
 - Events API ingress uses host-managed webhook callbacks
 - Socket Mode ingress supports both one-shot `poll_ingress` fetches and background `start_ingress` sessions
 - Socket Mode opens Slack's websocket via `apps.connections.open` and emits normalized inbound events back to Dispatch
+- accepted inbound messages receive an immediate `:eyes:` reaction when bot-token delivery is configured
 - challenge and acknowledgement replies are returned through `callback_reply`
 - status frames render visible status messages into Slack conversations
 
@@ -87,6 +88,7 @@ Bot-token mode:
 Recommended bot scopes:
 
 - `chat:write` - required for `deliver`, `push`, and `status`
+- `reactions:write` - required for inbound `:eyes:` acknowledgements
 - `app_mentions:read` - required if you subscribe to `app_mention`
 - `channels:history` - required for `message.channels`
 - `im:history` - required for `message.im`
@@ -105,9 +107,9 @@ Recommended event subscriptions:
 
 Common scope sets:
 
-- mention-only Socket Mode: `chat:write`, `app_mentions:read`
-- public-channel Events API or Socket Mode: `chat:write`, `channels:history`
-- full plugin test setup: `chat:write`, `files:write`, `app_mentions:read`, `channels:history`, `groups:history`, `im:history`, `mpim:history`
+- mention-only Socket Mode: `chat:write`, `reactions:write`, `app_mentions:read`
+- public-channel Events API or Socket Mode: `chat:write`, `reactions:write`, `channels:history`
+- full plugin test setup: `chat:write`, `reactions:write`, `files:write`, `app_mentions:read`, `channels:history`, `groups:history`, `im:history`, `mpim:history`
 
 Socket Mode setup:
 
