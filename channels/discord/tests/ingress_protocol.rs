@@ -69,14 +69,25 @@ fn run_request(request: Value) -> Value {
     response["result"].clone()
 }
 
-#[test]
-fn ingress_event_round_trips_discord_command_interaction() {
-    let body = json!({
+/// Scope a binding to one guild and one channel, as an operator would.
+fn scoped_config() -> Value {
+    json!({
+        "allowed_guild_ids": ["guild-1"],
+        "allowed_channel_ids": ["channel-1"]
+    })
+}
+
+fn interaction_body(guild_id: &str, channel_id: &str) -> String {
+    json!({
         "id": "interaction-1",
         "application_id": "app-1",
         "type": 2,
-        "guild_id": "guild-1",
-        "channel_id": "channel-1",
+        "guild_id": guild_id,
+        "channel_id": channel_id,
+        "channel": {
+            "id": channel_id,
+            "type": 0
+        },
         "locale": "en-US",
         "guild_locale": "en-US",
         "member": {
@@ -98,13 +109,15 @@ fn ingress_event_round_trips_discord_command_interaction() {
             ]
         }
     })
-    .to_string();
+    .to_string()
+}
 
-    let response = run_request(json!({
+fn ingress_request(config: Value, body: String) -> Value {
+    json!({
         "protocol_version": 1,
         "request": {
             "kind": "ingress_event",
-            "config": {},
+            "config": config,
             "payload": {
                 "endpoint_id": "discord:/discord/interactions",
                 "method": "POST",
@@ -116,7 +129,15 @@ fn ingress_event_round_trips_discord_command_interaction() {
                 "received_at": "2026-04-11T21:00:00Z"
             }
         }
-    }));
+    })
+}
+
+#[test]
+fn ingress_event_round_trips_discord_command_interaction() {
+    let response = run_request(ingress_request(
+        scoped_config(),
+        interaction_body("guild-1", "channel-1"),
+    ));
 
     assert_eq!(response["kind"], "ingress_events_received");
     let reply = &response["callback_reply"];
@@ -136,5 +157,43 @@ fn ingress_event_round_trips_discord_command_interaction() {
     assert_eq!(
         event["metadata"]["endpoint_id"],
         "discord:/discord/interactions"
+    );
+
+    // Provenance a host revalidates on its own before it creates a run.
+    assert_eq!(event["conversation"]["kind"], "channel");
+    assert_eq!(event["conversation"]["workspace_id"], "guild-1");
+    assert_eq!(event["activation"]["reason"], "slash_command");
+    assert_eq!(event["activation"]["agent_account_id"], "app-1");
+}
+
+#[test]
+fn ingress_event_rejects_an_interaction_outside_the_configured_channel() {
+    let response = run_request(ingress_request(
+        scoped_config(),
+        interaction_body("guild-1", "channel-other"),
+    ));
+
+    assert_eq!(response["kind"], "ingress_events_received");
+    assert!(
+        response["events"]
+            .as_array()
+            .expect("events array")
+            .is_empty()
+    );
+}
+
+#[test]
+fn ingress_event_rejects_an_interaction_when_the_binding_has_no_scope() {
+    let response = run_request(ingress_request(
+        json!({}),
+        interaction_body("guild-1", "channel-1"),
+    ));
+
+    assert_eq!(response["kind"], "ingress_events_received");
+    assert!(
+        response["events"]
+            .as_array()
+            .expect("events array")
+            .is_empty()
     );
 }

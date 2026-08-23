@@ -97,7 +97,7 @@ dependencies = [
  "anyhow",
  "base64",
  "channel-schema",
- "dispatch-channel-protocol",
+ "dispatch-channel-protocol 0.5.0",
  "dispatch-channel-runtime",
  "ed25519-dalek",
  "hex",
@@ -125,7 +125,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
- "dispatch-channel-protocol",
+ "dispatch-channel-protocol 0.4.0",
  "dispatch-channel-runtime",
  "imap",
  "jiff",
@@ -173,7 +173,7 @@ dependencies = [
  "anyhow",
  "base64",
  "channel-schema",
- "dispatch-channel-protocol",
+ "dispatch-channel-protocol 0.4.0",
  "dispatch-channel-runtime",
  "hex",
  "hmac",
@@ -192,7 +192,7 @@ dependencies = [
  "anyhow",
  "base64",
  "channel-schema",
- "dispatch-channel-protocol",
+ "dispatch-channel-protocol 0.4.0",
  "dispatch-channel-runtime",
  "jiff",
  "serde",
@@ -207,7 +207,7 @@ dependencies = [
  "anyhow",
  "base64",
  "channel-schema",
- "dispatch-channel-protocol",
+ "dispatch-channel-protocol 0.4.0",
  "hmac",
  "jiff",
  "serde",
@@ -224,7 +224,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "channel-schema",
- "dispatch-channel-protocol",
+ "dispatch-channel-protocol 0.4.0",
  "jiff",
  "serde",
  "serde_json",
@@ -397,7 +397,17 @@ name = "dispatch-channel-protocol"
 version = "0.4.0"
 source = "git+https://github.com/serenorg/dispatch?tag=v0.4.0#ceea4bb4c952e77cb42342b12d4501f94ce7b4ed"
 dependencies = [
- "dispatch-plugin-rpc",
+ "dispatch-plugin-rpc 0.4.0",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dispatch-channel-protocol"
+version = "0.5.0"
+source = "git+https://github.com/serenorg/dispatch?tag=v0.5.0#0a59fe283d5f9367ab7559d6562f1ccc01af123b"
+dependencies = [
+ "dispatch-plugin-rpc 0.5.0",
  "serde",
  "serde_json",
 ]
@@ -406,7 +416,7 @@ dependencies = [
 name = "dispatch-channel-runtime"
 version = "0.2.0"
 dependencies = [
- "dispatch-channel-protocol",
+ "dispatch-channel-protocol 0.4.0",
  "thiserror",
 ]
 
@@ -424,6 +434,16 @@ dependencies = [
 name = "dispatch-plugin-rpc"
 version = "0.4.0"
 source = "git+https://github.com/serenorg/dispatch?tag=v0.4.0#ceea4bb4c952e77cb42342b12d4501f94ce7b4ed"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "dispatch-plugin-rpc"
+version = "0.5.0"
+source = "git+https://github.com/serenorg/dispatch?tag=v0.5.0#0a59fe283d5f9367ab7559d6562f1ccc01af123b"
 dependencies = [
  "serde",
  "serde_json",

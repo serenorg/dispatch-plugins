@@ -24,6 +24,20 @@ pub struct DiscordMessage {
     pub channel_id: String,
 }
 
+/// Provider-reported shape of a channel, used to prove thread parentage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscordChannelInfo {
+    /// Discord channel type discriminant.
+    pub kind: u8,
+    /// Channel a thread descends from. Absent for a top-level channel.
+    pub parent_id: Option<String>,
+    /// Guild owning the channel, when the provider reports one.
+    pub guild_id: Option<String>,
+    /// Other accounts in a direct-message channel. Discord omits the current
+    /// bot account, so a type-1 DM normally contains exactly one recipient.
+    pub recipient_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscordUpload {
     pub name: String,
@@ -75,6 +89,40 @@ impl DiscordClient {
 
     pub fn bot_token(&self) -> &str {
         &self.bot_token
+    }
+
+    /// Read channel metadata for a conversation the gateway did not describe.
+    ///
+    /// The type discriminant is required: a caller that cannot read it cannot
+    /// tell a channel from a thread, and therefore cannot decide which
+    /// allowlist applies.
+    pub fn channel(&self, channel_id: &str) -> Result<DiscordChannelInfo> {
+        let url = format!("{}/channels/{}", self.base_url, channel_id);
+        let body = self.get_json(&url, "failed to query Discord channel")?;
+        let kind = body
+            .get("type")
+            .and_then(Value::as_u64)
+            .and_then(|kind| u8::try_from(kind).ok())
+            .ok_or_else(|| anyhow!("discord channel response missing type"))?;
+        Ok(DiscordChannelInfo {
+            kind,
+            parent_id: body
+                .get("parent_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            guild_id: body
+                .get("guild_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            recipient_ids: body
+                .get("recipients")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|recipient| recipient.get("id").and_then(Value::as_str))
+                .map(ToOwned::to_owned)
+                .collect(),
+        })
     }
 
     pub fn send_message(
