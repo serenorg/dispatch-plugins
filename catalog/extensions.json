@@ -361,6 +361,102 @@
       }
     },
     {
+      "id": "seren.channel.signal",
+      "name": "channel-signal",
+      "display_name": "Signal Channel",
+      "kind": "channel",
+      "version": "0.4.0",
+      "description": "Signal channel plugin for Dispatch using the native Rust presage client.",
+      "protocol": "jsonl",
+      "protocol_version": 1,
+      "source_dir": "channels/signal",
+      "manifest_path": "channels/signal/channel-plugin.json",
+      "keywords": [
+        "dispatch",
+        "channel",
+        "signal",
+        "messaging",
+        "presage"
+      ],
+      "tags": [
+        "messaging",
+        "signal",
+        "polling",
+        "websocket"
+      ],
+      "install_hint": "dispatch extension install channel-signal",
+      "auth": {
+        "method": "manual",
+        "provider": "Signal"
+      },
+      "requirements": {
+        "secrets": [],
+        "optional_secrets": [],
+        "network_domains": [
+          "cdn.signal.org",
+          "cdn2.signal.org",
+          "cdn3.signal.org",
+          "cdn-staging.signal.org",
+          "cdn2-staging.signal.org",
+          "cdn3-staging.signal.org",
+          "chat.signal.org",
+          "chat.staging.signal.org",
+          "cdsi.signal.org",
+          "cdsi.staging.signal.org",
+          "storage.signal.org",
+          "storage-staging.signal.org",
+          "signal.org"
+        ],
+        "platforms": [
+          "presage"
+        ]
+      },
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.4.0/channels/signal/channel-plugin.json",
+      "source": {
+        "type": "github_release",
+        "repo": "serenorg/dispatch-plugins",
+        "tag": "v0.4.0",
+        "checksum_asset": "SHA256SUMS.txt",
+        "binaries": [
+          {
+            "target": "aarch64-apple-darwin",
+            "asset": "channel-signal-aarch64-apple-darwin",
+            "binary_name": "channel-signal"
+          },
+          {
+            "target": "x86_64-apple-darwin",
+            "asset": "channel-signal-x86_64-apple-darwin",
+            "binary_name": "channel-signal"
+          },
+          {
+            "target": "aarch64-unknown-linux-gnu",
+            "asset": "channel-signal-aarch64-unknown-linux-gnu",
+            "binary_name": "channel-signal"
+          },
+          {
+            "target": "aarch64-unknown-linux-musl",
+            "asset": "channel-signal-aarch64-unknown-linux-musl",
+            "binary_name": "channel-signal"
+          },
+          {
+            "target": "x86_64-unknown-linux-gnu",
+            "asset": "channel-signal-x86_64-unknown-linux-gnu",
+            "binary_name": "channel-signal"
+          },
+          {
+            "target": "x86_64-unknown-linux-musl",
+            "asset": "channel-signal-x86_64-unknown-linux-musl",
+            "binary_name": "channel-signal"
+          },
+          {
+            "target": "x86_64-pc-windows-msvc",
+            "asset": "channel-signal-x86_64-pc-windows-msvc.exe",
+            "binary_name": "channel-signal.exe"
+          }
+        ]
+      }
+    },
+    {
       "id": "seren.channel.slack",
       "name": "channel-slack",
       "display_name": "Slack Channel",
@@ -708,6 +804,94 @@
             "target": "x86_64-pc-windows-msvc",
             "asset": "channel-webhook-x86_64-pc-windows-msvc.exe",
             "binary_name": "channel-webhook.exe"
+          }
+        ]
+      }
+    },
+    {
+      "id": "seren.channel.whatsapp",
+      "name": "channel-whatsapp",
+      "display_name": "WhatsApp Channel",
+      "kind": "channel",
+      "version": "0.4.0",
+      "description": "WhatsApp channel plugin for Dispatch using the native Rust whatsapp-rust client.",
+      "protocol": "jsonl",
+      "protocol_version": 1,
+      "source_dir": "channels/whatsapp",
+      "manifest_path": "channels/whatsapp/channel-plugin.json",
+      "keywords": [
+        "dispatch",
+        "channel",
+        "whatsapp",
+        "messaging",
+        "whatsapp-rust"
+      ],
+      "tags": [
+        "messaging",
+        "whatsapp",
+        "polling",
+        "websocket"
+      ],
+      "install_hint": "dispatch extension install channel-whatsapp",
+      "auth": {
+        "method": "manual",
+        "provider": "WhatsApp"
+      },
+      "requirements": {
+        "secrets": [],
+        "optional_secrets": [],
+        "network_domains": [
+          "web.whatsapp.com",
+          "static.whatsapp.net",
+          "mmg.whatsapp.net",
+          "mmg-fna.whatsapp.net",
+          "mmg-fallback.whatsapp.net"
+        ],
+        "platforms": [
+          "whatsapp-rust"
+        ]
+      },
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.4.0/channels/whatsapp/channel-plugin.json",
+      "source": {
+        "type": "github_release",
+        "repo": "serenorg/dispatch-plugins",
+        "tag": "v0.4.0",
+        "checksum_asset": "SHA256SUMS.txt",
+        "binaries": [
+          {
+            "target": "aarch64-apple-darwin",
+            "asset": "channel-whatsapp-aarch64-apple-darwin",
+            "binary_name": "channel-whatsapp"
+          },
+          {
+            "target": "x86_64-apple-darwin",
+            "asset": "channel-whatsapp-x86_64-apple-darwin",
+            "binary_name": "channel-whatsapp"
+          },
+          {
+            "target": "aarch64-unknown-linux-gnu",
+            "asset": "channel-whatsapp-aarch64-unknown-linux-gnu",
+            "binary_name": "channel-whatsapp"
+          },
+          {
+            "target": "aarch64-unknown-linux-musl",
+            "asset": "channel-whatsapp-aarch64-unknown-linux-musl",
+            "binary_name": "channel-whatsapp"
+          },
+          {
+            "target": "x86_64-unknown-linux-gnu",
+            "asset": "channel-whatsapp-x86_64-unknown-linux-gnu",
+            "binary_name": "channel-whatsapp"
+          },
+          {
+            "target": "x86_64-unknown-linux-musl",
+            "asset": "channel-whatsapp-x86_64-unknown-linux-musl",
+            "binary_name": "channel-whatsapp"
+          },
+          {
+            "target": "x86_64-pc-windows-msvc",
+            "asset": "channel-whatsapp-x86_64-pc-windows-msvc.exe",
+            "binary_name": "channel-whatsapp.exe"
           }
         ]
       }
