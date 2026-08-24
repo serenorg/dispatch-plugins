@@ -29,6 +29,17 @@ pub struct ChannelConfig {
     pub webhook_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_channel_id: Option<String>,
+    /// Slack conversations this binding may publish to.
+    ///
+    /// An empty list denies outbound mutations unless
+    /// `unrestricted_channel_access` is explicitly true.
+    #[serde(default)]
+    pub allowed_channel_ids: Vec<String>,
+    /// Explicitly permits outbound delivery to any Slack conversation.
+    ///
+    /// This is never inferred from an absent or empty allowlist.
+    #[serde(default)]
+    pub unrestricted_channel_access: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_thread_ts: Option<String>,
     #[serde(default)]

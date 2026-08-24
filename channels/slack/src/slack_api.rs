@@ -619,7 +619,7 @@ pub fn send_incoming_webhook(url: &str, content: &str) -> Result<SlackMessage> {
     let mut response = ureq::post(url)
         .header("Content-Type", "application/json")
         .send_json(json!({ "text": content }))
-        .map_err(|error| anyhow!("failed to send Slack incoming webhook: {error}"))?;
+        .map_err(|_| anyhow!("failed to send configured Slack incoming webhook"))?;
     let body = read_text_body(
         &mut response,
         "failed to read Slack incoming webhook response",

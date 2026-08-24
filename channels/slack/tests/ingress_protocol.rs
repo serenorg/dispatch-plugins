@@ -89,8 +89,12 @@ fn run_request_with_env_and_stderr(
         .find(|line| !line.trim().is_empty())
         .expect("response line");
     let response: Value = serde_json::from_str(line).expect("parse response");
+    let payload = response
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| response["error"]["data"]["dispatch_error"].clone());
     (
-        response["result"].clone(),
+        payload,
         String::from_utf8(output.stderr).expect("stderr utf-8"),
     )
 }
@@ -393,6 +397,38 @@ fn ingress_event_round_trips_slack_message_event() {
 }
 
 #[test]
+fn denied_bot_token_push_returns_stable_code_before_network() {
+    let response = run_request_with_env(
+        json!({
+            "protocol_version": 1,
+            "request": {
+                "kind": "push",
+                "config": {
+                    "bot_token_env": "SLACK_TEST_BOT_TOKEN_DENIED_PUSH",
+                    "allowed_channel_ids": ["C123"]
+                },
+                "message": {
+                    "content": "must not send",
+                    "channel_id": "C999"
+                }
+            }
+        }),
+        BTreeMap::from([
+            (
+                "SLACK_TEST_BOT_TOKEN_DENIED_PUSH".to_string(),
+                "xoxb-test-denied".to_string(),
+            ),
+            (
+                "SLACK_API_BASE_URL".to_string(),
+                "http://127.0.0.1:9/api".to_string(),
+            ),
+        ]),
+    );
+
+    assert_eq!(response["code"], "channel_target_denied");
+}
+
+#[test]
 fn accepted_ingress_reacts_after_policy_checks_with_slack_timestamp() {
     let bot_token_env = "SLACK_TEST_BOT_TOKEN_REACTIONS";
     let bot_token = "xoxb-test-reaction-token";
@@ -430,7 +466,8 @@ fn accepted_ingress_reacts_after_policy_checks_with_slack_timestamp() {
                 "kind": "ingress_event",
                 "config": {
                     "bot_token_env": bot_token_env,
-                    "owner_id": "U123"
+                    "owner_id": "U123",
+                    "allowed_channel_ids": ["C123"]
                 },
                 "payload": {
                     "endpoint_id": "slack-events",
@@ -507,7 +544,10 @@ fn reaction_failure_is_fail_open_and_diagnostic_is_content_free() {
             "protocol_version": 1,
             "request": {
                 "kind": "ingress_event",
-                "config": { "bot_token_env": bot_token_env },
+                "config": {
+                    "bot_token_env": bot_token_env,
+                    "allowed_channel_ids": ["C-sensitive-test"]
+                },
                 "payload": {
                     "endpoint_id": "slack-events",
                     "method": "POST",

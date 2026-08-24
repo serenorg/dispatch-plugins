@@ -67,6 +67,7 @@ const META_CHANNEL_TYPE: &str = "channel_type";
 const META_MESSAGE_TS: &str = "message_ts";
 const META_STATUS_KIND: &str = "status_kind";
 const META_REASON_CODE: &str = "reason_code";
+const REJECT_CHANNEL_TARGET_DENIED: &str = "channel_target_denied";
 
 const PLATFORM_SLACK: &str = "slack";
 const MODE_INCOMING_WEBHOOK: &str = "incoming_webhook";
@@ -75,11 +76,26 @@ const TRANSPORT_EVENTS_WEBHOOK: &str = "events_webhook";
 const TRANSPORT_SOCKET_MODE: &str = "socket_mode";
 const THINKING_REACTION: &str = "eyes";
 const MAX_SIGNATURE_AGE_SECS: i64 = 300;
+const MAX_SLACK_CHANNEL_ID_BYTES: usize = 512;
 
 const ROUTE_CONVERSATION_ID: &str = "conversation_id";
 const ROUTE_THREAD_ID: &str = "thread_id";
-const ROUTE_DESTINATION_URL: &str = "destination_url";
 const SLACK_STATUS_TEXT: &str = "slack_status_text";
+
+#[derive(Debug)]
+struct ChannelTargetDenied(String);
+
+impl std::fmt::Display for ChannelTargetDenied {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ChannelTargetDenied {}
+
+fn channel_target_denied(reason: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ChannelTargetDenied(reason.into()))
+}
 
 fn main() -> Result<()> {
     let stdin = io::stdin().lock();
@@ -98,7 +114,13 @@ fn main() -> Result<()> {
 
         let response = match handle_request(&envelope, &stdout_lock, &mut ingress_worker) {
             Ok(response) => response,
-            Err(error) => plugin_error("internal_error", error.to_string()),
+            Err(error) => {
+                let code = error
+                    .downcast_ref::<ChannelTargetDenied>()
+                    .map(|_| REJECT_CHANNEL_TARGET_DENIED)
+                    .unwrap_or("internal_error");
+                plugin_error(code, error.to_string())
+            }
         };
 
         let json = response_to_jsonrpc(&request_id, &response).map_err(|error| anyhow!(error))?;
@@ -212,6 +234,7 @@ fn slack_poll_ingress(
 }
 
 fn configure(config: &ChannelConfig) -> Result<ConfiguredChannel> {
+    validate_outbound_config(config)?;
     let mut metadata = BTreeMap::new();
 
     if has_optional_env(bot_token_env(config)) {
@@ -234,6 +257,18 @@ fn configure(config: &ChannelConfig) -> Result<ConfiguredChannel> {
         metadata.insert(
             META_DEFAULT_CHANNEL_ID.to_string(),
             default_channel_id.clone(),
+        );
+    }
+    if !config.allowed_channel_ids.is_empty() {
+        metadata.insert(
+            "allowed_channel_count".to_string(),
+            config.allowed_channel_ids.len().to_string(),
+        );
+    }
+    if config.unrestricted_channel_access {
+        metadata.insert(
+            "unrestricted_channel_access".to_string(),
+            "true".to_string(),
         );
     }
     if let Some(default_thread_ts) = &config.default_thread_ts {
@@ -272,15 +307,22 @@ fn configure(config: &ChannelConfig) -> Result<ConfiguredChannel> {
 }
 
 fn channel_policy(config: &ChannelConfig) -> ChannelPolicy {
+    let mut metadata = BTreeMap::new();
+    if config.unrestricted_channel_access {
+        metadata.insert(
+            "unrestricted_channel_access".to_string(),
+            "true".to_string(),
+        );
+    }
     ChannelPolicy {
         owner_id: config.owner_id.clone(),
         allowed_sender_ids: config.allowed_sender_ids.clone(),
-        allowed_conversation_ids: config.allowed_team_ids.clone(),
+        allowed_conversation_ids: config.allowed_channel_ids.clone(),
         dm_policy: config.dm_policy.clone(),
         require_signature_validation: Some(true),
         allow_group_messages: None,
         max_attachment_bytes: None,
-        metadata: BTreeMap::new(),
+        metadata,
     }
 }
 
@@ -411,9 +453,11 @@ fn stop_ingress(config: &ChannelConfig, state: Option<IngressState>) -> Result<I
 }
 
 fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<DeliveryReceipt> {
-    let upload = slack_upload(message)?;
+    validate_requested_channel_consistency(message)?;
     if has_optional_env(bot_token_env(config)) {
         let channel_id = resolve_channel_id(config, message)?;
+        authorize_channel_id(config, &channel_id)?;
+        let upload = slack_upload(message)?;
         let thread_ts = resolve_thread_ts(config, message);
         let client = SlackClient::from_env(bot_token_env(config))?;
         let posted =
@@ -440,8 +484,11 @@ fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<Delivery
         });
     }
 
-    let webhook_url = resolve_destination_url(config, message)
-        .ok_or_else(|| anyhow!("slack delivery requires a bot token or an incoming webhook URL"))?;
+    let webhook_url = resolved_incoming_webhook_url(config).ok_or_else(|| {
+        anyhow!("slack delivery requires a bot token or a configured incoming webhook URL")
+    })?;
+    authorize_webhook_delivery(config, message)?;
+    let upload = slack_upload(message)?;
     if upload.is_some() {
         bail!(
             "slack outbound attachments require bot-token delivery; incoming webhook delivery does not support attachments"
@@ -473,24 +520,29 @@ fn send_status(config: &ChannelConfig, update: &StatusFrame) -> Result<StatusAcc
         ));
     }
 
+    let mut message_metadata = BTreeMap::new();
+    if let Some(conversation_id) = update.metadata.get(ROUTE_CONVERSATION_ID) {
+        message_metadata.insert(ROUTE_CONVERSATION_ID.to_string(), conversation_id.clone());
+    }
+    if let Some(thread_id) = update.metadata.get(ROUTE_THREAD_ID) {
+        message_metadata.insert(ROUTE_THREAD_ID.to_string(), thread_id.clone());
+    }
     let message = OutboundMessage {
         content,
         attachments: Vec::new(),
-        channel_id: update
-            .conversation_id
-            .clone()
-            .or_else(|| update.metadata.get(ROUTE_CONVERSATION_ID).cloned()),
-        thread_ts: update
-            .thread_id
-            .clone()
-            .or_else(|| update.metadata.get(ROUTE_THREAD_ID).cloned()),
-        destination_url: update.metadata.get(ROUTE_DESTINATION_URL).cloned(),
-        metadata: BTreeMap::new(),
+        channel_id: update.conversation_id.clone(),
+        thread_ts: update.thread_id.clone(),
+        destination_url: None,
+        metadata: message_metadata,
     };
     let delivery = match deliver(config, &message) {
         Ok(delivery) => delivery,
         Err(error) => {
-            return Ok(rejected_status("delivery_failed", error.to_string()));
+            let reason_code = error
+                .downcast_ref::<ChannelTargetDenied>()
+                .map(|_| REJECT_CHANNEL_TARGET_DENIED)
+                .unwrap_or("delivery_failed");
+            return Ok(rejected_status(reason_code, error.to_string()));
         }
     };
 
@@ -958,15 +1010,24 @@ fn acknowledge_inbound_event(config: &ChannelConfig, channel_id: &str, message_t
         return;
     }
 
+    acknowledge_inbound_event_with(config, channel_id, message_ts, |channel_id, message_ts| {
+        let client = SlackClient::from_env(bot_token_env(config))?;
+        client.add_reaction(channel_id, message_ts, THINKING_REACTION)
+    });
+}
+
+fn acknowledge_inbound_event_with(
+    config: &ChannelConfig,
+    channel_id: &str,
+    message_ts: Option<&str>,
+    add_reaction: impl FnOnce(&str, &str) -> Result<()>,
+) {
+    if authorize_channel_id(config, channel_id).is_err() {
+        return;
+    }
     let result = message_ts
         .ok_or_else(|| anyhow!("Slack event is missing its message timestamp"))
-        .and_then(|message_ts| {
-            SlackClient::from_env(bot_token_env(config)).map(|client| (client, message_ts))
-        })
-        .and_then(|(client, message_ts)| {
-            client.add_reaction(channel_id, message_ts, THINKING_REACTION)
-        });
-
+        .and_then(|message_ts| add_reaction(channel_id, message_ts));
     if result.is_err() {
         eprintln!("slack inbound acknowledgement failed");
     }
@@ -1314,18 +1375,128 @@ fn resolved_incoming_webhook_url(config: &ChannelConfig) -> Option<String> {
 }
 
 fn resolve_channel_id(config: &ChannelConfig, message: &OutboundMessage) -> Result<String> {
-    if let Some(channel_id) = &message.channel_id {
-        return Ok(channel_id.clone());
-    }
-    if let Some(channel_id) = message.metadata.get(ROUTE_CONVERSATION_ID) {
-        return Ok(channel_id.clone());
+    validate_requested_channel_consistency(message)?;
+    let message_channel_id = message.channel_id.as_deref();
+    let metadata_channel_id = message
+        .metadata
+        .get(ROUTE_CONVERSATION_ID)
+        .map(String::as_str);
+    if let Some(channel_id) = message_channel_id.or(metadata_channel_id) {
+        return Ok(channel_id.to_string());
     }
     if let Some(default_channel_id) = &config.default_channel_id {
         return Ok(default_channel_id.clone());
     }
-    Err(anyhow!(
-        "slack bot-token delivery requires message.channel_id or config.default_channel_id"
+    Err(channel_target_denied(
+        "Slack delivery requires a channel target or configured default channel",
     ))
+}
+
+fn validate_requested_channel_consistency(message: &OutboundMessage) -> Result<()> {
+    if let (Some(message_channel_id), Some(metadata_channel_id)) = (
+        message.channel_id.as_deref(),
+        message
+            .metadata
+            .get(ROUTE_CONVERSATION_ID)
+            .map(String::as_str),
+    ) && message_channel_id != metadata_channel_id
+    {
+        return Err(channel_target_denied(
+            "Slack message and conversation metadata name conflicting channel targets",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_channel_id(channel_id: &str) -> Result<()> {
+    if channel_id.is_empty()
+        || channel_id
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(channel_target_denied(
+            "Slack channel ids must be non-empty and contain no whitespace or control characters",
+        ));
+    }
+    if channel_id == "*" {
+        return Err(channel_target_denied(
+            "Slack channel ids do not accept wildcard targets; use unrestricted_channel_access",
+        ));
+    }
+    if channel_id.len() > MAX_SLACK_CHANNEL_ID_BYTES {
+        return Err(channel_target_denied(
+            "Slack channel ids must not exceed 512 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_outbound_config(config: &ChannelConfig) -> Result<()> {
+    for channel_id in &config.allowed_channel_ids {
+        validate_channel_id(channel_id)?;
+    }
+    if let Some(default_channel_id) = &config.default_channel_id {
+        validate_channel_id(default_channel_id)?;
+        if !config.unrestricted_channel_access
+            && !config.allowed_channel_ids.is_empty()
+            && !config
+                .allowed_channel_ids
+                .iter()
+                .any(|id| id == default_channel_id)
+        {
+            return Err(channel_target_denied(
+                "Slack default_channel_id must be included in allowed_channel_ids",
+            ));
+        }
+    }
+    if config.unrestricted_channel_access && !config.allowed_channel_ids.is_empty() {
+        return Err(channel_target_denied(
+            "Slack unrestricted_channel_access cannot be combined with allowed_channel_ids",
+        ));
+    }
+    Ok(())
+}
+
+fn authorize_channel_id(config: &ChannelConfig, channel_id: &str) -> Result<()> {
+    validate_outbound_config(config)?;
+    validate_channel_id(channel_id)?;
+    if config.unrestricted_channel_access
+        || config.allowed_channel_ids.iter().any(|id| id == channel_id)
+    {
+        Ok(())
+    } else {
+        Err(channel_target_denied(
+            "Slack channel target is outside the configured outbound allowlist",
+        ))
+    }
+}
+
+fn authorize_webhook_delivery(config: &ChannelConfig, message: &OutboundMessage) -> Result<()> {
+    validate_outbound_config(config)?;
+    if config.unrestricted_channel_access {
+        return Ok(());
+    }
+    let configured_channel_id = config.default_channel_id.as_deref().or_else(|| {
+        (config.allowed_channel_ids.len() == 1).then(|| config.allowed_channel_ids[0].as_str())
+    });
+    let Some(configured_channel_id) = configured_channel_id else {
+        return Err(channel_target_denied(
+            "Slack incoming webhook delivery requires a default_channel_id when more than one channel is allowed",
+        ));
+    };
+    authorize_channel_id(config, configured_channel_id)?;
+    let requested_channel_id = message.channel_id.as_deref().or_else(|| {
+        message
+            .metadata
+            .get(ROUTE_CONVERSATION_ID)
+            .map(String::as_str)
+    });
+    if requested_channel_id.is_some_and(|requested| requested != configured_channel_id) {
+        return Err(channel_target_denied(
+            "Slack incoming webhook delivery uses its configured default channel",
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_thread_ts<'a>(
@@ -1337,14 +1508,6 @@ fn resolve_thread_ts<'a>(
         .as_deref()
         .or_else(|| message.metadata.get(ROUTE_THREAD_ID).map(String::as_str))
         .or(config.default_thread_ts.as_deref())
-}
-
-fn resolve_destination_url(config: &ChannelConfig, message: &OutboundMessage) -> Option<String> {
-    message
-        .destination_url
-        .clone()
-        .or_else(|| message.metadata.get(ROUTE_DESTINATION_URL).cloned())
-        .or_else(|| resolved_incoming_webhook_url(config))
 }
 
 fn bot_token_env(config: &ChannelConfig) -> &str {
@@ -1524,6 +1687,7 @@ struct SlackFile {
 mod tests {
     use super::*;
     use crate::protocol::OutboundAttachment;
+    use std::cell::Cell;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -1910,6 +2074,243 @@ mod tests {
     }
 
     #[test]
+    fn resolve_channel_id_rejects_conflicting_message_and_metadata_targets() {
+        let message = OutboundMessage {
+            content: "reply".to_string(),
+            attachments: Vec::new(),
+            channel_id: Some("C123".to_string()),
+            thread_ts: None,
+            destination_url: None,
+            metadata: BTreeMap::from([(ROUTE_CONVERSATION_ID.to_string(), "C456".to_string())]),
+        };
+
+        let error = resolve_channel_id(&ChannelConfig::default(), &message)
+            .expect_err("conflicting targets must be rejected");
+        assert!(error.downcast_ref::<ChannelTargetDenied>().is_some());
+    }
+
+    #[test]
+    fn empty_allowlist_denies_outbound_channel() {
+        let error = authorize_channel_id(&ChannelConfig::default(), "C123")
+            .expect_err("empty allowlist must deny");
+        assert!(error.downcast_ref::<ChannelTargetDenied>().is_some());
+    }
+
+    #[test]
+    fn unrestricted_mode_requires_no_allowlist_and_allows_outbound_channel() {
+        authorize_channel_id(
+            &ChannelConfig {
+                unrestricted_channel_access: true,
+                ..ChannelConfig::default()
+            },
+            "C123",
+        )
+        .expect("explicit unrestricted access");
+
+        let error = validate_outbound_config(&ChannelConfig {
+            unrestricted_channel_access: true,
+            allowed_channel_ids: vec!["C123".to_string()],
+            ..ChannelConfig::default()
+        })
+        .expect_err("ambiguous target policy");
+        assert!(error.downcast_ref::<ChannelTargetDenied>().is_some());
+    }
+
+    #[test]
+    fn default_channel_must_be_allowlisted() {
+        let error = validate_outbound_config(&ChannelConfig {
+            default_channel_id: Some("C999".to_string()),
+            allowed_channel_ids: vec!["C123".to_string()],
+            ..ChannelConfig::default()
+        })
+        .expect_err("default outside the allowlist");
+        assert!(error.downcast_ref::<ChannelTargetDenied>().is_some());
+    }
+
+    #[test]
+    fn channel_ids_reject_control_characters() {
+        for channel_id in ["C123\nC456", "C123\0C456"] {
+            let error = validate_channel_id(channel_id).expect_err("control character");
+            assert!(error.downcast_ref::<ChannelTargetDenied>().is_some());
+        }
+    }
+
+    #[test]
+    fn channel_id_length_matches_the_gateway_boundary() {
+        validate_channel_id(&"C".repeat(MAX_SLACK_CHANNEL_ID_BYTES)).expect("512-byte channel id");
+        let error = validate_channel_id(&"C".repeat(MAX_SLACK_CHANNEL_ID_BYTES + 1))
+            .expect_err("513-byte channel id");
+        assert!(error.downcast_ref::<ChannelTargetDenied>().is_some());
+    }
+
+    #[test]
+    fn inbound_acknowledgement_authorizes_before_reaction() {
+        let config = ChannelConfig {
+            allowed_channel_ids: vec!["C123".to_string()],
+            ..ChannelConfig::default()
+        };
+        let denied_called = Cell::new(false);
+        acknowledge_inbound_event_with(&config, "C999", Some("1712860000.100200"), |_, _| {
+            denied_called.set(true);
+            Ok(())
+        });
+        assert!(!denied_called.get());
+
+        let allowed_called = Cell::new(false);
+        acknowledge_inbound_event_with(&config, "C123", Some("1712860000.100200"), |_, _| {
+            allowed_called.set(true);
+            Ok(())
+        });
+        assert!(allowed_called.get());
+    }
+
+    #[test]
+    fn denied_webhook_target_is_rejected_before_network_call() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener nonblocking");
+        let webhook_url = format!(
+            "http://{}/services/configured",
+            listener.local_addr().expect("address")
+        );
+
+        let error = deliver(
+            &ChannelConfig {
+                incoming_webhook_url: Some(webhook_url),
+                default_channel_id: Some("C123".to_string()),
+                allowed_channel_ids: vec!["C123".to_string()],
+                ..ChannelConfig::default()
+            },
+            &OutboundMessage {
+                content: "should not send".to_string(),
+                attachments: Vec::new(),
+                channel_id: Some("C999".to_string()),
+                thread_ts: None,
+                destination_url: None,
+                metadata: BTreeMap::new(),
+            },
+        )
+        .expect_err("unauthorized target");
+
+        assert!(error.downcast_ref::<ChannelTargetDenied>().is_some());
+        assert!(
+            listener.accept().is_err(),
+            "denied delivery made a network call"
+        );
+    }
+
+    #[test]
+    fn push_uses_the_same_channel_target_authorizer() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener nonblocking");
+        let webhook_url = format!(
+            "http://{}/services/configured",
+            listener.local_addr().expect("address")
+        );
+        let envelope = PluginRequestEnvelope {
+            protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+            request: PluginRequest::Push {
+                config: ChannelConfig {
+                    incoming_webhook_url: Some(webhook_url),
+                    default_channel_id: Some("C123".to_string()),
+                    allowed_channel_ids: vec!["C123".to_string()],
+                    ..ChannelConfig::default()
+                },
+                message: OutboundMessage {
+                    content: "should not send".to_string(),
+                    attachments: Vec::new(),
+                    channel_id: Some("C999".to_string()),
+                    thread_ts: None,
+                    destination_url: None,
+                    metadata: BTreeMap::new(),
+                },
+            },
+        };
+
+        let error = handle_request(&envelope, &Arc::new(Mutex::new(())), &mut None)
+            .expect_err("unauthorized Push target");
+        assert!(error.downcast_ref::<ChannelTargetDenied>().is_some());
+        assert!(
+            listener.accept().is_err(),
+            "denied Push made a network call"
+        );
+    }
+
+    #[test]
+    fn status_uses_the_same_channel_target_authorizer() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener nonblocking");
+        let webhook_url = format!(
+            "http://{}/services/configured",
+            listener.local_addr().expect("address")
+        );
+        let update = StatusFrame {
+            kind: StatusKind::Info,
+            message: "hello".to_string(),
+            conversation_id: Some("C999".to_string()),
+            thread_id: None,
+            metadata: BTreeMap::new(),
+        };
+
+        let acceptance = send_status(
+            &ChannelConfig {
+                incoming_webhook_url: Some(webhook_url),
+                allowed_channel_ids: vec!["C123".to_string()],
+                default_channel_id: Some("C123".to_string()),
+                ..ChannelConfig::default()
+            },
+            &update,
+        )
+        .expect("status response");
+
+        assert!(!acceptance.accepted);
+        assert_eq!(
+            acceptance
+                .metadata
+                .get(META_REASON_CODE)
+                .map(String::as_str),
+            Some(REJECT_CHANNEL_TARGET_DENIED)
+        );
+    }
+
+    #[test]
+    fn status_rejects_conflicting_top_level_and_metadata_channels() {
+        let update = StatusFrame {
+            kind: StatusKind::Info,
+            message: "hello".to_string(),
+            conversation_id: Some("C123".to_string()),
+            thread_id: None,
+            metadata: BTreeMap::from([(ROUTE_CONVERSATION_ID.to_string(), "C456".to_string())]),
+        };
+
+        let acceptance = send_status(&ChannelConfig::default(), &update).expect("status response");
+        assert!(!acceptance.accepted);
+        assert_eq!(
+            acceptance
+                .metadata
+                .get(META_REASON_CODE)
+                .map(String::as_str),
+            Some(REJECT_CHANNEL_TARGET_DENIED)
+        );
+    }
+
+    #[test]
+    fn channel_policy_projects_channel_ids_not_team_ids() {
+        let policy = channel_policy(&ChannelConfig {
+            allowed_team_ids: vec!["T123".to_string()],
+            allowed_channel_ids: vec!["C123".to_string()],
+            ..ChannelConfig::default()
+        });
+
+        assert_eq!(policy.allowed_conversation_ids, vec!["C123"]);
+    }
+
+    #[test]
     fn send_status_rejects_missing_destination() {
         let update = StatusFrame {
             kind: StatusKind::Info,
@@ -2040,6 +2441,7 @@ mod tests {
         let delivery = deliver(
             &ChannelConfig {
                 incoming_webhook_url: Some(webhook_url.clone()),
+                allowed_channel_ids: vec!["C123".to_string()],
                 ..ChannelConfig::default()
             },
             &OutboundMessage {
@@ -2047,7 +2449,9 @@ mod tests {
                 attachments: Vec::new(),
                 channel_id: None,
                 thread_ts: None,
-                destination_url: None,
+                destination_url: Some(
+                    "https://caller-controlled.invalid/services/other".to_string(),
+                ),
                 metadata: BTreeMap::new(),
             },
         )

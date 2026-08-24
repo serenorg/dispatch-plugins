@@ -49,6 +49,7 @@ Outbound:
 - bot-token delivery uses `SLACK_BOT_TOKEN` and `chat.postMessage`
 - incoming-webhook delivery uses `SLACK_INCOMING_WEBHOOK_URL`
 - `default_channel_id` and `default_thread_ts` provide routing defaults
+- outbound delivery requires `allowed_channel_ids` unless `unrestricted_channel_access` is explicitly true
 
 ## Configuration
 
@@ -66,11 +67,15 @@ Useful config fields:
 - `webhook_public_url` - public base URL used for Events API ingress
 - `webhook_path` - ingress route path, default `/slack/events`
 - `default_channel_id` - default target channel for bot-token delivery
+- `allowed_channel_ids` - explicit Slack conversation IDs permitted for outbound delivery; an empty list denies outbound mutations
+- `unrestricted_channel_access` - explicitly permits outbound delivery to any Slack conversation; it cannot be combined with `allowed_channel_ids`
 - `default_thread_ts` - optional default thread timestamp
 - `poll_timeout_secs` - Socket Mode receive timeout in seconds, minimum 1
 - `allowed_team_ids`, `allowed_sender_ids`, `owner_id`, and `dm_policy` - optional policy controls surfaced through `configure`
 
 `SLACK_APP_TOKEN` is only for Socket Mode ingress. It does not replace the bot token for `health`, `deliver`, `push`, or `status`.
+
+An incoming webhook is fixed to its configured Slack conversation. A singleton `allowed_channel_ids` list identifies that target without requiring `default_channel_id`. When more than one channel is allowed, incoming-webhook delivery requires `default_channel_id` to identify the configured webhook target. A caller-supplied channel must equal that effective target, and caller-supplied webhook URLs are ignored.
 
 ## Setup
 
@@ -149,6 +154,7 @@ Minimal Socket Mode config:
 
 ```toml
 default_channel_id = "C1234567890"
+allowed_channel_ids = ["C1234567890"]
 poll_timeout_secs = 60
 ```
 
@@ -158,6 +164,7 @@ Minimal Events API config:
 webhook_public_url = "https://example.com"
 webhook_path = "/slack/events"
 default_channel_id = "C1234567890"
+allowed_channel_ids = ["C1234567890"]
 ```
 
 Environment example:
@@ -174,14 +181,14 @@ Dispatch operators normally use the host CLI:
 
 ```bash
 dispatch channel call channel-slack \
-  --request-json '{"kind":"health","config":{"bot_token_env":"SLACK_BOT_TOKEN","default_channel_id":"C1234567890"}}'
+  --request-json '{"kind":"health","config":{"bot_token_env":"SLACK_BOT_TOKEN","default_channel_id":"C1234567890","allowed_channel_ids":["C1234567890"]}}'
 
 dispatch channel listen channel-slack \
   --listen 127.0.0.1:8787 \
   --config-file ./slack-events.toml
 
 dispatch channel call channel-slack \
-  --request-json '{"kind":"push","config":{"bot_token_env":"SLACK_BOT_TOKEN","default_channel_id":"C1234567890"},"message":{"content":"Dispatch Slack test"}}'
+  --request-json '{"kind":"push","config":{"bot_token_env":"SLACK_BOT_TOKEN","default_channel_id":"C1234567890","allowed_channel_ids":["C1234567890"]},"message":{"content":"Dispatch Slack test"}}'
 ```
 
 The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Events API and Socket Mode are upstream Slack transport choices that the plugin translates into the shared Dispatch channel protocol.
