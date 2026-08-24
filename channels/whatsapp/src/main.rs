@@ -7,12 +7,14 @@ use std::sync::{Arc, Mutex};
 mod deliver;
 mod ingress;
 mod link;
+mod policy;
 mod protocol;
 mod session;
 mod status;
 mod store;
 
 use ingress::{IngressWorker, poll_ingress_once, start_ingress_worker};
+use policy::WhatsAppPolicy;
 use protocol::{
     CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ConfiguredChannel, HealthReport,
     PluginNotificationEnvelope, PluginRequest, PluginRequestEnvelope, PluginResponse, capabilities,
@@ -122,7 +124,11 @@ fn send_whatsapp_message(
     message: &protocol::OutboundMessage,
     kind: DeliveryKind,
 ) -> PluginResponse {
-    match deliver::deliver_text_message(config, message) {
+    let policy = match WhatsAppPolicy::from_config(config) {
+        Ok(policy) => policy,
+        Err(error) => return plugin_error("deliver_failed", format!("{error:#}")),
+    };
+    match deliver::deliver_text_message(config, &policy, message) {
         Ok(delivery) => match kind {
             DeliveryKind::Deliver => PluginResponse::Delivered { delivery },
             DeliveryKind::Push => PluginResponse::Pushed { delivery },
@@ -132,14 +138,22 @@ fn send_whatsapp_message(
 }
 
 fn handle_status(config: &ChannelConfig, frame: &protocol::StatusFrame) -> PluginResponse {
-    match status::handle_status(config, frame) {
+    let policy = match WhatsAppPolicy::from_config(config) {
+        Ok(policy) => policy,
+        Err(error) => return plugin_error("status_failed", format!("{error:#}")),
+    };
+    match status::handle_status(config, &policy, frame) {
         Ok(status) => PluginResponse::StatusAccepted { status },
         Err(error) => plugin_error("status_failed", format!("{error:#}")),
     }
 }
 
 fn poll_ingress(config: &ChannelConfig, _state: Option<&IngressState>) -> PluginResponse {
-    match poll_ingress_once(config) {
+    let (policy, account_id) = match ingress_policy_and_account(config) {
+        Ok(value) => value,
+        Err(error) => return plugin_error("poll_ingress_failed", format!("{error:#}")),
+    };
+    match poll_ingress_once(config, policy, account_id) {
         Ok(events) => PluginResponse::IngressEventsReceived {
             events,
             callback_reply: None,
@@ -160,7 +174,11 @@ fn start_ingress(
         worker.stop();
     }
 
-    match start_ingress_worker(config, Arc::clone(stdout_lock)) {
+    let (policy, account_id) = match ingress_policy_and_account(config) {
+        Ok(value) => value,
+        Err(error) => return plugin_error("start_ingress_failed", format!("{error:#}")),
+    };
+    match start_ingress_worker(config, policy, account_id, Arc::clone(stdout_lock)) {
         Ok(worker) => {
             *ingress_worker = Some(worker);
             PluginResponse::IngressStarted {
@@ -186,11 +204,15 @@ fn stop_ingress(
 }
 
 fn configure(config: &ChannelConfig) -> PluginResponse {
+    let policy = match WhatsAppPolicy::from_config(config) {
+        Ok(policy) => policy,
+        Err(error) => return plugin_error("configure_failed", format!("{error:#}")),
+    };
     match load_session(config) {
         Ok(state) => PluginResponse::Configured {
             configuration: Box::new(ConfiguredChannel {
-                metadata: session_metadata(&state),
-                policy: None,
+                metadata: session_metadata(&state, Some(&policy)),
+                policy: Some(policy.to_channel_policy()),
                 runtime: None,
             }),
         },
@@ -199,15 +221,22 @@ fn configure(config: &ChannelConfig) -> PluginResponse {
 }
 
 fn health(config: &ChannelConfig) -> PluginResponse {
+    let policy = match WhatsAppPolicy::from_config(config) {
+        Ok(policy) => policy,
+        Err(error) => return plugin_error("health_failed", format!("{error:#}")),
+    };
     match load_session(config) {
         Ok(state) => PluginResponse::Health {
-            health: health_report(&state),
+            health: health_report(&state, Some(&policy)),
         },
         Err(error) => plugin_error("health_failed", format!("{error:#}")),
     }
 }
 
-fn session_metadata(state: &SessionState) -> BTreeMap<String, String> {
+fn session_metadata(
+    state: &SessionState,
+    policy: Option<&WhatsAppPolicy>,
+) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     metadata.insert("platform".to_string(), PLATFORM_WHATSAPP.to_string());
     match state {
@@ -246,11 +275,14 @@ fn session_metadata(state: &SessionState) -> BTreeMap<String, String> {
             }
         }
     }
+    if let Some(policy) = policy {
+        metadata.extend(policy.diagnostics());
+    }
     metadata
 }
 
-fn health_report(state: &SessionState) -> HealthReport {
-    let metadata = session_metadata(state);
+fn health_report(state: &SessionState, policy: Option<&WhatsAppPolicy>) -> HealthReport {
+    let metadata = session_metadata(state, policy);
     match state {
         SessionState::Registered { summary, .. } => HealthReport {
             ok: true,
@@ -270,6 +302,21 @@ fn health_report(state: &SessionState) -> HealthReport {
             metadata,
         },
     }
+}
+
+fn ingress_policy_and_account(config: &ChannelConfig) -> Result<(WhatsAppPolicy, String)> {
+    let policy = WhatsAppPolicy::from_config(config)?;
+    policy.validate_for_ingress()?;
+    let SessionState::Registered { summary, .. } = load_session(config)? else {
+        return Err(anyhow!(
+            "WhatsApp session has not been linked yet; run `channel-whatsapp --link` first"
+        ));
+    };
+    summary
+        .phone_jid
+        .or(summary.lid_jid)
+        .ok_or_else(|| anyhow!("WhatsApp linked session does not provide a direct account JID"))
+        .map(|account_id| (policy, account_id))
 }
 
 fn running_ingress_state(config: &ChannelConfig, mode: IngressMode) -> IngressState {

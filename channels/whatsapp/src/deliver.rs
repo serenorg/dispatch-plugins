@@ -13,6 +13,7 @@ use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
+use crate::policy::{WhatsAppPolicy, normalize_direct_jid};
 use crate::protocol::{ChannelConfig, DeliveryReceipt, OutboundAttachment, OutboundMessage};
 use crate::session::{SessionState, load_session};
 use crate::store::{resolve_store_path, to_sqlite_url};
@@ -82,9 +83,16 @@ impl AttachmentKind {
 
 pub fn deliver_text_message(
     config: &ChannelConfig,
+    policy: &WhatsAppPolicy,
     message: &OutboundMessage,
 ) -> Result<DeliveryReceipt> {
     let recipient_raw = resolve_recipient_raw(config, message)?;
+    let recipient_raw = normalize_direct_jid(&recipient_raw, "outbound recipient")?;
+    if !policy.allows_outbound_recipient(&recipient_raw) {
+        return Err(anyhow!(
+            "WhatsApp outbound recipient is outside the binding's authorized direct-message scope"
+        ));
+    }
     let recipient = parse_recipient_jid(&recipient_raw)?;
     let prepared = prepare_outbound_payload(message)?;
 
@@ -142,7 +150,7 @@ fn prepare_outbound_payload(message: &OutboundMessage) -> Result<PreparedSend> {
         [attachment] => Some(prepare_outbound_attachment(attachment)?),
         _ => {
             return Err(anyhow!(
-                "channel-whatsapp v0.1.0 supports at most one outbound attachment per message"
+                "channel-whatsapp v0.2.0 supports at most one outbound attachment per message"
             ));
         }
     };
@@ -158,7 +166,7 @@ fn prepare_outbound_payload(message: &OutboundMessage) -> Result<PreparedSend> {
         && !attachment.kind.supports_caption()
     {
         return Err(anyhow!(
-            "channel-whatsapp audio attachments cannot include `message.content` in v0.1.0; send the text separately or send the file as a document attachment"
+            "channel-whatsapp audio attachments cannot include `message.content` in v0.2.0; send the text separately or send the file as a document attachment"
         ));
     }
 
@@ -171,7 +179,7 @@ fn prepare_outbound_payload(message: &OutboundMessage) -> Result<PreparedSend> {
 fn prepare_outbound_attachment(attachment: &OutboundAttachment) -> Result<PreparedAttachment> {
     if attachment.url.is_some() || attachment.storage_key.is_some() {
         return Err(anyhow!(
-            "channel-whatsapp attachment `{}` must inline `data_base64`; URL and storage-key attachments are not supported in v0.1.0",
+            "channel-whatsapp attachment `{}` must inline `data_base64`; URL and storage-key attachments are not supported in v0.2.0",
             attachment.name
         ));
     }
@@ -378,7 +386,7 @@ fn parse_recipient_jid(raw: &str) -> Result<Jid> {
 
     if !raw.ends_with("@s.whatsapp.net") && !raw.ends_with("@lid") {
         return Err(anyhow!(
-            "channel-whatsapp v0.1.0 only supports direct-message JIDs ending in `@s.whatsapp.net` or `@lid`; got `{raw}`"
+            "channel-whatsapp v0.2.0 only supports direct-message JIDs ending in `@s.whatsapp.net` or `@lid`; got `{raw}`"
         ));
     }
 
@@ -389,6 +397,15 @@ fn parse_recipient_jid(raw: &str) -> Result<Jid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn allowlist_policy() -> WhatsAppPolicy {
+        WhatsAppPolicy::from_config(&ChannelConfig {
+            dm_policy: Some("allowlist".to_string()),
+            allowed_dm_sender_ids: vec!["15551234567@s.whatsapp.net".to_string()],
+            ..ChannelConfig::default()
+        })
+        .unwrap()
+    }
 
     fn outbound_message() -> OutboundMessage {
         OutboundMessage {
@@ -460,6 +477,23 @@ mod tests {
             error
                 .to_string()
                 .contains("only supports direct-message JIDs")
+        );
+    }
+
+    #[test]
+    fn delivery_rejects_a_direct_recipient_outside_the_effective_policy_scope() {
+        let mut message = outbound_message();
+        message.metadata.insert(
+            ROUTE_CONVERSATION_ID.to_string(),
+            "15557654321@s.whatsapp.net".to_string(),
+        );
+
+        let error = deliver_text_message(&ChannelConfig::default(), &allowlist_policy(), &message)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("authorized direct-message scope")
         );
     }
 

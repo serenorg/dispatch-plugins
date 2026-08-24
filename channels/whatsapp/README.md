@@ -21,9 +21,9 @@ Implemented:
 - `status` (mapped to WhatsApp typing indicators)
 - `shutdown`
 
-Not yet implemented (v0.1.1 follow-ups):
+Not yet implemented:
 
-- inbound attachment byte download (metadata only in v0.1.0)
+- inbound attachment byte download (metadata only)
 - multiple outbound attachments in one Dispatch message
 - group send and group receive as first-class behavior
 - reactions, edits, read receipts as distinct event types
@@ -72,6 +72,10 @@ On success the plugin prints a JSON summary containing the linked JIDs, device i
 | `account` | Logical account name selecting the per-account subdirectory when `sqlite_store_path` is unset. Defaults to `default`. |
 | `default_recipient` | Fallback JID for operator-driven `push`, `deliver`, and `status` frames with no routing metadata. |
 | `poll_timeout_secs` | Receive timeout in seconds for one `poll_ingress` cycle. Defaults to 10. |
+| `dm_policy` | Direct-message ingress policy: `deny`, `allowlist`, or `open`. Omitted means `deny`. Persistent ingress requires `allowlist` with senders or explicit `open`. |
+| `allowed_dm_sender_ids` | Exact direct-message JIDs permitted when `dm_policy` is `allowlist`. Empty lists deny all; wildcards and group JIDs are rejected. |
+| `outbound_recipient_ids` | Optional direct-message destinations. Empty falls back to `allowed_dm_sender_ids`, so outbound delivery cannot widen an allowlist. |
+| `reply_delivery` | `runtime_owned` (default) or `tool_owned`, selecting the path that publishes the visible reply. |
 
 Default store layout:
 
@@ -88,7 +92,11 @@ Outbound delivery and status frames currently require a full WhatsApp JID:
 - `15551234567@s.whatsapp.net` for a direct-message chat
 - `<lid>@lid` for LID-addressed direct-message chats
 
-Bare phone numbers are rejected. Group JIDs (`@g.us`) are not supported in v0.1.0.
+Bare phone numbers are rejected. Group JIDs (`@g.us`) are not supported.
+
+## Authorization policy
+
+WhatsApp persistent ingress is direct-message-only. The plugin rejects group messages before emitting a channel event and evaluates the same normalized policy for configuration, inbound messages, `deliver`, `push`, and typing-status frames. An `allowlist` requires one or more exact direct WhatsApp JIDs; `open` is an explicit unbounded direct-message surface; `deny` has no ingress or outbound surface. The plugin records its authenticated linked-account JID and direct-message activation evidence on each accepted event so the host can re-authorize it.
 
 The intended operator flow is to receive an inbound event first, then reuse `conversation.id` as the outbound `message.metadata.conversation_id`.
 
@@ -140,13 +148,13 @@ Inbound media is surfaced as attachment metadata:
 - `message.attachments[].kind` = `image`, `video`, `audio`, or `document`
 - `mime_type`, `size_bytes`, and `name` are populated when WhatsApp provides them
 - dimensions, caption, duration, and audio `ptt` state are carried in `attachments[].extras`
-- attachment bytes are not downloaded in v0.1.0
+- attachment bytes are not downloaded
 
 If an inbound message carries only media and no text or caption, the plugin emits a fallback body like `(1 attachment(s))` so the event is still visible to the agent.
 
 ## Outbound attachments
 
-`deliver` and `push` support one optional inline attachment per message. Only `data_base64` attachments are supported in v0.1.0.
+`deliver` and `push` support one optional inline attachment per message. Only `data_base64` attachments are supported.
 
 - `url` attachments are rejected
 - `storage_key` attachments are rejected
@@ -190,7 +198,7 @@ The status frame's `conversation_id` is required and is treated the same way as 
 
 ## Known limitations
 
-- Multiple outbound attachments in one Dispatch message are not supported in v0.1.0.
+- Multiple outbound attachments in one Dispatch message are not supported.
 - Group JIDs are intentionally out of scope for the first release.
 - Inbound attachment bytes are not downloaded yet; only metadata is surfaced.
 - Reactions, edits, and read receipts are ignored for now.

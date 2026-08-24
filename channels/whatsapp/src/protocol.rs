@@ -4,11 +4,12 @@ use serde::{Deserialize, Serialize};
 #[allow(unused_imports)]
 pub use proto::{
     AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities,
-    ChannelEventNotification, ConfiguredChannel, DeliveryReceipt, HealthReport, InboundActor,
-    InboundAttachment, InboundConversationRef, InboundEventEnvelope, InboundMessage, IngressMode,
-    IngressState, OutboundAttachment, OutboundMessageEnvelope, PluginNotificationEnvelope,
-    PluginResponse, StatusAcceptance, StatusFrame, StatusKind, ThreadingModel,
-    notification_to_jsonrpc, parse_jsonrpc_request, plugin_error, response_to_jsonrpc,
+    ChannelEventNotification, ChannelPolicy, ConfiguredChannel, DeliveryReceipt, HealthReport,
+    InboundActivation, InboundActor, InboundAttachment, InboundConversationRef,
+    InboundEventEnvelope, InboundMessage, IngressMode, IngressState, OutboundAttachment,
+    OutboundMessageEnvelope, PluginNotificationEnvelope, PluginResponse, StatusAcceptance,
+    StatusFrame, StatusKind, ThreadingModel, notification_to_jsonrpc, parse_jsonrpc_request,
+    plugin_error, response_to_jsonrpc,
 };
 
 /// Configuration for the native Rust WhatsApp channel plugin.
@@ -28,6 +29,20 @@ pub struct ChannelConfig {
     pub default_recipient: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_timeout_secs: Option<u16>,
+    /// `deny`, `allowlist`, or `open`. Absent means `deny`, so a linked account
+    /// never turns its direct-message visibility into ingress authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dm_policy: Option<String>,
+    /// Exact direct-message senders authorized by the `allowlist` policy.
+    #[serde(default)]
+    pub allowed_dm_sender_ids: Vec<String>,
+    /// Optional direct-message destinations. Empty falls back to the inbound
+    /// sender scope, so an unset outbound list cannot widen the binding.
+    #[serde(default)]
+    pub outbound_recipient_ids: Vec<String>,
+    /// `runtime_owned` or `tool_owned`. Absent means `runtime_owned`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_delivery: Option<String>,
 }
 
 pub type OutboundMessage = OutboundMessageEnvelope;

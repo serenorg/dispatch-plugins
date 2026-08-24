@@ -9,6 +9,7 @@ use whatsapp_rust::store::SqliteStore;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
+use crate::policy::{WhatsAppPolicy, normalize_direct_jid};
 use crate::protocol::{ChannelConfig, StatusAcceptance, StatusFrame, StatusKind};
 use crate::session::{SessionState, load_session};
 use crate::store::{resolve_store_path, to_sqlite_url};
@@ -16,7 +17,11 @@ use crate::store::{resolve_store_path, to_sqlite_url};
 const PLATFORM_WHATSAPP: &str = "whatsapp";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub fn handle_status(config: &ChannelConfig, frame: &StatusFrame) -> Result<StatusAcceptance> {
+pub fn handle_status(
+    config: &ChannelConfig,
+    policy: &WhatsAppPolicy,
+    frame: &StatusFrame,
+) -> Result<StatusAcceptance> {
     let state = chat_state_for_kind(frame.kind.clone());
 
     let mut metadata = BTreeMap::new();
@@ -41,6 +46,12 @@ pub fn handle_status(config: &ChannelConfig, frame: &StatusFrame) -> Result<Stat
             )
         })?
         .to_string();
+    let conversation_id = normalize_direct_jid(&conversation_id, "status recipient")?;
+    if !policy.allows_outbound_recipient(&conversation_id) {
+        return Err(anyhow!(
+            "WhatsApp status recipient is outside the binding's authorized direct-message scope"
+        ));
+    }
     let recipient = parse_recipient_jid(&conversation_id)?;
 
     match load_session(config)? {
@@ -114,7 +125,7 @@ fn parse_recipient_jid(raw: &str) -> Result<Jid> {
 
     if !raw.ends_with("@s.whatsapp.net") && !raw.ends_with("@lid") {
         return Err(anyhow!(
-            "channel-whatsapp v0.1.0 status frames only support direct-message JIDs ending in `@s.whatsapp.net` or `@lid`; got `{raw}`"
+            "channel-whatsapp v0.2.0 status frames only support direct-message JIDs ending in `@s.whatsapp.net` or `@lid`; got `{raw}`"
         ));
     }
 
@@ -191,6 +202,15 @@ async fn resolve_chat_recipient(client: &whatsapp_rust::Client, recipient: &Jid)
 mod tests {
     use super::*;
 
+    fn allowlist_policy() -> WhatsAppPolicy {
+        WhatsAppPolicy::from_config(&ChannelConfig {
+            dm_policy: Some("allowlist".to_string()),
+            allowed_dm_sender_ids: vec!["15551234567@s.whatsapp.net".to_string()],
+            ..ChannelConfig::default()
+        })
+        .unwrap()
+    }
+
     #[test]
     fn chat_state_for_kind_maps_turn_taking_states() {
         assert_eq!(
@@ -238,6 +258,25 @@ mod tests {
             error
                 .to_string()
                 .contains("only support direct-message JIDs")
+        );
+    }
+
+    #[test]
+    fn status_rejects_a_recipient_outside_the_effective_policy_scope() {
+        let frame = StatusFrame {
+            kind: StatusKind::Processing,
+            message: "processing".to_string(),
+            conversation_id: Some("15557654321@s.whatsapp.net".to_string()),
+            thread_id: None,
+            metadata: BTreeMap::new(),
+        };
+
+        let error =
+            handle_status(&ChannelConfig::default(), &allowlist_policy(), &frame).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("authorized direct-message scope")
         );
     }
 }

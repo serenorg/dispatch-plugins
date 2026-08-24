@@ -15,9 +15,10 @@ use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
+use crate::policy::WhatsAppPolicy;
 use crate::protocol::{
-    ChannelConfig, InboundActor, InboundAttachment, InboundConversationRef, InboundEventEnvelope,
-    InboundMessage,
+    ChannelConfig, InboundActivation, InboundActor, InboundAttachment, InboundConversationRef,
+    InboundEventEnvelope, InboundMessage,
 };
 use crate::store::{resolve_store_path, to_sqlite_url};
 
@@ -71,6 +72,8 @@ impl IngressWorker {
 /// Start supervised ingress that writes notifications under the shared stdout lock.
 pub fn start_ingress_worker(
     config: &ChannelConfig,
+    policy: WhatsAppPolicy,
+    account_id: String,
     stdout_lock: Arc<Mutex<()>>,
 ) -> Result<IngressWorker> {
     let store_path = resolve_store_path(config)?;
@@ -86,7 +89,9 @@ pub fn start_ingress_worker(
 
     let handle = std::thread::Builder::new()
         .name("channel-whatsapp-receive".to_string())
-        .spawn(move || supervise_receive_loop(sqlite_url, stdout_lock, stop_flag))
+        .spawn(move || {
+            supervise_receive_loop(sqlite_url, policy, account_id, stdout_lock, stop_flag)
+        })
         .context("failed to spawn channel-whatsapp receive thread")?;
 
     Ok(IngressWorker {
@@ -96,7 +101,13 @@ pub fn start_ingress_worker(
 }
 
 /// Reconnect transient failures and exit after a terminal failure so the host can replace the plugin.
-fn supervise_receive_loop(sqlite_url: String, stdout_lock: Arc<Mutex<()>>, stop: Arc<AtomicBool>) {
+fn supervise_receive_loop(
+    sqlite_url: String,
+    policy: WhatsAppPolicy,
+    account_id: String,
+    stdout_lock: Arc<Mutex<()>>,
+    stop: Arc<AtomicBool>,
+) {
     let mut consecutive_failures = 0_u32;
     let mut backoff = INITIAL_RECONNECT_BACKOFF;
 
@@ -119,6 +130,8 @@ fn supervise_receive_loop(sqlite_url: String, stdout_lock: Arc<Mutex<()>>, stop:
         let mut stable_connection = false;
         let outcome = runtime.block_on(run_receive_loop(
             sqlite_url.clone(),
+            policy.clone(),
+            account_id.clone(),
             &stdout_lock,
             &stop,
             &mut connected_at,
@@ -252,7 +265,11 @@ fn jitter_seed() -> u64 {
     seed ^ (seed >> 31)
 }
 
-pub fn poll_ingress_once(config: &ChannelConfig) -> Result<Vec<InboundEventEnvelope>> {
+pub fn poll_ingress_once(
+    config: &ChannelConfig,
+    policy: WhatsAppPolicy,
+    account_id: String,
+) -> Result<Vec<InboundEventEnvelope>> {
     let timeout = Duration::from_secs(u64::from(
         config
             .poll_timeout_secs
@@ -262,8 +279,15 @@ pub fn poll_ingress_once(config: &ChannelConfig) -> Result<Vec<InboundEventEnvel
 
     let (event_tx, event_rx) = channel::<InboundEventEnvelope>();
     let stop = Arc::new(AtomicBool::new(false));
-    let handle = spawn_receive_thread(config, event_tx, Arc::clone(&stop), "channel-whatsapp-poll")
-        .context("failed to spawn channel-whatsapp poll thread")?;
+    let handle = spawn_receive_thread(
+        config,
+        policy,
+        account_id,
+        event_tx,
+        Arc::clone(&stop),
+        "channel-whatsapp-poll",
+    )
+    .context("failed to spawn channel-whatsapp poll thread")?;
 
     let started_at = Instant::now();
     let deadline = started_at + timeout;
@@ -299,6 +323,8 @@ pub fn poll_ingress_once(config: &ChannelConfig) -> Result<Vec<InboundEventEnvel
 
 fn spawn_receive_thread(
     config: &ChannelConfig,
+    policy: WhatsAppPolicy,
+    account_id: String,
     event_tx: Sender<InboundEventEnvelope>,
     stop_flag: Arc<AtomicBool>,
     thread_name: &str,
@@ -327,9 +353,9 @@ fn spawn_receive_thread(
                 }
             };
 
-            if let Err(error) =
-                runtime.block_on(run_poll_receive_loop(sqlite_url, event_tx, &stop_flag))
-            {
+            if let Err(error) = runtime.block_on(run_poll_receive_loop(
+                sqlite_url, policy, account_id, event_tx, &stop_flag,
+            )) {
                 eprintln!("{thread_name} terminated: {error}");
             }
         })
@@ -343,11 +369,14 @@ fn spawn_receive_thread(
 /// no reconnect: the host owns the retry by issuing the next poll.
 async fn run_poll_receive_loop(
     sqlite_url: String,
+    policy: WhatsAppPolicy,
+    account_id: String,
     event_tx: Sender<InboundEventEnvelope>,
     stop_flag: &AtomicBool,
 ) -> Result<()> {
     let connection_status = Arc::new(AtomicU8::new(CONNECTION_CONNECTING));
-    let mut bot = build_ingress_bot(&sqlite_url, event_tx, connection_status).await?;
+    let mut bot =
+        build_ingress_bot(&sqlite_url, policy, account_id, event_tx, connection_status).await?;
     let client = bot.client();
     let bot_handle = bot.run().await.context("failed to start WhatsApp bot")?;
     tokio::pin!(bot_handle);
@@ -373,6 +402,8 @@ async fn run_poll_receive_loop(
 
 async fn build_ingress_bot(
     sqlite_url: &str,
+    policy: WhatsAppPolicy,
+    account_id: String,
     event_tx: Sender<InboundEventEnvelope>,
     connection_status: Arc<AtomicU8>,
 ) -> Result<Bot> {
@@ -389,6 +420,8 @@ async fn build_ingress_bot(
         .with_runtime(TokioRuntime)
         .on_event(move |event, _client| {
             let sender = event_tx.clone();
+            let policy = policy.clone();
+            let account_id = account_id.clone();
             let connection_status = Arc::clone(&connection_status);
             async move {
                 match event {
@@ -402,7 +435,9 @@ async fn build_ingress_bot(
                         connection_status.store(CONNECTION_LOGGED_OUT, Ordering::Relaxed);
                     }
                     Event::Message(message, info) => {
-                        if let Some(inbound) = build_inbound_event_from_message(&message, &info) {
+                        if let Some(inbound) =
+                            build_inbound_event_from_message(&message, &info, &policy, &account_id)
+                        {
                             let _ = sender.send(inbound);
                         }
                     }
@@ -433,6 +468,8 @@ fn join_receive_thread(handle: JoinHandle<()>) {
 
 async fn run_receive_loop(
     sqlite_url: String,
+    policy: WhatsAppPolicy,
+    account_id: String,
     stdout_lock: &Arc<Mutex<()>>,
     stop_flag: &AtomicBool,
     connected_at: &mut Option<Instant>,
@@ -440,7 +477,14 @@ async fn run_receive_loop(
 ) -> Result<()> {
     let (event_tx, event_rx) = channel::<InboundEventEnvelope>();
     let connection_status = Arc::new(AtomicU8::new(CONNECTION_CONNECTING));
-    let mut bot = build_ingress_bot(&sqlite_url, event_tx, Arc::clone(&connection_status)).await?;
+    let mut bot = build_ingress_bot(
+        &sqlite_url,
+        policy,
+        account_id,
+        event_tx,
+        Arc::clone(&connection_status),
+    )
+    .await?;
 
     let client = bot.client();
     let bot_handle = bot.run().await.context("failed to start WhatsApp bot")?;
@@ -578,8 +622,18 @@ fn emit_events(stdout_lock: &Arc<Mutex<()>>, events: Vec<InboundEventEnvelope>) 
 fn build_inbound_event_from_message(
     message: &wa::Message,
     info: &MessageInfo,
+    policy: &WhatsAppPolicy,
+    account_id: &str,
 ) -> Option<InboundEventEnvelope> {
-    if info.source.is_from_me {
+    if info.source.is_from_me || info.source.is_group {
+        return None;
+    }
+    let sender_id = info.source.sender.to_string();
+    let conversation_id = info.source.chat.to_string();
+    if !policy.allows_inbound_sender(&sender_id)
+        || crate::policy::normalize_direct_jid(&sender_id, "inbound sender").is_err()
+        || crate::policy::normalize_direct_jid(&conversation_id, "inbound conversation").is_err()
+    {
         return None;
     }
 
@@ -614,17 +668,15 @@ fn build_inbound_event_from_message(
         event_type: "message.received".to_string(),
         received_at: info.timestamp.to_rfc3339(),
         conversation: InboundConversationRef {
-            id: info.source.chat.to_string(),
-            kind: if info.source.is_group {
-                "group_chat".to_string()
-            } else {
-                "chat".to_string()
-            },
+            id: conversation_id,
+            kind: "dm".to_string(),
             thread_id: None,
             parent_message_id: None,
+            workspace_id: None,
+            parent_conversation_id: None,
         },
         actor: InboundActor {
-            id: info.source.sender.to_string(),
+            id: sender_id,
             display_name: (!info.push_name.trim().is_empty()).then(|| info.push_name.clone()),
             username: None,
             is_bot: false,
@@ -638,7 +690,12 @@ fn build_inbound_event_from_message(
             attachments,
             metadata: message_metadata,
         },
-        account_id: None,
+        account_id: Some(account_id.to_string()),
+        activation: Some(InboundActivation {
+            reason: InboundActivation::REASON_DIRECT_MESSAGE.to_string(),
+            agent_account_id: Some(account_id.to_string()),
+            referenced_message_author_id: None,
+        }),
         metadata: event_metadata,
     })
 }
@@ -789,6 +846,18 @@ fn build_document_attachment(document: &wa::message::DocumentMessage) -> Inbound
 mod tests {
     use super::*;
     use whatsapp_rust::types::message::MessageSource;
+
+    const SENDER_ID: &str = "15557654321@s.whatsapp.net";
+    const ACCOUNT_ID: &str = "15551234567@s.whatsapp.net";
+
+    fn policy() -> WhatsAppPolicy {
+        WhatsAppPolicy::from_config(&ChannelConfig {
+            dm_policy: Some("allowlist".to_string()),
+            allowed_dm_sender_ids: vec![SENDER_ID.to_string()],
+            ..ChannelConfig::default()
+        })
+        .unwrap()
+    }
 
     /// A receive session that ends on its own has lost its connection. Treating
     /// that as a clean exit is what leaves the JSON-RPC parent alive with no
@@ -942,7 +1011,7 @@ mod tests {
         MessageInfo {
             source: MessageSource {
                 chat: "15551234567@s.whatsapp.net".parse().unwrap(),
-                sender: "15557654321@s.whatsapp.net".parse().unwrap(),
+                sender: SENDER_ID.parse().unwrap(),
                 is_from_me: false,
                 is_group: false,
                 ..Default::default()
@@ -966,9 +1035,20 @@ mod tests {
             ..Default::default()
         };
 
-        let event = build_inbound_event_from_message(&message, &inbound_info()).unwrap();
+        let event =
+            build_inbound_event_from_message(&message, &inbound_info(), &policy(), ACCOUNT_ID)
+                .unwrap();
         assert_eq!(event.event_type, "message.received");
         assert_eq!(event.platform, "whatsapp");
+        assert_eq!(event.conversation.kind, "dm");
+        assert_eq!(event.account_id.as_deref(), Some(ACCOUNT_ID));
+        assert_eq!(
+            event
+                .activation
+                .as_ref()
+                .map(|activation| activation.reason.as_str()),
+            Some(InboundActivation::REASON_DIRECT_MESSAGE)
+        );
         assert_eq!(
             event.metadata.get("platform").map(String::as_str),
             Some("whatsapp")
@@ -1013,7 +1093,9 @@ mod tests {
             ..Default::default()
         };
 
-        let event = build_inbound_event_from_message(&message, &inbound_info()).unwrap();
+        let event =
+            build_inbound_event_from_message(&message, &inbound_info(), &policy(), ACCOUNT_ID)
+                .unwrap();
         assert_eq!(event.message.content, "look");
         assert_eq!(event.message.attachments.len(), 1);
         assert_eq!(event.message.attachments[0].kind, "image");
@@ -1037,6 +1119,25 @@ mod tests {
                 .get("caption")
                 .map(String::as_str),
             Some("look")
+        );
+    }
+
+    #[test]
+    fn build_inbound_event_rejects_groups_and_senders_outside_the_allowlist() {
+        let message = wa::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
+        };
+        let mut group = inbound_info();
+        group.source.is_group = true;
+        assert!(
+            build_inbound_event_from_message(&message, &group, &policy(), ACCOUNT_ID).is_none()
+        );
+
+        let mut unlisted = inbound_info();
+        unlisted.source.sender = "15559876543@s.whatsapp.net".parse().unwrap();
+        assert!(
+            build_inbound_event_from_message(&message, &unlisted, &policy(), ACCOUNT_ID).is_none()
         );
     }
 }
