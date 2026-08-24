@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 use jiff::Timestamp;
 use presage::Manager;
-use presage::libsignal_service::content::{Content, ContentBody};
+use presage::libsignal_service::content::{Content, ContentBody, DataMessage};
 use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Builder;
 
 use crate::protocol::{
-    ChannelConfig, InboundActor, InboundAttachment, InboundConversationRef, InboundEventEnvelope,
-    InboundMessage,
+    ChannelConfig, InboundActivation, InboundActor, InboundAttachment, InboundConversationRef,
+    InboundEventEnvelope, InboundMessage, SignalChannelPolicy,
 };
 use crate::store::{resolve_passphrase, resolve_store_path, to_sqlite_url};
 
@@ -86,13 +86,12 @@ impl IngressWorker {
     }
 }
 
-/// Spawn a new Signal receive worker on a dedicated OS thread running
-/// its own current-thread tokio runtime. Fails if the session has not
-/// been linked yet (caller should run `channel-signal --link` first).
-/// Start supervised ingress that writes notifications under the shared stdout lock.
+/// Start supervised ingress on a dedicated OS thread and write notifications under the shared stdout lock. Fails if the session has not been linked yet.
 pub fn start_ingress_worker(
     config: &ChannelConfig,
     stdout_lock: Arc<Mutex<()>>,
+    policy: SignalChannelPolicy,
+    account_id: String,
 ) -> Result<IngressWorker> {
     let store_path = resolve_store_path(config)?;
     if !store_path.exists() {
@@ -110,7 +109,9 @@ pub fn start_ingress_worker(
     let handle = std::thread::Builder::new()
         .name("channel-signal-receive".to_string())
         .stack_size(SIGNAL_THREAD_STACK_SIZE)
-        .spawn(move || supervise_receive_loop(url, passphrase, stdout_lock, stop_flag))
+        .spawn(move || {
+            supervise_receive_loop(url, passphrase, stdout_lock, stop_flag, policy, account_id)
+        })
         .context("failed to spawn channel-signal receive thread")?;
 
     Ok(IngressWorker {
@@ -125,6 +126,8 @@ fn supervise_receive_loop(
     passphrase: Option<String>,
     stdout_lock: Arc<Mutex<()>>,
     stop: Arc<AtomicBool>,
+    policy: SignalChannelPolicy,
+    account_id: String,
 ) {
     let mut consecutive_failures = 0_u32;
     let mut backoff = INITIAL_RECONNECT_BACKOFF;
@@ -148,6 +151,8 @@ fn supervise_receive_loop(
             &stdout_lock,
             &stop,
             &mut connected_at,
+            &policy,
+            &account_id,
         ));
         if session_was_stable(connected_at.map(|started| started.elapsed())) {
             consecutive_failures = 0;
@@ -246,7 +251,11 @@ const DEFAULT_POLL_TIMEOUT_SECS: u16 = 10;
 /// Run a single `poll_ingress` cycle and return all inbound events
 /// that presage delivers before the first `QueueEmpty` marker or the
 /// configured timeout elapses, whichever comes first.
-pub fn poll_ingress_once(config: &ChannelConfig) -> Result<Vec<InboundEventEnvelope>> {
+pub fn poll_ingress_once(
+    config: &ChannelConfig,
+    policy: &SignalChannelPolicy,
+    account_id: &str,
+) -> Result<Vec<InboundEventEnvelope>> {
     let store_path = resolve_store_path(config)?;
     if !store_path.exists() {
         return Err(anyhow!(
@@ -261,6 +270,8 @@ pub fn poll_ingress_once(config: &ChannelConfig) -> Result<Vec<InboundEventEnvel
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_POLL_TIMEOUT_SECS);
     let timeout = std::time::Duration::from_secs(u64::from(timeout_secs));
+    let policy = policy.clone();
+    let account_id = account_id.to_string();
 
     let handle = std::thread::Builder::new()
         .name("channel-signal-poll".to_string())
@@ -270,7 +281,7 @@ pub fn poll_ingress_once(config: &ChannelConfig) -> Result<Vec<InboundEventEnvel
                 .enable_all()
                 .build()
                 .context("failed to build poll-thread tokio runtime")?;
-            runtime.block_on(run_poll_once(url, passphrase, timeout))
+            runtime.block_on(run_poll_once(url, passphrase, timeout, policy, account_id))
         })
         .context("failed to spawn channel-signal poll thread")?;
 
@@ -283,6 +294,8 @@ async fn run_poll_once(
     url: String,
     passphrase: Option<String>,
     timeout: std::time::Duration,
+    policy: SignalChannelPolicy,
+    account_id: String,
 ) -> Result<Vec<InboundEventEnvelope>> {
     let store =
         SqliteStore::open_with_passphrase(&url, passphrase.as_deref(), OnNewIdentity::Trust)
@@ -309,7 +322,9 @@ async fn run_poll_once(
         }
         match tokio::time::timeout(remaining, messages.next()).await {
             Ok(Some(Received::Content(content))) => {
-                if let Some(event) = build_inbound_event_from_content(&content) {
+                if let Some(event) =
+                    build_inbound_event_from_content(&content, &policy, &account_id)
+                {
                     events.push(event);
                 }
             }
@@ -328,6 +343,8 @@ async fn run_receive_loop(
     stdout_lock: &Arc<Mutex<()>>,
     stop_flag: &AtomicBool,
     connected_at: &mut Option<Instant>,
+    policy: &SignalChannelPolicy,
+    account_id: &str,
 ) -> Result<()> {
     let store =
         SqliteStore::open_with_passphrase(&url, passphrase.as_deref(), OnNewIdentity::Trust)
@@ -363,10 +380,9 @@ async fn run_receive_loop(
         if stop_flag.load(Ordering::Relaxed) {
             return Ok(());
         }
-
         let mut emitted = false;
         if let Some(Received::Content(content)) = received
-            && let Some(event) = build_inbound_event_from_content(&content)
+            && let Some(event) = build_inbound_event_from_content(&content, policy, account_id)
         {
             emit_events(stdout_lock, vec![event])?;
             emitted = true;
@@ -386,7 +402,7 @@ fn emit_events(stdout_lock: &Arc<Mutex<()>>, events: Vec<InboundEventEnvelope>) 
 }
 
 /// Convert a Signal `Content` into the Dispatch inbound event shape.
-/// For v0.1.0 this handles direct-message text plus attachment
+/// For v0.2.0 this handles direct-message text plus attachment
 /// metadata. Attachment bytes are NOT downloaded here: `presage`'s
 /// receive stream borrows the Manager mutably, so
 /// `Manager::get_attachment` cannot be called while iterating. The
@@ -394,11 +410,18 @@ fn emit_events(stdout_lock: &Arc<Mutex<()>>, events: Vec<InboundEventEnvelope>) 
 /// each `AttachmentPointer` so the agent knows attachments exist and
 /// can request explicit fetching later. Full inbound download lands
 /// in a follow-up commit.
-fn build_inbound_event_from_content(content: &Content) -> Option<InboundEventEnvelope> {
+fn build_inbound_event_from_content(
+    content: &Content,
+    policy: &SignalChannelPolicy,
+    account_id: &str,
+) -> Option<InboundEventEnvelope> {
     let data_message = match &content.body {
         ContentBody::DataMessage(msg) => msg,
         _ => return None,
     };
+    if !is_direct_message(data_message) {
+        return None;
+    }
     let text = data_message.body.as_deref().map(str::trim).unwrap_or("");
     let attachments = build_inbound_attachments(&data_message.attachments);
 
@@ -408,8 +431,33 @@ fn build_inbound_event_from_content(content: &Content) -> Option<InboundEventEnv
         return None;
     }
 
-    let sender = content.metadata.sender.service_id_string();
     let timestamp_ms = content.metadata.timestamp as i64;
+
+    inbound_event(
+        content.metadata.sender.service_id_string(),
+        timestamp_ms,
+        text,
+        attachments,
+        policy,
+        account_id,
+    )
+}
+
+fn is_direct_message(message: &DataMessage) -> bool {
+    message.group_v2.is_none()
+}
+
+fn inbound_event(
+    sender: String,
+    timestamp_ms: i64,
+    text: &str,
+    attachments: Vec<InboundAttachment>,
+    policy: &SignalChannelPolicy,
+    account_id: &str,
+) -> Option<InboundEventEnvelope> {
+    if !policy.allows_inbound_sender(&sender) {
+        return None;
+    }
 
     let mut event_metadata = BTreeMap::new();
     event_metadata.insert("platform".to_string(), PLATFORM_SIGNAL.to_string());
@@ -439,9 +487,11 @@ fn build_inbound_event_from_content(content: &Content) -> Option<InboundEventEnv
         received_at,
         conversation: InboundConversationRef {
             id: sender.clone(),
-            kind: "signal_direct".to_string(),
+            kind: "dm".to_string(),
             thread_id: None,
             parent_message_id: None,
+            workspace_id: None,
+            parent_conversation_id: None,
         },
         actor: InboundActor {
             id: sender,
@@ -458,7 +508,12 @@ fn build_inbound_event_from_content(content: &Content) -> Option<InboundEventEnv
             attachments,
             metadata: message_metadata,
         },
-        account_id: None,
+        account_id: Some(account_id.to_string()),
+        activation: Some(InboundActivation {
+            reason: InboundActivation::REASON_DIRECT_MESSAGE.to_string(),
+            agent_account_id: Some(account_id.to_string()),
+            referenced_message_author_id: None,
+        }),
         metadata: event_metadata,
     })
 }
@@ -513,6 +568,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{DmPolicy, SignalChannelPolicy};
+    use presage::libsignal_service::content::GroupContextV2;
+
+    fn service_id(value: u8) -> String {
+        format!("00000000-0000-0000-0000-0000000000{value:02}")
+    }
 
     #[test]
     fn stop_waits_for_worker_thread_to_exit() {
@@ -615,5 +676,69 @@ mod tests {
             stream_open < clock_start,
             "connected_at must be armed after receive_messages() succeeds"
         );
+    }
+
+    #[test]
+    fn inbound_events_have_authenticated_direct_message_provenance() {
+        let sender = service_id(1);
+        let account_id = service_id(9);
+        let policy = SignalChannelPolicy::from_config(&ChannelConfig {
+            dm_policy: DmPolicy::Allowlist,
+            allowed_dm_sender_ids: vec![sender.clone()],
+            ..ChannelConfig::default()
+        })
+        .unwrap();
+
+        let event = inbound_event(sender.clone(), 1, "hello", Vec::new(), &policy, &account_id)
+            .expect("authorized event");
+        assert_eq!(event.platform, PLATFORM_SIGNAL);
+        assert_eq!(event.conversation.id, sender);
+        assert_eq!(event.conversation.kind, "dm");
+        assert_eq!(event.account_id.as_deref(), Some(account_id.as_str()));
+        assert_eq!(
+            event
+                .activation
+                .as_ref()
+                .map(|activation| activation.reason.as_str()),
+            Some(InboundActivation::REASON_DIRECT_MESSAGE)
+        );
+        assert_eq!(
+            event
+                .activation
+                .as_ref()
+                .and_then(|activation| activation.agent_account_id.as_deref()),
+            Some(account_id.as_str())
+        );
+    }
+
+    #[test]
+    fn inbound_filter_drops_unauthorized_sender_before_notification() {
+        let policy = SignalChannelPolicy::from_config(&ChannelConfig {
+            dm_policy: DmPolicy::Allowlist,
+            allowed_dm_sender_ids: vec![service_id(1)],
+            ..ChannelConfig::default()
+        })
+        .unwrap();
+
+        assert!(
+            inbound_event(
+                service_id(2),
+                1,
+                "hello",
+                Vec::new(),
+                &policy,
+                &service_id(9)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn group_messages_are_not_reclassified_as_direct_messages() {
+        assert!(is_direct_message(&DataMessage::default()));
+        assert!(!is_direct_message(&DataMessage {
+            group_v2: Some(GroupContextV2::default()),
+            ..DataMessage::default()
+        }));
     }
 }

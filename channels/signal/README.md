@@ -23,7 +23,7 @@ Implemented:
 - `status` (mapped to Signal typing indicators)
 - `shutdown`
 
-Not yet implemented (v0.1.1 follow-ups):
+Not yet implemented:
 
 - inbound attachment byte download (metadata is surfaced on inbound events, but the encrypted bytes remain on Signal's CDN until a dedicated fetch step lands)
 - group messaging (send + receive)
@@ -81,6 +81,10 @@ All configuration fields are optional. Defaults match what `--link` wrote to dis
 | `passphrase_env` | Env var name holding a passphrase used to encrypt the store at rest (SQLCipher `PRAGMA key`). Leave unset for an unencrypted store. |
 | `default_recipient` | Fallback recipient for operator-driven `push`, `deliver`, and `status` frames with no routing metadata. |
 | `poll_timeout_secs` | Receive timeout (seconds) for one `poll_ingress` cycle. Defaults to 10. |
+| `dm_policy` | `deny` (default), `allowlist`, or `open`. Persistent ingress requires `allowlist` with at least one sender or explicit `open`. |
+| `allowed_dm_sender_ids` | Exact Signal ServiceIds permitted to start direct-message turns when `dm_policy` is `allowlist`. |
+| `outbound_recipient_ids` | Exact Signal ServiceIds permitted for delivery. Empty falls back to `allowed_dm_sender_ids`; it cannot widen an allowlist. |
+| `reply_delivery` | `runtime_owned` (default) or `tool_owned`, selecting the runtime path that presents a turn's visible reply. |
 
 Default store layout:
 
@@ -149,10 +153,11 @@ Reliable delivery without duplicate runs needs all three of the following, none 
 Both ingress paths emit the same `InboundEventEnvelope` shape:
 
 - `conversation.id` = sender ACI (as a UUID string)
-- `conversation.kind` = `signal_direct`
+- `conversation.kind` = `dm`
 - `actor.id`          = sender ACI
+- `account_id` = linked Signal account ACI, with `activation.reason` = `direct_message`
 - `message.content`   = the text body (or a placeholder when the message only carries attachments)
-- `message.attachments[]` = metadata per attachment (name, MIME type, size). Attachment bytes are not downloaded in v0.1.0.
+- `message.attachments[]` = metadata per attachment (name, MIME type, size). The plugin does not download attachment bytes.
 
 ## Outbound attachments
 
@@ -194,6 +199,7 @@ The status frame's `conversation_id` is required and is treated the same way as 
 - `chmod 700 ~/.config/dispatch/channels/signal/<account>/` is recommended.
 - For defense-in-depth, set `passphrase_env` and export the passphrase through whatever secret manager your deployment uses. The passphrase is never written to disk.
 - To revoke this device's access, open Signal on your phone -> Settings -> Linked Devices and remove the Dispatch entry.
+- Signal ingress is fail-closed. An absent policy, `deny`, or an empty `allowlist` produces no inbound events. Wildcards are not supported. Delivery and typing indicators are restricted to the same effective recipient scope, unless `dm_policy` is explicitly `open`.
 
 ## License
 

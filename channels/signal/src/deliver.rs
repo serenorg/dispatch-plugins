@@ -7,7 +7,7 @@
 //! constraint (libsignal stores hold `Rc<UnsafeCell<_>>` internally
 //! and cannot cross work-stealing tokio workers).
 //!
-//! For v0.1.0 we support plain text outbound only. The recipient is
+//! For v0.2.0 we support plain text outbound only. The recipient is
 //! resolved from `message.metadata.conversation_id` first, then
 //! `config.default_recipient`, and must be a Signal ServiceId string
 //! (either a raw ACI UUID or a `PNI:<uuid>` / `ACI:<uuid>` form).
@@ -28,7 +28,9 @@ use presage_store_sqlite::SqliteStore;
 use std::collections::BTreeMap;
 use tokio::runtime::Builder;
 
-use crate::protocol::{ChannelConfig, DeliveryReceipt, OutboundAttachment, OutboundMessage};
+use crate::protocol::{
+    ChannelConfig, DeliveryReceipt, OutboundAttachment, OutboundMessage, SignalChannelPolicy,
+};
 use crate::store::{resolve_passphrase, resolve_store_path, to_sqlite_url};
 
 const PLATFORM_SIGNAL: &str = "signal";
@@ -39,14 +41,16 @@ const SIGNAL_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// configured recipient. Blocks the calling thread until the send
 /// completes or fails.
 ///
-/// For v0.1.0 only `data_base64` attachments are supported. Attachment
+/// For v0.2.0 only `data_base64` attachments are supported. Attachment
 /// URLs and storage-key references return an error - dispatch stages
 /// media locally and the caller should inline it as base64.
 pub fn deliver_text_message(
     config: &ChannelConfig,
     message: &OutboundMessage,
+    policy: &SignalChannelPolicy,
 ) -> Result<DeliveryReceipt> {
-    let recipient_raw = resolve_recipient_raw(config, message)?;
+    let recipient_raw =
+        policy.authorize_outbound_recipient(&resolve_recipient_raw(config, message)?)?;
     let recipient = parse_service_id(&recipient_raw)?;
     let content = message.content.trim().to_string();
 

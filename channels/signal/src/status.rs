@@ -17,7 +17,9 @@ use presage::model::identity::OnNewIdentity;
 use presage_store_sqlite::SqliteStore;
 use tokio::runtime::Builder;
 
-use crate::protocol::{ChannelConfig, StatusAcceptance, StatusFrame, StatusKind};
+use crate::protocol::{
+    ChannelConfig, SignalChannelPolicy, StatusAcceptance, StatusFrame, StatusKind,
+};
 use crate::store::{resolve_passphrase, resolve_store_path, to_sqlite_url};
 
 const SIGNAL_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
@@ -26,7 +28,11 @@ const SIGNAL_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// indicator if applicable, and return a StatusAcceptance reporting
 /// what happened. Unknown / unsupported kinds are accepted without
 /// any upstream traffic.
-pub fn handle_status(config: &ChannelConfig, frame: &StatusFrame) -> Result<StatusAcceptance> {
+pub fn handle_status(
+    config: &ChannelConfig,
+    frame: &StatusFrame,
+    policy: &SignalChannelPolicy,
+) -> Result<StatusAcceptance> {
     let action = match frame.kind {
         StatusKind::Processing | StatusKind::Delivering | StatusKind::OperationStarted => {
             Some(Action::Started)
@@ -63,6 +69,7 @@ pub fn handle_status(config: &ChannelConfig, frame: &StatusFrame) -> Result<Stat
             )
         })?
         .to_string();
+    let recipient_raw = policy.authorize_outbound_recipient(&recipient_raw)?;
     let recipient = parse_service_id(&recipient_raw)?;
 
     let store_path = resolve_store_path(config)?;

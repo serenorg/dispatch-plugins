@@ -26,8 +26,8 @@ mod store;
 use ingress::{IngressWorker, poll_ingress_once, start_ingress_worker};
 use protocol::{
     CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ConfiguredChannel, OutboundMessage,
-    PluginRequest, PluginRequestEnvelope, PluginResponse, capabilities, parse_jsonrpc_request,
-    plugin_error, response_to_jsonrpc,
+    PluginRequest, PluginRequestEnvelope, PluginResponse, SignalChannelPolicy, capabilities,
+    parse_jsonrpc_request, plugin_error, response_to_jsonrpc,
 };
 use session::{SessionState, load_session};
 
@@ -121,23 +121,32 @@ fn handle_request(
             send_signal_message(config, message, DeliveryKind::Push)
         }
         PluginRequest::IngressEvent { .. } => not_implemented("ingress_event"),
-        PluginRequest::Status { config, update } => match status::handle_status(config, update) {
-            Ok(acceptance) => PluginResponse::StatusAccepted { status: acceptance },
-            Err(error) => plugin_error("status_failed", error.to_string()),
-        },
+        PluginRequest::Status { config, update } => {
+            let policy = match SignalChannelPolicy::from_config(config) {
+                Ok(policy) => policy,
+                Err(error) => return plugin_error("status_failed", error.to_string()),
+            };
+            match status::handle_status(config, update, &policy) {
+                Ok(acceptance) => PluginResponse::StatusAccepted { status: acceptance },
+                Err(error) => plugin_error("status_failed", error.to_string()),
+            }
+        }
     }
 }
 
 fn configure(config: &ChannelConfig) -> PluginResponse {
-    match load_session(config) {
-        Ok(state) => PluginResponse::Configured {
+    match (
+        SignalChannelPolicy::from_config(config),
+        load_session(config),
+    ) {
+        (Ok(policy), Ok(state)) => PluginResponse::Configured {
             configuration: Box::new(ConfiguredChannel {
                 metadata: session_metadata(&state),
-                policy: None,
+                policy: Some(policy.project(linked_account_id_from_state(&state))),
                 runtime: None,
             }),
         },
-        Err(error) => plugin_error("configure_failed", error.to_string()),
+        (Err(error), _) | (_, Err(error)) => plugin_error("configure_failed", error.to_string()),
     }
 }
 
@@ -151,7 +160,18 @@ fn health(config: &ChannelConfig) -> PluginResponse {
 }
 
 fn poll_ingress(config: &ChannelConfig, _state: Option<&IngressState>) -> PluginResponse {
-    match poll_ingress_once(config) {
+    let policy = match SignalChannelPolicy::from_config(config).and_then(|policy| {
+        policy.require_persistent_ingress()?;
+        Ok(policy)
+    }) {
+        Ok(policy) => policy,
+        Err(error) => return plugin_error("poll_ingress_failed", error.to_string()),
+    };
+    let account_id = match linked_account_id(config) {
+        Ok(account_id) => account_id,
+        Err(error) => return plugin_error("poll_ingress_failed", error.to_string()),
+    };
+    match poll_ingress_once(config, &policy, &account_id) {
         Ok(events) => PluginResponse::IngressEventsReceived {
             events,
             callback_reply: None,
@@ -173,7 +193,18 @@ fn start_ingress(
         worker.stop();
     }
 
-    match start_ingress_worker(config, Arc::clone(stdout_lock)) {
+    let policy = match SignalChannelPolicy::from_config(config).and_then(|policy| {
+        policy.require_persistent_ingress()?;
+        Ok(policy)
+    }) {
+        Ok(policy) => policy,
+        Err(error) => return plugin_error("start_ingress_failed", error.to_string()),
+    };
+    let account_id = match linked_account_id(config) {
+        Ok(account_id) => account_id,
+        Err(error) => return plugin_error("start_ingress_failed", error.to_string()),
+    };
+    match start_ingress_worker(config, Arc::clone(stdout_lock), policy, account_id) {
         Ok(worker) => {
             *ingress_worker = Some(worker);
             PluginResponse::IngressStarted {
@@ -194,12 +225,32 @@ fn send_signal_message(
     message: &OutboundMessage,
     kind: DeliveryKind,
 ) -> PluginResponse {
-    match deliver::deliver_text_message(config, message) {
+    let policy = match SignalChannelPolicy::from_config(config) {
+        Ok(policy) => policy,
+        Err(error) => return plugin_error("deliver_failed", error.to_string()),
+    };
+    match deliver::deliver_text_message(config, message, &policy) {
         Ok(delivery) => match kind {
             DeliveryKind::Deliver => PluginResponse::Delivered { delivery },
             DeliveryKind::Push => PluginResponse::Pushed { delivery },
         },
         Err(error) => plugin_error("deliver_failed", error.to_string()),
+    }
+}
+
+fn linked_account_id(config: &ChannelConfig) -> Result<String> {
+    let state = load_session(config)?;
+    linked_account_id_from_state(&state).ok_or_else(|| {
+        anyhow!("Signal session has not been linked yet; run `channel-signal --link` first")
+    })
+}
+
+fn linked_account_id_from_state(state: &SessionState) -> Option<String> {
+    match state {
+        SessionState::Registered { summary, .. } => {
+            protocol::normalize_service_id(&summary.aci).ok()
+        }
+        SessionState::NotYetLinked { .. } | SessionState::StoreEmpty { .. } => None,
     }
 }
 
@@ -339,6 +390,7 @@ pub(crate) fn write_stdout_line(stdout_lock: &Arc<Mutex<()>>, line: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::{StatusFrame, StatusKind};
 
     #[test]
     fn ingress_state_reports_the_selected_transport_mode() {
@@ -351,5 +403,62 @@ mod tests {
             running_ingress_state(&config, IngressMode::Websocket).mode,
             IngressMode::Websocket
         );
+    }
+
+    fn service_id(value: u8) -> String {
+        format!("00000000-0000-0000-0000-0000000000{value:02}")
+    }
+
+    fn error_code(response: PluginResponse) -> String {
+        match response {
+            PluginResponse::Error { error } => error.code,
+            other => panic!("expected plugin error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn denied_policy_stops_ingress_before_the_signal_session_is_opened() {
+        let config = ChannelConfig::default();
+        assert_eq!(
+            error_code(poll_ingress(&config, None)),
+            "poll_ingress_failed"
+        );
+
+        let mut worker = None;
+        let stdout_lock = Arc::new(Mutex::new(()));
+        assert_eq!(
+            error_code(start_ingress(&config, None, &stdout_lock, &mut worker)),
+            "start_ingress_failed"
+        );
+    }
+
+    #[test]
+    fn denied_policy_stops_delivery_and_status_before_the_signal_session_is_opened() {
+        let config = ChannelConfig::default();
+        let mut metadata = BTreeMap::new();
+        metadata.insert("conversation_id".to_string(), service_id(1));
+        let message = OutboundMessage {
+            content: "hello".to_string(),
+            content_type: Some("text/plain".to_string()),
+            attachments: Vec::new(),
+            metadata,
+        };
+        assert_eq!(
+            error_code(send_signal_message(
+                &config,
+                &message,
+                DeliveryKind::Deliver
+            )),
+            "deliver_failed"
+        );
+        let status = StatusFrame {
+            kind: StatusKind::Processing,
+            message: "working".to_string(),
+            conversation_id: Some(service_id(1)),
+            thread_id: None,
+            metadata: BTreeMap::new(),
+        };
+        let policy = SignalChannelPolicy::from_config(&config).unwrap();
+        assert!(status::handle_status(&config, &status, &policy).is_err());
     }
 }
