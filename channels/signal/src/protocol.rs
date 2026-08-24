@@ -61,7 +61,7 @@ pub fn capabilities() -> ChannelCapabilities {
     ChannelCapabilities {
         plugin_id: "signal".to_string(),
         platform: "signal".to_string(),
-        ingress_modes: vec![IngressMode::Polling],
+        ingress_modes: vec![IngressMode::Polling, IngressMode::Websocket],
         outbound_message_types: vec!["text".to_string()],
         threading_model: ThreadingModel::ChatOrThread,
         attachment_support: true,
@@ -152,9 +152,7 @@ mod tests {
             attachment_source_names(&runtime)
         );
         assert_eq!(
-            delivery["max_attachment_bytes"]
-                .as_u64()
-                .map(|value| value as u64),
+            delivery["max_attachment_bytes"].as_u64(),
             runtime.max_attachment_bytes
         );
     }

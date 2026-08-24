@@ -128,9 +128,23 @@ The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Dispatch operators nor
 ## Ingress model
 
 - `poll_ingress` opens a single WebSocket to Signal, drains all queued messages until Signal reports `QueueEmpty`, then closes. Useful for CLI-driven `dispatch channel poll --once` and for short-lived environments.
-- `start_ingress` / `stop_ingress` run a persistent background receive worker on a dedicated OS thread with its own tokio current-thread runtime. Inbound messages are delivered back to the host as `channel.event` notifications between JSON-RPC requests.
+- `start_ingress` / `stop_ingress` run a persistent background receive worker on a dedicated OS thread with its own tokio current-thread runtime. The worker sends inbound messages to the host as `channel.event` notifications without waiting for another JSON-RPC request.
 
 The plugin always owns the upstream receive loop. There is no webhook or polling-of-third-party-service transport.
+
+## Delivery guarantee
+
+Inbound delivery is best effort. Messages can be lost or processed more than once. Do not rely on this plugin for messages that must never be lost or duplicated.
+
+`presage` processes and stores a message before yielding it to the plugin, and the plugin then writes a `channel.event` notification to stdout. The plugin has no local outbox and the protocol has no host-acceptance acknowledgement, so a crash or a failed stdout write between those two steps drops that message with no replay path. A write failure ends the receive session, which the supervisor reports, but the message itself is already gone.
+
+Redelivery is equally unprotected in the other direction: the host allocates a new execution identifier for every notification and does not claim the provider event id, so a message that did arrive twice would produce two runs and two replies.
+
+Reliable delivery without duplicate runs needs all three of the following, none of which exist yet:
+
+- a host-side claim on `(organization, deployment, binding, platform account, provider event id)` taken before a run is created, so redelivery is collapsed into one run and one reply;
+- an explicit host-acceptance acknowledgement in the channel protocol, so the plugin learns when a notification is durably held rather than merely written;
+- a plugin-side outbox that retains an event until that acknowledgement arrives.
 
 Both ingress paths emit the same `InboundEventEnvelope` shape:
 

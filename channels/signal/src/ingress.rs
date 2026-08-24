@@ -2,11 +2,9 @@
 //!
 //! `presage::Manager::receive_messages` returns an async `Stream` that
 //! borrows the Manager exclusively. We run the whole receive loop on a
-//! single background tokio task inside the plugin-wide runtime, and
-//! bridge inbound messages back to the sync JSON-RPC loop via a
-//! `std::sync::mpsc::Sender`. The outer stdio loop drains the
-//! receiver between requests and emits `channel.event` notifications
-//! to dispatch.
+//! single background tokio task inside the plugin-wide runtime. The worker
+//! writes `channel.event` notifications under the shared stdout lock and sends
+//! empty liveness notifications while the receive stream remains open.
 //!
 //! Outbound calls (deliver, push, status) load a fresh Manager from
 //! the shared SQLite store each time. The store is an `Arc<SqlitePool>`
@@ -23,9 +21,8 @@ use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
 use presage_store_sqlite::SqliteStore;
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tokio::runtime::Builder;
@@ -41,11 +38,16 @@ const TRANSPORT_WEBSOCKET: &str = "websocket";
 const RECEIVE_STOP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const STOP_JOIN_GRACE: Duration = Duration::from_secs(3);
 const SIGNAL_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+/// Send three liveness notifications within the shortest 90-second host grace.
+const LIVENESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(60);
+/// Clear reconnect history only after one minute with an open receive stream.
+const SESSION_STABILITY_WINDOW: Duration = Duration::from_secs(60);
+const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
-/// A running Signal receive worker. Owns the background OS thread
-/// (which in turn runs a single-thread tokio runtime for presage) and
-/// the sync-side `mpsc::Receiver` that the outer JSON-RPC loop drains
-/// between requests.
+/// A running Signal receive worker. Owns the background OS thread,
+/// which in turn runs a single-thread tokio runtime for presage.
 ///
 /// The receive task must run on its own thread with a current-thread
 /// tokio runtime because `presage::Manager::receive_messages` returns
@@ -55,19 +57,9 @@ const SIGNAL_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 pub struct IngressWorker {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
-    event_rx: Receiver<InboundEventEnvelope>,
 }
 
 impl IngressWorker {
-    /// Pop every queued inbound event the receive task has produced.
-    pub fn drain_pending_events(&self) -> Vec<InboundEventEnvelope> {
-        let mut events = Vec::new();
-        while let Ok(event) = self.event_rx.try_recv() {
-            events.push(event);
-        }
-        events
-    }
-
     /// Signal the background task to stop and wait briefly for it to
     /// exit.
     ///
@@ -83,10 +75,11 @@ impl IngressWorker {
                 std::thread::sleep(Duration::from_millis(25));
             }
             if !handle.is_finished() {
-                tracing::warn!(
-                    grace_ms = STOP_JOIN_GRACE.as_millis() as u64,
-                    "channel-signal receive worker did not stop within grace period; joining anyway - process exit may block until the current Signal call returns"
+                eprintln!(
+                    "channel-signal receive worker did not stop within {} ms; exiting so the host can replace the plugin",
+                    STOP_JOIN_GRACE.as_millis()
                 );
+                std::process::exit(1);
             }
             let _ = handle.join();
         }
@@ -96,7 +89,11 @@ impl IngressWorker {
 /// Spawn a new Signal receive worker on a dedicated OS thread running
 /// its own current-thread tokio runtime. Fails if the session has not
 /// been linked yet (caller should run `channel-signal --link` first).
-pub fn start_ingress_worker(config: &ChannelConfig) -> Result<IngressWorker> {
+/// Start supervised ingress that writes notifications under the shared stdout lock.
+pub fn start_ingress_worker(
+    config: &ChannelConfig,
+    stdout_lock: Arc<Mutex<()>>,
+) -> Result<IngressWorker> {
     let store_path = resolve_store_path(config)?;
     if !store_path.exists() {
         return Err(anyhow!(
@@ -107,36 +104,135 @@ pub fn start_ingress_worker(config: &ChannelConfig) -> Result<IngressWorker> {
     let url = to_sqlite_url(&store_path);
     let passphrase = resolve_passphrase(config)?;
 
-    let (event_tx, event_rx) = channel::<InboundEventEnvelope>();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_flag = Arc::clone(&stop);
 
     let handle = std::thread::Builder::new()
         .name("channel-signal-receive".to_string())
         .stack_size(SIGNAL_THREAD_STACK_SIZE)
-        .spawn(move || {
-            let runtime = match Builder::new_current_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(error) => {
-                    eprintln!(
-                        "channel-signal receive worker failed to build tokio runtime: {error}"
-                    );
-                    return;
-                }
-            };
-            if let Err(error) =
-                runtime.block_on(run_receive_loop(url, passphrase, event_tx, stop_flag))
-            {
-                eprintln!("channel-signal receive loop terminated: {error}");
-            }
-        })
+        .spawn(move || supervise_receive_loop(url, passphrase, stdout_lock, stop_flag))
         .context("failed to spawn channel-signal receive thread")?;
 
     Ok(IngressWorker {
         stop,
         handle: Some(handle),
-        event_rx,
     })
+}
+
+/// Reconnect transient failures and exit after a terminal failure so the host can replace the plugin.
+fn supervise_receive_loop(
+    url: String,
+    passphrase: Option<String>,
+    stdout_lock: Arc<Mutex<()>>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut consecutive_failures = 0_u32;
+    let mut backoff = INITIAL_RECONNECT_BACKOFF;
+
+    while !stop.load(Ordering::Relaxed) {
+        let runtime = match Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                terminate_worker(
+                    "runtime",
+                    &format!("failed to build tokio runtime: {error}"),
+                    0,
+                );
+            }
+        };
+
+        let mut connected_at = None;
+        let outcome = runtime.block_on(run_receive_loop(
+            url.clone(),
+            passphrase.clone(),
+            &stdout_lock,
+            &stop,
+            &mut connected_at,
+        ));
+        if session_was_stable(connected_at.map(|started| started.elapsed())) {
+            consecutive_failures = 0;
+            backoff = INITIAL_RECONNECT_BACKOFF;
+        }
+
+        let reason = match classify_session_end(outcome, stop.load(Ordering::Relaxed)) {
+            SessionEnd::Stopped => return,
+            SessionEnd::Failed(reason) => reason,
+        };
+        consecutive_failures += 1;
+        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            terminate_worker("transport", &reason, consecutive_failures);
+        }
+        eprintln!(
+            "channel-signal receive worker reconnecting: reason=transport retry_count={consecutive_failures} backoff_ms={} message={reason}",
+            backoff.as_millis()
+        );
+        sleep_until_stopped(&stop, reconnect_backoff(backoff));
+        backoff = std::cmp::min(backoff * 2, MAX_RECONNECT_BACKOFF);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SessionEnd {
+    Stopped,
+    Failed(String),
+}
+
+/// Treat only a requested stop as a healthy session end.
+fn classify_session_end(outcome: Result<()>, stop_requested: bool) -> SessionEnd {
+    if stop_requested {
+        return SessionEnd::Stopped;
+    }
+    match outcome {
+        Ok(()) => SessionEnd::Failed("Signal receive stream ended".to_string()),
+        Err(error) => SessionEnd::Failed(format!("{error:#}")),
+    }
+}
+
+fn terminate_worker(reason: &str, message: &str, retry_count: u32) -> ! {
+    eprintln!(
+        "channel-signal ingress worker terminated: reason={reason} retryable=false retry_count={retry_count} message={message}"
+    );
+    std::process::exit(1);
+}
+
+fn sleep_until_stopped(stop: &AtomicBool, total: Duration) {
+    let mut slept = Duration::ZERO;
+    while slept < total && !stop.load(Ordering::Relaxed) {
+        let step = std::cmp::min(Duration::from_millis(250), total - slept);
+        std::thread::sleep(step);
+        slept += step;
+    }
+}
+
+fn session_was_stable(connected_duration: Option<Duration>) -> bool {
+    connected_duration.is_some_and(|duration| duration >= SESSION_STABILITY_WINDOW)
+}
+
+/// Spread reconnects across processes so replicas that fail together do not
+/// retry in lockstep.
+fn reconnect_backoff(base: Duration) -> Duration {
+    let jitter_bound_ms = (base.as_millis() / 4).max(1) as u64;
+    base.saturating_add(Duration::from_millis(jitter_seed() % jitter_bound_ms))
+}
+
+fn jitter_seed() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut seed = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or_default()
+        ^ u64::from(std::process::id()).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ sequence.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    seed ^= seed >> 30;
+    seed = seed.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    seed ^= seed >> 27;
+    seed = seed.wrapping_mul(0x94d0_49bb_1331_11eb);
+    seed ^ (seed >> 31)
 }
 
 /// Default receive timeout for one-shot `poll_ingress` calls, in
@@ -229,8 +325,9 @@ async fn run_poll_once(
 async fn run_receive_loop(
     url: String,
     passphrase: Option<String>,
-    event_tx: Sender<InboundEventEnvelope>,
-    stop_flag: Arc<AtomicBool>,
+    stdout_lock: &Arc<Mutex<()>>,
+    stop_flag: &AtomicBool,
+    connected_at: &mut Option<Instant>,
 ) -> Result<()> {
     let store =
         SqliteStore::open_with_passphrase(&url, passphrase.as_deref(), OnNewIdentity::Trust)
@@ -244,36 +341,48 @@ async fn run_receive_loop(
         .await
         .map_err(|error| anyhow!("failed to open Signal receive stream: {error}"))?;
     let mut messages = std::pin::pin!(messages);
+    *connected_at = Some(Instant::now());
+
+    // Publish the first heartbeat only after the receive stream opens.
+    emit_events(stdout_lock, Vec::new())?;
+    let mut last_heartbeat = Instant::now();
 
     loop {
         if stop_flag.load(Ordering::Relaxed) {
-            break;
+            return Ok(());
         }
 
         let received = match tokio::time::timeout(RECEIVE_STOP_POLL_INTERVAL, messages.next()).await
         {
-            Ok(Some(received)) => received,
-            Ok(None) => break,
-            Err(_) => continue,
+            Ok(Some(received)) => Some(received),
+            // An unrequested stream end is a transport failure.
+            Ok(None) => return Err(anyhow!("Signal receive stream closed")),
+            Err(_) => None,
         };
 
         if stop_flag.load(Ordering::Relaxed) {
-            break;
+            return Ok(());
         }
-        match received {
-            Received::Content(content) => {
-                if let Some(event) = build_inbound_event_from_content(&content)
-                    && event_tx.send(event).is_err()
-                {
-                    // Outer loop has dropped the receiver; we are
-                    // being torn down.
-                    break;
-                }
+
+        let mut emitted = false;
+        if let Some(Received::Content(content)) = received
+            && let Some(event) = build_inbound_event_from_content(&content)
+        {
+            emit_events(stdout_lock, vec![event])?;
+            emitted = true;
+        }
+
+        if emitted || last_heartbeat.elapsed() >= LIVENESS_HEARTBEAT_INTERVAL {
+            if !emitted {
+                emit_events(stdout_lock, Vec::new())?;
             }
-            Received::QueueEmpty | Received::Contacts => {}
+            last_heartbeat = Instant::now();
         }
     }
-    Ok(())
+}
+
+fn emit_events(stdout_lock: &Arc<Mutex<()>>, events: Vec<InboundEventEnvelope>) -> Result<()> {
+    crate::emit_channel_event_notifications(stdout_lock, events)
 }
 
 /// Convert a Signal `Content` into the Dispatch inbound event shape.
@@ -411,7 +520,6 @@ mod tests {
         let finished = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker_finished = Arc::clone(&finished);
-        let (_event_tx, event_rx) = channel::<InboundEventEnvelope>();
 
         let handle = std::thread::spawn(move || {
             while !worker_stop.load(Ordering::Relaxed) {
@@ -423,10 +531,89 @@ mod tests {
         let worker = IngressWorker {
             stop,
             handle: Some(handle),
-            event_rx,
         };
 
         worker.stop();
         assert!(finished.load(Ordering::Relaxed));
+    }
+
+    /// A receive stream that ends on its own has lost its connection. Treating
+    /// that as a clean exit is what leaves the JSON-RPC parent alive with no
+    /// receiver, silently dropping every later message.
+    #[test]
+    fn a_session_that_ends_without_a_stop_request_is_a_failure() {
+        assert_eq!(
+            classify_session_end(Ok(()), false),
+            SessionEnd::Failed("Signal receive stream ended".to_string())
+        );
+        assert_eq!(
+            classify_session_end(Err(anyhow!("stream closed")), false),
+            SessionEnd::Failed("stream closed".to_string())
+        );
+    }
+
+    /// Shutdown tears the session down too. That must not be counted as a
+    /// supervision failure, or a normal stop would exit the process nonzero.
+    #[test]
+    fn a_session_ended_by_shutdown_is_not_a_failure() {
+        assert_eq!(classify_session_end(Ok(()), true), SessionEnd::Stopped);
+        assert_eq!(
+            classify_session_end(Err(anyhow!("stream closed")), true),
+            SessionEnd::Stopped
+        );
+    }
+
+    /// The heartbeat has to fire several times inside the host's shortest
+    /// liveness grace, otherwise one slow cycle marks a healthy channel dead.
+    #[test]
+    fn heartbeat_cadence_fits_inside_the_host_liveness_grace() {
+        const HOST_MINIMUM_LIVENESS_GRACE: Duration = Duration::from_secs(90);
+        assert!(LIVENESS_HEARTBEAT_INTERVAL * 3 <= HOST_MINIMUM_LIVENESS_GRACE);
+    }
+
+    #[test]
+    fn reconnect_backoff_stays_within_its_jitter_bound() {
+        let base = Duration::from_secs(4);
+        for _ in 0..16 {
+            let delay = reconnect_backoff(base);
+            assert!(delay >= base);
+            assert!(delay < base + Duration::from_millis(1000));
+        }
+    }
+
+    #[test]
+    fn only_an_open_receive_stream_can_clear_failure_history() {
+        assert!(!session_was_stable(None));
+        assert!(!session_was_stable(Some(
+            SESSION_STABILITY_WINDOW - Duration::from_millis(1)
+        )));
+        assert!(session_was_stable(Some(SESSION_STABILITY_WINDOW)));
+    }
+
+    /// The threshold above is only meaningful if the clock starts when the
+    /// stream is genuinely open. Starting it earlier would let a slow store
+    /// open or session load count as connected time and clear the failure
+    /// history for a session that never received anything.
+    ///
+    /// Exercising this needs a live Signal session, so pin the ordering in the
+    /// source until an injectable stream abstraction exists.
+    #[test]
+    fn the_stability_clock_starts_only_after_the_stream_opens() {
+        const SOURCE: &str = include_str!("ingress.rs");
+        let start = SOURCE
+            .find("async fn run_receive_loop(")
+            .expect("run_receive_loop is present");
+        let body = &SOURCE[start..];
+        let stream_open = body
+            .find(".receive_messages()")
+            .expect("the stream is opened in run_receive_loop");
+        let clock_start = body
+            .find("*connected_at = Some(")
+            .expect("the stability clock is armed in run_receive_loop");
+
+        assert!(
+            stream_open < clock_start,
+            "connected_at must be armed after receive_messages() succeeds"
+        );
     }
 }
