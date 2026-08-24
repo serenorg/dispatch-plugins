@@ -7,7 +7,7 @@
 //! constraint (libsignal stores hold `Rc<UnsafeCell<_>>` internally
 //! and cannot cross work-stealing tokio workers).
 //!
-//! For v0.2.0 we support plain text outbound only. The recipient is
+//! Outbound delivery supports plain text. The recipient is
 //! resolved from `message.metadata.conversation_id` first, then
 //! `config.default_recipient`, and must be a Signal ServiceId string
 //! (either a raw ACI UUID or a `PNI:<uuid>` / `ACI:<uuid>` form).
@@ -41,7 +41,7 @@ const SIGNAL_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// configured recipient. Blocks the calling thread until the send
 /// completes or fails.
 ///
-/// For v0.2.0 only `data_base64` attachments are supported. Attachment
+/// Only `data_base64` attachments are supported. Attachment
 /// URLs and storage-key references return an error - dispatch stages
 /// media locally and the caller should inline it as base64.
 pub fn deliver_text_message(

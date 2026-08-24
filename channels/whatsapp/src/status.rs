@@ -113,6 +113,7 @@ fn chat_state_label(state: ChatStateType) -> &'static str {
         ChatStateType::Composing => "composing",
         ChatStateType::Paused => "paused",
         ChatStateType::Recording => "recording",
+        _ => "unknown",
     }
 }
 
@@ -125,7 +126,7 @@ fn parse_recipient_jid(raw: &str) -> Result<Jid> {
 
     if !raw.ends_with("@s.whatsapp.net") && !raw.ends_with("@lid") {
         return Err(anyhow!(
-            "channel-whatsapp v0.2.0 status frames only support direct-message JIDs ending in `@s.whatsapp.net` or `@lid`; got `{raw}`"
+            "channel-whatsapp status frames only support direct-message JIDs ending in `@s.whatsapp.net` or `@lid`; got `{raw}`"
         ));
     }
 
@@ -155,47 +156,15 @@ async fn send_chat_state(sqlite_url: String, recipient: Jid, state: ChatStateTyp
         .wait_for_socket(CONNECT_TIMEOUT)
         .await
         .context("timed out waiting for linked WhatsApp session socket")?;
-    let recipient = resolve_chat_recipient(&client, &recipient).await?;
-
-    match state {
-        ChatStateType::Composing => client
-            .chatstate()
-            .send_composing(&recipient)
-            .await
-            .context("failed to send WhatsApp composing indicator")?,
-        ChatStateType::Paused => client
-            .chatstate()
-            .send_paused(&recipient)
-            .await
-            .context("failed to send WhatsApp paused indicator")?,
-        ChatStateType::Recording => client
-            .chatstate()
-            .send_recording(&recipient)
-            .await
-            .context("failed to send WhatsApp recording indicator")?,
-    }
+    client
+        .chatstate()
+        .send(&recipient, state)
+        .await
+        .context("failed to send WhatsApp chat-state indicator")?;
 
     client.disconnect().await;
     let _ = bot_handle.await;
     Ok(())
-}
-
-async fn resolve_chat_recipient(client: &whatsapp_rust::Client, recipient: &Jid) -> Result<Jid> {
-    if recipient.is_lid()
-        && let Some(phone_number) = client
-            .get_phone_number_from_lid(&recipient.to_string())
-            .await
-    {
-        return format!("{phone_number}@s.whatsapp.net")
-            .parse::<Jid>()
-            .with_context(|| {
-                format!(
-                    "failed to convert mapped WhatsApp phone number `{phone_number}` into a chat JID"
-                )
-            });
-    }
-
-    Ok(recipient.clone())
 }
 
 #[cfg(test)]

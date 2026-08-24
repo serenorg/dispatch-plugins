@@ -1,11 +1,11 @@
 [package]
 name = "channel-whatsapp"
-version = "0.2.0"
-edition = "2024"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 publish = false
 description = "Dispatch channel plugin for WhatsApp via native Rust whatsapp-rust."
-repository = "https://github.com/serenorg/dispatch-channel-whatsapp"
+repository.workspace = true
 keywords = ["dispatch", "channel", "whatsapp", "agents"]
 categories = ["command-line-utilities"]
 
@@ -25,7 +25,8 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1"
 url = "2"
-whatsapp-rust = { version = "0.5", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native", "signal"] }
-whatsapp-rust-sqlite-storage = "0.5"
-whatsapp-rust-tokio-transport = "0.5"
-whatsapp-rust-ureq-http-client = "0.5"
+wacore = { version = "0.6", default-features = false }
+whatsapp-rust = { version = "0.6", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native", "signal"] }
+whatsapp-rust-sqlite-storage = "0.6"
+whatsapp-rust-tokio-transport = "0.6"
+whatsapp-rust-ureq-http-client = "0.6"

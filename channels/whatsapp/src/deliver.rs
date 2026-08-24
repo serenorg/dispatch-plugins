@@ -8,7 +8,7 @@ use whatsapp_rust::TokioRuntime;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::download::MediaType;
 use whatsapp_rust::store::SqliteStore;
-use whatsapp_rust::upload::UploadResponse;
+use whatsapp_rust::upload::{UploadOptions, UploadResponse};
 use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
@@ -150,7 +150,7 @@ fn prepare_outbound_payload(message: &OutboundMessage) -> Result<PreparedSend> {
         [attachment] => Some(prepare_outbound_attachment(attachment)?),
         _ => {
             return Err(anyhow!(
-                "channel-whatsapp v0.2.0 supports at most one outbound attachment per message"
+                "channel-whatsapp supports at most one outbound attachment per message"
             ));
         }
     };
@@ -166,7 +166,7 @@ fn prepare_outbound_payload(message: &OutboundMessage) -> Result<PreparedSend> {
         && !attachment.kind.supports_caption()
     {
         return Err(anyhow!(
-            "channel-whatsapp audio attachments cannot include `message.content` in v0.2.0; send the text separately or send the file as a document attachment"
+            "channel-whatsapp audio attachments cannot include `message.content`; send the text separately or send the file as a document attachment"
         ));
     }
 
@@ -179,7 +179,7 @@ fn prepare_outbound_payload(message: &OutboundMessage) -> Result<PreparedSend> {
 fn prepare_outbound_attachment(attachment: &OutboundAttachment) -> Result<PreparedAttachment> {
     if attachment.url.is_some() || attachment.storage_key.is_some() {
         return Err(anyhow!(
-            "channel-whatsapp attachment `{}` must inline `data_base64`; URL and storage-key attachments are not supported in v0.2.0",
+            "channel-whatsapp attachment `{}` must inline `data_base64`; URL and storage-key attachments are not supported",
             attachment.name
         ));
     }
@@ -231,7 +231,6 @@ async fn send_message_inner(
         .wait_for_socket(CONNECT_TIMEOUT)
         .await
         .context("timed out waiting for linked WhatsApp session socket")?;
-    let recipient = resolve_chat_recipient(&client, &recipient).await?;
 
     let outbound = match prepared.attachment {
         Some(attachment) => {
@@ -242,7 +241,7 @@ async fn send_message_inner(
                 bytes,
             } = attachment;
             let upload = client
-                .upload(bytes, kind.media_type())
+                .upload(bytes, kind.media_type(), UploadOptions::default())
                 .await
                 .context("failed to upload WhatsApp attachment")?;
             build_attachment_message(name, mime_type, kind, upload, &prepared.content)?
@@ -261,25 +260,7 @@ async fn send_message_inner(
     tokio::time::sleep(POST_SEND_FLUSH_DELAY).await;
     client.disconnect().await;
     let _ = bot_handle.await;
-    Ok(message_id)
-}
-
-async fn resolve_chat_recipient(client: &whatsapp_rust::Client, recipient: &Jid) -> Result<Jid> {
-    if recipient.is_lid()
-        && let Some(phone_number) = client
-            .get_phone_number_from_lid(&recipient.to_string())
-            .await
-    {
-        return format!("{phone_number}@s.whatsapp.net")
-            .parse::<Jid>()
-            .with_context(|| {
-                format!(
-                    "failed to convert mapped WhatsApp phone number `{phone_number}` into a chat JID"
-                )
-            });
-    }
-
-    Ok(recipient.clone())
+    Ok(message_id.message_id)
 }
 
 fn build_attachment_message(
@@ -296,9 +277,9 @@ fn build_attachment_message(
             image_message: Some(Box::new(wa::message::ImageMessage {
                 url: Some(upload.url),
                 direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key),
-                file_sha256: Some(upload.file_sha256),
-                file_enc_sha256: Some(upload.file_enc_sha256),
+                media_key: Some(upload.media_key.to_vec()),
+                file_sha256: Some(upload.file_sha256.to_vec()),
+                file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
                 file_length: Some(upload.file_length),
                 mimetype: Some(mime_type),
                 caption,
@@ -310,9 +291,9 @@ fn build_attachment_message(
             video_message: Some(Box::new(wa::message::VideoMessage {
                 url: Some(upload.url),
                 direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key),
-                file_sha256: Some(upload.file_sha256),
-                file_enc_sha256: Some(upload.file_enc_sha256),
+                media_key: Some(upload.media_key.to_vec()),
+                file_sha256: Some(upload.file_sha256.to_vec()),
+                file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
                 file_length: Some(upload.file_length),
                 mimetype: Some(mime_type),
                 caption,
@@ -324,9 +305,9 @@ fn build_attachment_message(
             audio_message: Some(Box::new(wa::message::AudioMessage {
                 url: Some(upload.url),
                 direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key),
-                file_sha256: Some(upload.file_sha256),
-                file_enc_sha256: Some(upload.file_enc_sha256),
+                media_key: Some(upload.media_key.to_vec()),
+                file_sha256: Some(upload.file_sha256.to_vec()),
+                file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
                 file_length: Some(upload.file_length),
                 mimetype: Some(mime_type),
                 ptt: Some(false),
@@ -338,9 +319,9 @@ fn build_attachment_message(
             document_message: Some(Box::new(wa::message::DocumentMessage {
                 url: Some(upload.url),
                 direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key),
-                file_sha256: Some(upload.file_sha256),
-                file_enc_sha256: Some(upload.file_enc_sha256),
+                media_key: Some(upload.media_key.to_vec()),
+                file_sha256: Some(upload.file_sha256.to_vec()),
+                file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
                 file_length: Some(upload.file_length),
                 mimetype: Some(mime_type),
                 title: Some(name.clone()),
@@ -386,7 +367,7 @@ fn parse_recipient_jid(raw: &str) -> Result<Jid> {
 
     if !raw.ends_with("@s.whatsapp.net") && !raw.ends_with("@lid") {
         return Err(anyhow!(
-            "channel-whatsapp v0.2.0 only supports direct-message JIDs ending in `@s.whatsapp.net` or `@lid`; got `{raw}`"
+            "channel-whatsapp only supports direct-message JIDs ending in `@s.whatsapp.net` or `@lid`; got `{raw}`"
         ));
     }
 

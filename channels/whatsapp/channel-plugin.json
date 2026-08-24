@@ -7,7 +7,7 @@
   "protocol_version": 1,
   "description": "WhatsApp channel plugin for Dispatch using the native Rust whatsapp-rust client.",
   "entrypoint": {
-    "command": "target/release/channel-whatsapp",
+    "command": "../../target/release/channel-whatsapp",
     "args": []
   },
   "auth": {

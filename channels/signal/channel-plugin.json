@@ -7,7 +7,7 @@
   "protocol_version": 1,
   "description": "Signal channel plugin for Dispatch using the native Rust presage client.",
   "entrypoint": {
-    "command": "target/release/channel-signal",
+    "command": "../../target/release/channel-signal",
     "args": []
   },
   "auth": {

@@ -402,7 +402,7 @@ fn emit_events(stdout_lock: &Arc<Mutex<()>>, events: Vec<InboundEventEnvelope>) 
 }
 
 /// Convert a Signal `Content` into the Dispatch inbound event shape.
-/// For v0.2.0 this handles direct-message text plus attachment
+/// This handles direct-message text plus attachment
 /// metadata. Attachment bytes are NOT downloaded here: `presage`'s
 /// receive stream borrows the Manager mutably, so
 /// `Manager::get_attachment` cannot be called while iterating. The

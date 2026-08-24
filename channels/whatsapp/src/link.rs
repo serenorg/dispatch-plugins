@@ -5,6 +5,7 @@ use qrcode::render::unicode::Dense1x2;
 use serde_json::json;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
+use wacore::store::DevicePropsOverride;
 use whatsapp_rust::TokioRuntime;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::store::SqliteStore;
@@ -123,11 +124,15 @@ pub fn run(options: LinkOptions) -> Result<()> {
             .with_transport_factory(TokioWebSocketTransportFactory::new())
             .with_http_client(UreqHttpClient::new())
             .with_runtime(TokioRuntime)
-            .with_device_props(Some(device_name.clone()), None, Some(PlatformType::Desktop))
-            .on_event(move |event: Event, _client| {
+            .with_device_props(
+                DevicePropsOverride::new()
+                    .with_os(device_name.clone())
+                    .with_platform_type(PlatformType::Desktop),
+            )
+            .on_event(move |event, _client| {
                 let completion = Arc::clone(&completion_events);
                 async move {
-                    match &event {
+                    match &*event {
                         Event::PairingQrCode { code, .. } => {
                             if let Err(error) = render_qr_to_stderr(code) {
                                 eprintln!("warning: failed to render WhatsApp QR code: {error}");

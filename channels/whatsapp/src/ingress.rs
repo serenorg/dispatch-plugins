@@ -424,7 +424,7 @@ async fn build_ingress_bot(
             let account_id = account_id.clone();
             let connection_status = Arc::clone(&connection_status);
             async move {
-                match event {
+                match &*event {
                     Event::Connected(_) => {
                         connection_status.store(CONNECTION_READY, Ordering::Relaxed);
                     }
@@ -436,7 +436,7 @@ async fn build_ingress_bot(
                     }
                     Event::Message(message, info) => {
                         if let Some(inbound) =
-                            build_inbound_event_from_message(&message, &info, &policy, &account_id)
+                            build_inbound_event_from_message(message, info, &policy, &account_id)
                         {
                             let _ = sender.send(inbound);
                         }
