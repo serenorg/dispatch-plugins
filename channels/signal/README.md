@@ -106,7 +106,7 @@ Phone numbers (`+15551234567`) and Signal usernames are not yet accepted on outb
 
 ```bash
 dispatch channel install \
-  https://raw.githubusercontent.com/serenorg/dispatch-channel-signal/v0.1.0/channel-plugin.json
+  https://raw.githubusercontent.com/serenorg/dispatch-channel-signal/v0.2.0/channel-plugin.json
 
 dispatch channel call channel-signal \
   --request-json '{"kind":"health","config":{}}'

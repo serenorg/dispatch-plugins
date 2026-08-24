@@ -2,6 +2,31 @@
 
 All notable changes to the Dispatch Signal channel plugin are documented in this file.
 
+## [0.2.0] - 2026-08-24
+
+### Added
+
+- The receive worker emits an empty `channel.event` notification when its stream opens and every 20 seconds thereafter. These notifications contain no message content and let the host distinguish a quiet Signal channel from a dead receive worker.
+- The README now documents the best-effort inbound delivery guarantee and the missing durability, acknowledgement, and deduplication mechanisms.
+
+### Changed
+
+- The plugin now uses Dispatch channel protocol `v0.5.0`, reports `polling` and `websocket` ingress modes, and populates the typed direct-message authorization and activation fields.
+
+### Fixed
+
+- Persistent ingress writes `channel.event` notifications without waiting for another JSON-RPC request, so inbound messages reach a host that only listens after starting ingress.
+- The receive worker reconnects with bounded exponential backoff and per-attempt jitter instead of ending on the first failure.
+- After five consecutive failures without a sustained receive stream, the plugin exits nonzero so the host can restart the channel. Only an open stream that stays up for one minute clears the failure history.
+- A receive stream that closes on its own is treated as a lost connection. Only a stop request ends the worker healthily.
+- A worker that does not stop within three seconds exits the plugin, which prevents a blocked provider call from stopping process replacement.
+- The `poll_timeout_secs` documentation now correctly states that zero uses the default timeout.
+
+### Security
+
+- Signal direct-message authorization now fails closed. Persistent ingress requires an explicit sender allowlist or `dm_policy: open`; outbound delivery and typing indicators use the same effective recipient scope.
+- Store encryption configuration now rejects empty passphrase environment-variable names and empty passphrase values.
+
 ## [0.1.0] - 2026-04-24
 
 Initial release.

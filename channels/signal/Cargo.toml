@@ -1,6 +1,6 @@
 [package]
 name = "channel-signal"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # channel-signal links against presage, which is AGPL-3.0. The combined
 # binary is therefore distributed under AGPL-3.0.
