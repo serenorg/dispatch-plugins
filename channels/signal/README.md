@@ -6,7 +6,7 @@ A [Dispatch](https://github.com/serenorg/dispatch) channel plugin for Signal, us
 
 > This plugin links against `presage`, which is licensed under AGPL-3.0. The `channel-signal` binary is therefore distributed under AGPL-3.0.
 
-This repository is the source of truth for the first-party Signal channel plugin. The main `dispatch-plugins` repository keeps only a pointer README plus catalog metadata so Signal remains discoverable without carrying its dependency graph inside the standard plugin workspace.
+This directory is the source of truth for the first-party Signal channel plugin. The `dispatch-plugins` workspace builds and releases it with the other first-party channels.
 
 ## Scope
 
@@ -35,7 +35,7 @@ Not yet implemented:
 Build from source. This is not a Rust-only build: the `presage` + `libsignal` dependency stack requires a working `protoc` at build time on every platform, and the bundled SQLCipher/OpenSSL path also requires a native C toolchain. Install `protoc` via `brew install protobuf` on macOS, your distribution's package manager on Linux, or `choco install protoc` on Windows. The `choco` examples assume Chocolatey is already installed; otherwise, install Chocolatey first or place `protoc.exe` and `perl.exe` on `PATH` manually. On Windows, the vendored OpenSSL build also requires `perl` on `PATH` (for example `choco install strawberryperl`) and the MSVC C toolchain from Visual Studio Build Tools. The resulting `channel-signal` binary has no runtime dependencies beyond TLS root certificates.
 
 ```bash
-cargo build --release
+cargo build --release -p channel-signal
 ```
 
 The binary is written to `target/release/channel-signal`.
@@ -105,8 +105,7 @@ Phone numbers (`+15551234567`) and Signal usernames are not yet accepted on outb
 ## Dispatch usage
 
 ```bash
-dispatch channel install \
-  https://raw.githubusercontent.com/serenorg/dispatch-channel-signal/v0.2.0/channel-plugin.json
+dispatch extension install channel-signal
 
 dispatch channel call channel-signal \
   --request-json '{"kind":"health","config":{}}'

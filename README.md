@@ -1,6 +1,6 @@
 # dispatch-plugins
 
-Dispatch channel extensions collected under a single parent directory.
+Dispatch channel extensions built and released together from one workspace.
 
 ## Layout
 
@@ -10,10 +10,12 @@ Dispatch channel extensions collected under a single parent directory.
 - `channels/email` - IMAP + SMTP email plugin
 - `channels/gmail` - Gmail-focused IMAP + SMTP email plugin
 - `channels/outlook` - Outlook / Microsoft 365 IMAP + SMTP email plugin
+- `channels/signal` - native Signal plugin based on presage
 - `channels/slack` - Slack Events API / Socket Mode plugin
 - `channels/telegram` - Telegram Bot API plugin
 - `channels/twilio-sms` - Twilio SMS plugin
 - `channels/webhook` - generic webhook plugin
+- `channels/whatsapp` - native WhatsApp Web plugin based on whatsapp-rust
 - `catalog` - local catalog search and inspection helper
 
 ## Channel availability
@@ -24,10 +26,12 @@ Dispatch channel extensions collected under a single parent directory.
 | `channel-email` | One-shot poll or background ingress session | IMAP polling worker inside the plugin | SMTP delivery |
 | `channel-gmail` | One-shot poll or background ingress session | Gmail IMAP polling worker inside the plugin | Gmail SMTP delivery |
 | `channel-outlook` | One-shot poll or background ingress session | Outlook / Microsoft 365 IMAP polling worker inside the plugin | Outlook / Microsoft 365 SMTP delivery |
+| `channel-signal` | One-shot poll or background ingress session | Native Signal websocket through presage | Native Signal messages and attachments |
 | `channel-slack` | Events API webhook or background Socket Mode session | Host-managed HTTPS callback or Slack Socket Mode websocket | `chat.postMessage` or incoming webhook |
 | `channel-telegram` | Bot API webhook, one-shot poll, or background poll session | Telegram webhook callback or Bot API `getUpdates` | `sendMessage`, `sendPhoto`, `sendDocument` |
 | `channel-twilio-sms` | Twilio webhook only | Host-managed HTTPS callback | Twilio Messages API |
 | `channel-webhook` | Generic webhook only | Host-managed HTTPS callback | JSON `POST` to configured endpoint |
+| `channel-whatsapp` | One-shot poll or background ingress session | Native WhatsApp Web websocket through whatsapp-rust | Native WhatsApp messages and attachments |
 
 ## Dispatch integration
 
@@ -50,10 +54,16 @@ All in-repo plugins build from the repo-root workspace:
 - `cargo check --workspace --locked`
 - `cargo test --workspace --locked`
 
+Signal and WhatsApp require `protoc` during compilation. Signal also requires a native C toolchain and Perl for its bundled SQLCipher and OpenSSL build.
+
 ## Notes
 
 - `channel-schema` remains a repo-local crate for shared manifest and catalog types used by plugin tests and the catalog helper.
 - Email-oriented plugins are still channels in Dispatch because they surface inbound user-originated messages and outbound replies through the same normalized conversation/event model as chat platforms.
 - Email service variants stay service-specific at the plugin layer: `channel-email`, `channel-gmail`, and `channel-outlook`. Broader provider umbrellas such as Google or Microsoft can exist later as separate connector or tool surfaces without overloading the channel naming.
-- `catalog/extensions.json` acts as the local catalog seed for install/search tooling and normalizes the plugin manifests into one searchable index. It covers only the plugins built and released from this repository; other first-party channel plugins (for example Signal and WhatsApp) ship from standalone repositories with their own catalogs. See [`dispatch/docs/plugin-ecosystem.md`](https://github.com/serenorg/dispatch/blob/main/docs/plugin-ecosystem.md) for the curated index of first-party plugin repositories.
+- `catalog/extensions.json` acts as the local catalog seed for install and search tools. It includes all channel plugins that this repository builds and releases.
 - The protocol surface may still change as Dispatch hardens the channel runtime, so it should not yet be treated as a stable Dispatch core compatibility contract.
+
+## License
+
+The workspace uses the MIT License except for `channel-signal`. The `channel-signal` binary links to `presage` and uses the AGPL-3.0 license. See `channels/signal/LICENSE`.

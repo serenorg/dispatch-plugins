@@ -1,10 +1,10 @@
 # channel-whatsapp
 
-A [Dispatch](https://github.com/serenorg/dispatch) channel plugin for WhatsApp, using the native Rust [whatsapp-rust](https://github.com/oxidezap/whatsapp-rust) client.
+A [Dispatch](https://github.com/serenorg/dispatch) channel plugin for WhatsApp, using the native Rust [whatsapp-rust](https://github.com/jlucaso1/whatsapp-rust) client.
 
 **No Docker. No Meta Business Account. No Cloud API app. No external daemon.** The plugin is a single Rust binary that links a WhatsApp Web session via QR code and stores that session locally in SQLite.
 
-This repository is the source of truth for the first-party WhatsApp channel plugin. The main `dispatch-plugins` repository keeps only a pointer README plus catalog metadata so WhatsApp remains discoverable without carrying its dependency graph inside the standard plugin workspace.
+This directory is the source of truth for the first-party WhatsApp channel plugin. The `dispatch-plugins` workspace builds and releases it with the other first-party channels.
 
 ## Scope
 
@@ -34,7 +34,7 @@ Not yet implemented:
 Build from source. The `whatsapp-rust` dependency stack requires a working `protoc` at build time on every platform. Install it via `brew install protobuf` on macOS, your distribution's package manager on Linux, or `choco install protoc` on Windows. The `choco` example assumes Chocolatey is already installed; otherwise, install Chocolatey first or place `protoc.exe` on `PATH` manually. The resulting `channel-whatsapp` binary has no runtime dependencies beyond TLS root certificates.
 
 ```bash
-cargo build --release
+cargo build --release -p channel-whatsapp
 ```
 
 The binary is written to `target/release/channel-whatsapp`.
@@ -103,6 +103,8 @@ The intended operator flow is to receive an inbound event first, then reuse `con
 ## Dispatch usage
 
 ```bash
+dispatch extension install channel-whatsapp
+
 dispatch channel call channel-whatsapp \
   --request-json '{"kind":"health","config":{}}'
 
