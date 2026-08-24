@@ -438,6 +438,7 @@ fn build_inbound_event(
         actor,
         message,
         account_id,
+        activation: None,
         metadata,
     })
 }
@@ -465,11 +466,25 @@ fn resolve_conversation(payload: &IngressPayload, body: Option<&Value>) -> Inbou
         .and_then(|value| lookup_string(value, &["parent_message_id"]))
         .or_else(|| nested_string(body, &["conversation", "parent_message_id"]));
 
+    let workspace_id = body
+        .and_then(|value| lookup_string(value, &["workspace_id"]))
+        .or_else(|| nested_string(body, &["conversation", "workspace_id"]))
+        .or_else(|| payload.query.get("workspace_id").cloned())
+        .or_else(|| header_value(&payload.headers, "X-Dispatch-Workspace-Id"));
+
+    let parent_conversation_id = body
+        .and_then(|value| lookup_string(value, &["parent_conversation_id"]))
+        .or_else(|| nested_string(body, &["conversation", "parent_conversation_id"]))
+        .or_else(|| payload.query.get("parent_conversation_id").cloned())
+        .or_else(|| header_value(&payload.headers, "X-Dispatch-Parent-Conversation-Id"));
+
     InboundConversationRef {
         id,
         kind,
         thread_id,
         parent_message_id,
+        workspace_id,
+        parent_conversation_id,
     }
 }
 
@@ -746,7 +761,9 @@ mod tests {
                 "conversation": {
                     "id": "customer-123",
                     "kind": "external",
-                    "thread_id": "thread-9"
+                    "thread_id": "thread-9",
+                    "workspace_id": "workspace-4",
+                    "parent_conversation_id": "customer-parent"
                 },
                 "actor": {
                     "id": "acct-7",
@@ -793,6 +810,14 @@ mod tests {
         assert_eq!(event.received_at, "2026-04-11T00:00:00Z");
         assert_eq!(event.conversation.id, "customer-123");
         assert_eq!(event.conversation.thread_id.as_deref(), Some("thread-9"));
+        assert_eq!(
+            event.conversation.workspace_id.as_deref(),
+            Some("workspace-4")
+        );
+        assert_eq!(
+            event.conversation.parent_conversation_id.as_deref(),
+            Some("customer-parent")
+        );
         assert_eq!(event.actor.id, "acct-7");
         assert_eq!(event.actor.display_name.as_deref(), Some("Webhook Sender"));
         assert!(event.actor.is_bot);

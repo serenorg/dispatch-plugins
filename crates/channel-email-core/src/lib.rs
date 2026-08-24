@@ -738,6 +738,8 @@ fn build_inbound_event_inner<P: EmailPreset>(
             kind: CONVERSATION_KIND_EMAIL.to_string(),
             thread_id: Some(subject),
             parent_message_id: reply_to_message_id.clone(),
+            workspace_id: None,
+            parent_conversation_id: None,
         },
         actor: InboundActor {
             id: sender_email,
@@ -755,6 +757,7 @@ fn build_inbound_event_inner<P: EmailPreset>(
             metadata: message_metadata,
         },
         account_id: None,
+        activation: None,
         metadata: event_metadata,
     }))
 }

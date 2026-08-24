@@ -409,6 +409,8 @@ mod tests {
                 kind: "channel".to_string(),
                 thread_id: None,
                 parent_message_id: None,
+                workspace_id: None,
+                parent_conversation_id: None,
             },
             actor: InboundActor {
                 id: "actor-1".to_string(),
@@ -426,6 +428,7 @@ mod tests {
                 metadata: BTreeMap::new(),
             },
             account_id: None,
+            activation: None,
             metadata: BTreeMap::new(),
         }
     }

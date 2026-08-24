@@ -656,7 +656,14 @@ fn channel_policy(config: &ChannelConfig) -> ChannelPolicy {
         owner_id: config.owner_id.clone(),
         allowed_sender_ids: config.allowed_sender_ids.clone(),
         allowed_conversation_ids: config.allowed_chat_ids.clone(),
+        allowed_workspace_ids: Vec::new(),
+        allowed_outbound_conversation_ids: config.allowed_chat_ids.clone(),
+        activation: None,
+        thread_policy: None,
+        allowed_thread_ids: Vec::new(),
         dm_policy: config.dm_policy.clone(),
+        allowed_dm_sender_ids: config.allowed_sender_ids.clone(),
+        reply_delivery: None,
         require_signature_validation: Some(true),
         allow_group_messages: config.allow_group_messages,
         max_attachment_bytes: None,
@@ -889,6 +896,8 @@ fn build_inbound_event(
             kind: message.chat.kind.clone(),
             thread_id: message.message_thread_id.map(|value| value.to_string()),
             parent_message_id: reply_to_message_id.clone(),
+            workspace_id: None,
+            parent_conversation_id: None,
         },
         actor,
         message: InboundMessage {
@@ -900,6 +909,7 @@ fn build_inbound_event(
             metadata: message_metadata,
         },
         account_id: None,
+        activation: None,
         metadata: event_metadata,
     })
 }

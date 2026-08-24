@@ -480,6 +480,8 @@ fn build_inbound_event(
             kind: CONVERSATION_KIND_PHONE_NUMBER.to_string(),
             thread_id: None,
             parent_message_id: None,
+            workspace_id: None,
+            parent_conversation_id: None,
         },
         actor: InboundActor {
             id: from_number.to_string(),
@@ -497,6 +499,7 @@ fn build_inbound_event(
             metadata: message_metadata,
         },
         account_id: param(params, "AccountSid").map(ToOwned::to_owned),
+        activation: None,
         metadata: event_metadata,
     }))
 }
