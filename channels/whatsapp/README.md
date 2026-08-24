@@ -119,7 +119,21 @@ The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Operators normally go 
 ## Ingress model
 
 - `poll_ingress` opens a WhatsApp session, drains queued inbound messages until the idle window or timeout is reached, then exits. This is the one-shot path used by `dispatch channel poll --once`.
-- `start_ingress` / `stop_ingress` run a background receive worker on a dedicated OS thread with its own current-thread tokio runtime. Inbound messages are sent back to the host as `channel.event` notifications between JSON-RPC responses.
+- `start_ingress` / `stop_ingress` run a background receive worker on a dedicated OS thread with its own current-thread tokio runtime. The worker sends inbound messages to the host as `channel.event` notifications without waiting for another JSON-RPC request.
+
+## Delivery guarantee
+
+Inbound delivery is best effort. Messages can be lost or processed more than once. Do not rely on this plugin for messages that must never be lost or duplicated.
+
+`whatsapp-rust` acknowledges a message to WhatsApp after it dispatches its event handlers, and it dispatches them as detached tasks. The plugin handler only places the message on an in-memory channel and returns, so the acknowledgement is not tied to the message reaching the host. The receive worker then writes a `channel.event` notification to stdout. A crash or a failed stdout write after the provider acknowledgement and before that write drops the message: WhatsApp considers it delivered, and the plugin has no local outbox and no replay path.
+
+Redelivery is equally unprotected in the other direction: the host allocates a new execution identifier for every notification and does not claim the provider event id, so a message that did arrive twice would produce two runs and two replies.
+
+Reliable delivery without duplicate runs needs all three of the following, none of which exist yet:
+
+- a host-side claim on `(organization, deployment, binding, platform account, provider event id)` taken before a run is created, so redelivery is collapsed into one run and one reply;
+- an explicit host-acceptance acknowledgement in the channel protocol, so the plugin learns when a notification is durably held rather than merely written;
+- a plugin-side outbox that retains an event until that acknowledgement arrives.
 
 Inbound media is surfaced as attachment metadata:
 

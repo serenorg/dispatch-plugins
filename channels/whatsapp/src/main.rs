@@ -52,16 +52,9 @@ fn main() -> Result<()> {
         let (request_id, envelope) = parse_jsonrpc_request(&line)
             .map_err(|error| anyhow!("failed to parse channel request: {error}"))?;
         let should_exit = matches!(envelope.request, PluginRequest::Shutdown);
-        let response = handle_request(&envelope, &mut ingress_worker);
+        let response = handle_request(&envelope, &stdout_lock, &mut ingress_worker);
         let json = response_to_jsonrpc(&request_id, &response).map_err(|error| anyhow!(error))?;
         write_stdout_line(&stdout_lock, &json)?;
-
-        if let Some(worker) = ingress_worker.as_ref() {
-            let events = worker.drain_pending_events();
-            if !events.is_empty() {
-                emit_channel_event_notifications(&stdout_lock, events)?;
-            }
-        }
 
         if should_exit {
             break;
@@ -76,6 +69,7 @@ fn main() -> Result<()> {
 
 fn handle_request(
     envelope: &PluginRequestEnvelope,
+    stdout_lock: &Arc<Mutex<()>>,
     ingress_worker: &mut Option<IngressWorker>,
 ) -> PluginResponse {
     if envelope.protocol_version != CHANNEL_PLUGIN_PROTOCOL_VERSION {
@@ -102,7 +96,7 @@ fn handle_request(
         PluginRequest::Health { config } => health(config),
         PluginRequest::PollIngress { config, state } => poll_ingress(config, state.as_ref()),
         PluginRequest::StartIngress { config, state } => {
-            start_ingress(config, state.as_ref(), ingress_worker)
+            start_ingress(config, state.as_ref(), stdout_lock, ingress_worker)
         }
         PluginRequest::StopIngress { config, state } => {
             stop_ingress(config, state.as_ref(), ingress_worker)
@@ -149,7 +143,7 @@ fn poll_ingress(config: &ChannelConfig, _state: Option<&IngressState>) -> Plugin
         Ok(events) => PluginResponse::IngressEventsReceived {
             events,
             callback_reply: None,
-            state: Some(running_ingress_state(config)),
+            state: Some(running_ingress_state(config, IngressMode::Polling)),
             poll_after_ms: None,
         },
         Err(error) => plugin_error("poll_ingress_failed", format!("{error:#}")),
@@ -159,17 +153,18 @@ fn poll_ingress(config: &ChannelConfig, _state: Option<&IngressState>) -> Plugin
 fn start_ingress(
     config: &ChannelConfig,
     _restored_state: Option<&IngressState>,
+    stdout_lock: &Arc<Mutex<()>>,
     ingress_worker: &mut Option<IngressWorker>,
 ) -> PluginResponse {
     if let Some(worker) = ingress_worker.take() {
         worker.stop();
     }
 
-    match start_ingress_worker(config) {
+    match start_ingress_worker(config, Arc::clone(stdout_lock)) {
         Ok(worker) => {
             *ingress_worker = Some(worker);
             PluginResponse::IngressStarted {
-                state: running_ingress_state(config),
+                state: running_ingress_state(config, IngressMode::Websocket),
             }
         }
         Err(error) => plugin_error("start_ingress_failed", format!("{error:#}")),
@@ -277,7 +272,7 @@ fn health_report(state: &SessionState) -> HealthReport {
     }
 }
 
-fn running_ingress_state(config: &ChannelConfig) -> IngressState {
+fn running_ingress_state(config: &ChannelConfig, mode: IngressMode) -> IngressState {
     let mut metadata = BTreeMap::new();
     metadata.insert("platform".to_string(), PLATFORM_WHATSAPP.to_string());
     metadata.insert("transport".to_string(), "websocket".to_string());
@@ -291,7 +286,7 @@ fn running_ingress_state(config: &ChannelConfig) -> IngressState {
     }
 
     IngressState {
-        mode: IngressMode::Polling,
+        mode,
         status: "running".to_string(),
         endpoint: None,
         metadata,
@@ -299,7 +294,7 @@ fn running_ingress_state(config: &ChannelConfig) -> IngressState {
 }
 
 fn stopped_ingress_state(config: &ChannelConfig) -> IngressState {
-    let mut state = running_ingress_state(config);
+    let mut state = running_ingress_state(config, IngressMode::Websocket);
     state.status = "stopped".to_string();
     state
 }
@@ -311,7 +306,7 @@ fn not_implemented(kind: &str) -> PluginResponse {
     )
 }
 
-fn emit_channel_event_notifications(
+pub(crate) fn emit_channel_event_notifications(
     stdout_lock: &Arc<Mutex<()>>,
     events: Vec<protocol::InboundEventEnvelope>,
 ) -> Result<()> {
@@ -327,7 +322,7 @@ fn emit_channel_event_notifications(
     write_stdout_line(stdout_lock, &json)
 }
 
-fn write_stdout_line(stdout_lock: &Arc<Mutex<()>>, line: &str) -> Result<()> {
+pub(crate) fn write_stdout_line(stdout_lock: &Arc<Mutex<()>>, line: &str) -> Result<()> {
     let _guard = stdout_lock
         .lock()
         .map_err(|_| anyhow!("stdout lock poisoned"))?;
@@ -335,4 +330,22 @@ fn write_stdout_line(stdout_lock: &Arc<Mutex<()>>, line: &str) -> Result<()> {
     writeln!(stdout, "{line}")?;
     stdout.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ingress_state_reports_the_selected_transport_mode() {
+        let config = ChannelConfig::default();
+        assert_eq!(
+            running_ingress_state(&config, IngressMode::Polling).mode,
+            IngressMode::Polling
+        );
+        assert_eq!(
+            running_ingress_state(&config, IngressMode::Websocket).mode,
+            IngressMode::Websocket
+        );
+    }
 }

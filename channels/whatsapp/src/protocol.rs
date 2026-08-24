@@ -38,7 +38,7 @@ pub fn capabilities() -> ChannelCapabilities {
     ChannelCapabilities {
         plugin_id: "whatsapp".to_string(),
         platform: "whatsapp".to_string(),
-        ingress_modes: vec![IngressMode::Polling],
+        ingress_modes: vec![IngressMode::Polling, IngressMode::Websocket],
         outbound_message_types: vec!["text".to_string()],
         threading_model: ThreadingModel::ChatOrThread,
         attachment_support: true,

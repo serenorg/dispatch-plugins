@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
-dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", tag = "v0.3.0" }
+dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", tag = "v0.4.0" }
 futures = "0.3"
 jiff = "0.2"
 qrcode = { version = "0.14", default-features = false }

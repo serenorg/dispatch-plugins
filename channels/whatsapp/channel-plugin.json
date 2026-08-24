@@ -17,7 +17,7 @@
   "capabilities": {
     "channel": {
       "platform": "whatsapp",
-      "ingress_modes": ["polling"],
+      "ingress_modes": ["polling", "websocket"],
       "outbound_message_types": ["text"],
       "threading_model": "chat_or_thread",
       "attachment_support": true,
