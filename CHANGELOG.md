@@ -2,6 +2,24 @@
 
 All notable changes to Dispatch Plugins are documented in this file.
 
+## [0.4.0] - 2026-08-24
+
+### Added
+
+- The native Signal plugin based on `presage` now ships in this repository. It supports linked accounts, polling and websocket ingress, direct-message policy, delivery, attachments, and typing indicators.
+- The native WhatsApp Web plugin based on `whatsapp-rust` now ships in this repository. It supports linked accounts, polling and websocket ingress, direct-message policy, delivery, attachments, and typing indicators.
+
+### Changed
+
+- Signal and WhatsApp now use the shared workspace version, lockfile, catalog, CI matrix, release tag, checksums, and GitHub release assets.
+- WhatsApp now uses `whatsapp-rust` 0.6, the newest release that shares the `libsqlite3-sys` 0.36 native link required by Signal.
+- Signal now pins the previously tested `presage` revision instead of following its mutable `main` branch.
+
+### Notes
+
+- Version 0.2.0 remains the final standalone Signal and WhatsApp release. Existing standalone tags and assets remain available for installed manifests.
+- The workspace uses the MIT License except for `channel-signal`. The `channel-signal` binary links to `presage` and uses the AGPL-3.0 license.
+
 ## [0.3.0] - 2026-08-24
 
 ### Added
