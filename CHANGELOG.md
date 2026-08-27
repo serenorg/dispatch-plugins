@@ -2,6 +2,26 @@
 
 All notable changes to Dispatch Plugins are documented in this file.
 
+## [0.5.0] - 2026-08-27
+
+### Added
+
+- Discord ingress state now records content-free counters and timestamps for gateway frames, message decisions, emitted notifications, and stable rejection reasons.
+- Discord ingress state now reports `event_path_degraded` separately from websocket and heartbeat health. Message decode and event delivery failures set the flag, and a successful event delivery clears it.
+- Delivery receipts from every channel plugin now carry receipt-bound message references, using provider-issued conversation, message, and thread coordinates when the provider exposes them.
+- Slack bot-token delivery now supports authorized exact-message read-back and permalink resolution. Incoming-webhook delivery reports that read-back is unavailable because Slack does not return message coordinates for those requests.
+
+### Changed
+
+- All channel plugins now target Dispatch channel protocol `v0.6.0`.
+- **Breaking:** `DeliveryReceipt` now contains a required `reference: MessageRef`. Rust plugin code that accessed receipt coordinates directly must use `receipt.reference`, and delivery producers must provide a message reference.
+
+### Fixed
+
+- Discord gateway ingress now accepts an authorized direct mention when channel classification is unavailable and the channel is explicitly allowed. Provider-classified threads still use the thread policy.
+- Slack thread-reply read-back now accepts the bounded parent-plus-reply response and still requires an exact timestamp match.
+- Slack read-back now distinguishes documented message absence from provider errors, visibility failures, and authorization failures instead of reporting operational failures as missing messages.
+
 ## [0.4.0] - 2026-08-24
 
 ### Added
