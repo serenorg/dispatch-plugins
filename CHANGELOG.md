@@ -2,6 +2,18 @@
 
 All notable changes to Dispatch Plugins are documented in this file.
 
+## [0.5.0] - 2026-08-26
+
+### Fixed
+
+- The Discord websocket gateway no longer silently drops an authorized direct mention when the per-message channel classification is unavailable. A gateway `MESSAGE_CREATE` carries no channel object, so an explicitly allow-listed channel is now placed from the guild id already validated against `allowed_guild_ids` when `GET /channels/{id}` cannot be resolved, instead of failing closed as an unresolved conversation. A channel the API reports as a thread still answers to thread policy, so fail-closed authorization is unchanged.
+
+### Added
+
+- The Discord websocket gateway records always-on, content-free ingress counters and freshness timestamps in ingress state: dispatch frames by type, decoded and accepted `MESSAGE_CREATE`, emitted notifications, and rejections keyed by the stable reason vocabulary. These no longer depend on the `DISCORD_GATEWAY_DEBUG` flag, so an operator can distinguish `not_addressed`, `unauthorized_channel`, `empty_message`, `decode_error`, and `notification_write_error` from health alone.
+- Discord ingress state now reports a separate `event_path_ready` flag for the actionable message-to-notification path, distinct from websocket heartbeat and dispatch-frame freshness. A malformed frame degrades it, and a fresh heartbeat ACK never clears a known decode or emission failure.
+- A release-gated integration test drives the packaged `channel-discord` binary through a protocol-faithful fake gateway (`HELLO` → `READY` → `MESSAGE_CREATE`), proving a notification crosses the stdio boundary for an authorized direct mention and that every rejection is counted without a debug flag.
+
 ## [0.4.0] - 2026-08-24
 
 ### Added
