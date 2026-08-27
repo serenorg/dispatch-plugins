@@ -4,6 +4,10 @@ use std::io::Read;
 use ureq::unversioned::multipart::{Form, Part};
 
 const DEFAULT_API_BASE: &str = "https://discord.com/api/v10";
+/// Test-only seam mirroring the gateway URL override: when set, REST calls go to
+/// this base instead of Discord's. Never set in production, so the base is
+/// otherwise fixed and the bot token still authorizes every request.
+const API_BASE_URL_ENV: &str = "DISCORD_API_BASE_URL";
 
 #[derive(Debug)]
 pub struct DiscordClient {
@@ -49,9 +53,13 @@ impl DiscordClient {
     pub fn from_env(bot_token_env: &str) -> Result<Self> {
         let bot_token = std::env::var(bot_token_env)
             .with_context(|| format!("{bot_token_env} is required for the discord channel"))?;
+        let base_url = match std::env::var(API_BASE_URL_ENV) {
+            Ok(base) if !base.trim().is_empty() => base,
+            _ => DEFAULT_API_BASE.to_string(),
+        };
         Ok(Self {
             bot_token,
-            base_url: DEFAULT_API_BASE.to_string(),
+            base_url,
         })
     }
 
