@@ -129,6 +129,10 @@ fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
         PluginRequest::Push { config, message } => Ok(PluginResponse::Pushed {
             delivery: deliver(config, message)?,
         }),
+        PluginRequest::GetMessage { .. } | PluginRequest::GetPermalink { .. } => Ok(plugin_error(
+            "unsupported_request",
+            "twilio sms does not support message read-back",
+        )),
         PluginRequest::IngressEvent {
             config, payload, ..
         } => handle_ingress_event(config, payload),
@@ -349,6 +353,7 @@ fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<Delivery
     }
 
     Ok(DeliveryReceipt {
+        message_ref: None,
         message_id: sent.sid,
         conversation_id: sent.to,
         metadata,

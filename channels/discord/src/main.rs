@@ -290,6 +290,10 @@ fn handle_request(
         PluginRequest::Push { config, message } => Ok(PluginResponse::Pushed {
             delivery: deliver(config, message)?,
         }),
+        PluginRequest::GetMessage { .. } | PluginRequest::GetPermalink { .. } => Ok(plugin_error(
+            "unsupported_request",
+            "discord does not support message read-back",
+        )),
         PluginRequest::IngressEvent {
             config, payload, ..
         } => handle_ingress_event(config, payload),
@@ -2518,6 +2522,7 @@ fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<Delivery
     }
 
     Ok(DeliveryReceipt {
+        message_ref: None,
         message_id: posted.id,
         conversation_id: posted.channel_id,
         metadata,

@@ -100,6 +100,7 @@ pub fn deliver_text_message(
     metadata.insert("signal_timestamp_ms".to_string(), timestamp_ms.to_string());
     metadata.insert("attachment_count".to_string(), attachment_count.to_string());
     Ok(DeliveryReceipt {
+        message_ref: None,
         message_id: timestamp_ms.to_string(),
         conversation_id: recipient_raw,
         metadata,

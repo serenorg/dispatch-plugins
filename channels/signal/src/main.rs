@@ -120,6 +120,10 @@ fn handle_request(
         PluginRequest::Push { config, message } => {
             send_signal_message(config, message, DeliveryKind::Push)
         }
+        PluginRequest::GetMessage { .. } | PluginRequest::GetPermalink { .. } => plugin_error(
+            "unsupported_request",
+            "signal does not support message read-back",
+        ),
         PluginRequest::IngressEvent { .. } => not_implemented("ingress_event"),
         PluginRequest::Status { config, update } => {
             let policy = match SignalChannelPolicy::from_config(config) {

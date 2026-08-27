@@ -137,6 +137,7 @@ pub fn deliver_text_message(
     }
 
     Ok(DeliveryReceipt {
+        message_ref: None,
         message_id: sent,
         conversation_id: recipient_raw,
         metadata,

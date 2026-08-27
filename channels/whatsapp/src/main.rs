@@ -110,6 +110,10 @@ fn handle_request(
         PluginRequest::Push { config, message } => {
             send_whatsapp_message(config, message, DeliveryKind::Push)
         }
+        PluginRequest::GetMessage { .. } | PluginRequest::GetPermalink { .. } => plugin_error(
+            "unsupported_request",
+            "whatsapp does not support message read-back",
+        ),
         PluginRequest::Status { config, update, .. } => handle_status(config, update),
     }
 }
