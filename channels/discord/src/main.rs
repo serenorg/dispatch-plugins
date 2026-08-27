@@ -85,6 +85,25 @@ const META_CHANNEL_WILDCARD: &str = "channel_wildcard";
 const META_BOT_USER_ID: &str = "bot_user_id";
 const META_PARENT_CHANNEL_ID: &str = "parent_channel_id";
 
+// Content-free ingress health metadata.
+const META_FRAMES_TOTAL: &str = "frames_dispatch_total";
+const META_FRAMES_MESSAGE_CREATE: &str = "frames_message_create";
+const META_FRAMES_READY: &str = "frames_ready";
+const META_FRAMES_OTHER_DISPATCH: &str = "frames_other_dispatch";
+const META_MESSAGES_DECODED: &str = "messages_decoded";
+const META_MESSAGE_DECODE_ERRORS: &str = "message_decode_errors";
+const META_MESSAGES_ACCEPTED: &str = "messages_accepted";
+const META_NOTIFICATIONS_EMITTED: &str = "notifications_emitted";
+const META_LAST_DISPATCH_FRAME_AT: &str = "last_dispatch_frame_at";
+const META_LAST_MESSAGE_FRAME_AT: &str = "last_message_frame_at";
+const META_LAST_HEARTBEAT_AT: &str = "last_heartbeat_at";
+const META_LAST_NOTIFICATION_AT: &str = "last_notification_at";
+/// True while a decode or event delivery failure remains unresolved. Reports
+/// only observed failures; it never claims an unproven healthy path.
+const META_EVENT_PATH_DEGRADED: &str = "event_path_degraded";
+/// Prefix for stable rejection counters.
+const META_REJECT_PREFIX: &str = "reject_";
+
 const PLATFORM_DISCORD: &str = "discord";
 const ROUTE_CONVERSATION_ID: &str = "conversation_id";
 const ROUTE_THREAD_ID: &str = "thread_id";
@@ -163,6 +182,8 @@ const REJECT_APPLICATION_MISMATCH: &str = "application_mismatch";
 const REJECT_INVALID_POLICY: &str = "invalid_policy";
 const REJECT_MISSING_DESTINATION: &str = "missing_destination";
 const REJECT_UNAUTHORIZED_DESTINATION: &str = "unauthorized_destination";
+/// A channel event notification could not be written to the host.
+const REJECT_NOTIFICATION_WRITE: &str = "notification_write_error";
 
 // Discord channel type discriminants used to separate channels from threads.
 const CHANNEL_TYPE_ANNOUNCEMENT_THREAD: u8 = 10;
@@ -619,6 +640,13 @@ impl DiscordPolicy {
                 .any(|allowed| allowed == channel_id)
     }
 
+    /// Return true only for an exact channel allowlist entry.
+    fn channel_is_explicitly_allowed(&self, channel_id: &str) -> bool {
+        self.allowed_channel_ids
+            .iter()
+            .any(|allowed| allowed == channel_id)
+    }
+
     fn thread_is_listed(&self, thread_id: &str) -> bool {
         self.allowed_thread_ids
             .iter()
@@ -879,6 +907,52 @@ fn store_cached_channel(channel_id: &str, info: &DiscordChannelInfo) {
     );
 }
 
+/// Why a conversation could not be placed.
+enum ScopeError {
+    /// The provider supplied no shape and the channel lookup failed, so the
+    /// conversation is unclassified rather than rejected by policy.
+    LookupUnavailable,
+    /// Placement was decided against, with its stable rejection reason.
+    Rejected(&'static str),
+}
+
+/// Resolve provider shape before using an exact configured channel as fallback.
+///
+/// The fallback applies only to gateway messages whose shape lookup was
+/// unavailable: a provider-classified conversation is never reclassified, an
+/// interaction with no channel object stays fail-closed, the channel wildcard
+/// never qualifies, and the guild id was already validated by the caller.
+fn resolve_candidate_scope(
+    policy: &DiscordPolicy,
+    candidate: &InboundCandidate<'_>,
+    lookup: &dyn DiscordChannelLookup,
+) -> Result<ConversationScope, &'static str> {
+    match resolve_conversation_scope(
+        candidate.channel_id,
+        candidate.guild_id,
+        &candidate.hint,
+        lookup,
+    ) {
+        Ok(scope) => Ok(scope),
+        Err(ScopeError::Rejected(reason)) => Err(reason),
+        Err(ScopeError::LookupUnavailable) => {
+            if matches!(candidate.surface, CandidateSurface::Message { .. })
+                && policy.channel_is_explicitly_allowed(candidate.channel_id)
+                && let Some(guild_id) = candidate.guild_id
+            {
+                Ok(ConversationScope {
+                    id: candidate.channel_id.to_string(),
+                    kind: ConversationKind::Channel,
+                    workspace_id: Some(guild_id.to_string()),
+                    parent_conversation_id: None,
+                })
+            } else {
+                Err(REJECT_UNRESOLVED_CONVERSATION)
+            }
+        }
+    }
+}
+
 /// Resolve which conversation an event belongs to and prove thread parentage.
 ///
 /// Returns a rejection code when the conversation cannot be placed, because an
@@ -888,7 +962,7 @@ fn resolve_conversation_scope(
     guild_id: Option<&str>,
     hint: &ChannelHint,
     lookup: &dyn DiscordChannelLookup,
-) -> Result<ConversationScope, &'static str> {
+) -> Result<ConversationScope, ScopeError> {
     let Some(guild_id) = guild_id else {
         return Ok(ConversationScope {
             id: channel_id.to_string(),
@@ -906,7 +980,7 @@ fn resolve_conversation_scope(
     };
 
     if hint.kind.is_none() && hint.parent_id.is_some() {
-        return Err(REJECT_UNRESOLVED_CONVERSATION);
+        return Err(ScopeError::Rejected(REJECT_UNRESOLVED_CONVERSATION));
     }
 
     if let Some(is_thread) = hint.is_thread() {
@@ -914,7 +988,7 @@ fn resolve_conversation_scope(
             return Ok(channel_scope(None, ConversationKind::Channel));
         }
         let Some(parent_id) = hint.parent_id.clone() else {
-            return Err(REJECT_UNRESOLVED_CONVERSATION);
+            return Err(ScopeError::Rejected(REJECT_UNRESOLVED_CONVERSATION));
         };
         return Ok(channel_scope(Some(parent_id), ConversationKind::Thread));
     }
@@ -923,16 +997,18 @@ fn resolve_conversation_scope(
     // thread policy; the wildcard names channels only and cannot erase a deny
     // or allowlist decision for child threads.
     let Ok(info) = lookup.channel(channel_id) else {
-        return Err(REJECT_UNRESOLVED_CONVERSATION);
+        return Err(ScopeError::LookupUnavailable);
     };
     if info.guild_id.as_deref() != Some(guild_id) {
-        return Err(REJECT_UNAUTHORIZED_WORKSPACE);
+        return Err(ScopeError::Rejected(REJECT_UNAUTHORIZED_WORKSPACE));
     }
     if !is_thread_channel_type(info.kind) {
         return Ok(channel_scope(None, ConversationKind::Channel));
     }
+    // A resolved thread with no reported parent is still a thread; it must not
+    // fall back to a channel placement.
     let Some(parent_id) = info.parent_id else {
-        return Err(REJECT_UNRESOLVED_CONVERSATION);
+        return Err(ScopeError::Rejected(REJECT_UNRESOLVED_CONVERSATION));
     };
     Ok(channel_scope(Some(parent_id), ConversationKind::Thread))
 }
@@ -1021,12 +1097,7 @@ fn evaluate_inbound(
     }
 
     // 3. Conversation scope, including which allowlist a thread answers to.
-    let scope = resolve_conversation_scope(
-        candidate.channel_id,
-        candidate.guild_id,
-        &candidate.hint,
-        lookup,
-    )?;
+    let scope = resolve_candidate_scope(policy, candidate, lookup)?;
     match scope.kind {
         ConversationKind::Channel => {
             if !policy.channel_is_allowed(&scope.id) {
@@ -1469,7 +1540,7 @@ fn discord_websocket_receive(
                 close_discord_websocket_for_reconnect(&mut socket);
                 return Ok(discord_gateway_action_response(
                     DiscordGatewayAction::Reconnect,
-                    &session,
+                    &mut session,
                 ));
             }
             send_discord_session_heartbeat(&mut socket, &mut session)?;
@@ -1490,7 +1561,7 @@ fn discord_websocket_receive(
                     &mut session,
                     client.bot_token(),
                 )? {
-                    return Ok(discord_gateway_action_response(action, &session));
+                    return Ok(discord_gateway_action_response(action, &mut session));
                 }
             }
             Ok(Message::Binary(bytes)) => {
@@ -1503,7 +1574,7 @@ fn discord_websocket_receive(
                     &mut session,
                     client.bot_token(),
                 )? {
-                    return Ok(discord_gateway_action_response(action, &session));
+                    return Ok(discord_gateway_action_response(action, &mut session));
                 }
             }
             Ok(Message::Ping(payload)) => {
@@ -1600,6 +1671,14 @@ fn run_discord_websocket_worker(
                 failure_backoff = Duration::from_secs(1);
             }
             Err(error) => {
+                // Resume from the last published state so counters recorded in
+                // the failed session, including the failure itself, survive the
+                // reconnect instead of rolling back to the session's start.
+                if let Ok(guard) = shared_state.lock()
+                    && guard.is_some()
+                {
+                    state = guard.clone();
+                }
                 consecutive_failures += 1;
                 if consecutive_failures >= DISCORD_MAX_CONSECUTIVE_FAILURES {
                     eprintln!(
@@ -1614,6 +1693,59 @@ fn run_discord_websocket_worker(
             }
         }
         sleep_until_stopped(&stop, Duration::from_secs(1));
+    }
+}
+
+/// Emit an action and publish the resulting state.
+fn apply_gateway_action(
+    action: DiscordGatewayAction,
+    session: &mut DiscordGatewaySession,
+    shared_state: &Arc<Mutex<Option<IngressState>>>,
+    stdout_lock: &Arc<Mutex<()>>,
+    healthy_since: &mut Option<Instant>,
+) -> Result<Option<IngressState>> {
+    match action {
+        DiscordGatewayAction::Event(event) => {
+            emit_gateway_notification(session, shared_state, stdout_lock, vec![*event])?;
+            healthy_since.get_or_insert_with(Instant::now);
+            Ok(None)
+        }
+        DiscordGatewayAction::Heartbeat => {
+            emit_gateway_notification(session, shared_state, stdout_lock, Vec::new())?;
+            healthy_since.get_or_insert_with(Instant::now);
+            Ok(None)
+        }
+        DiscordGatewayAction::Reconnect => {
+            let state = session.to_state("reconnect");
+            set_worker_state(shared_state, state.clone());
+            Ok(Some(state))
+        }
+    }
+}
+
+fn emit_gateway_notification(
+    session: &mut DiscordGatewaySession,
+    shared_state: &Arc<Mutex<Option<IngressState>>>,
+    stdout_lock: &Arc<Mutex<()>>,
+    events: Vec<InboundEventEnvelope>,
+) -> Result<()> {
+    let counters_before = session.counters.clone();
+    if !events.is_empty() {
+        session.counters.record_emitted();
+    }
+    let state = session.to_state("running");
+    match emit_channel_event_notification(stdout_lock, events, Some(state.clone()), Some(0)) {
+        Ok(()) => {
+            set_worker_state(shared_state, state);
+            Ok(())
+        }
+        Err(error) => {
+            session.counters = counters_before;
+            session.counters.record_rejection(REJECT_NOTIFICATION_WRITE);
+            session.counters.mark_emission_failed();
+            set_worker_state(shared_state, session.to_state("running"));
+            Err(error)
+        }
     }
 }
 
@@ -1667,36 +1799,14 @@ fn run_discord_websocket_session(
                     text.as_str(),
                     &mut session,
                     client.bot_token(),
+                )? && let Some(state) = apply_gateway_action(
+                    action,
+                    &mut session,
+                    shared_state,
+                    stdout_lock,
+                    &mut *healthy_since,
                 )? {
-                    match action {
-                        DiscordGatewayAction::Event(event) => {
-                            healthy_since.get_or_insert_with(Instant::now);
-                            let state = session.to_state("running");
-                            set_worker_state(shared_state, state.clone());
-                            emit_channel_event_notification(
-                                stdout_lock,
-                                vec![*event],
-                                Some(state),
-                                Some(0),
-                            )?;
-                        }
-                        DiscordGatewayAction::Heartbeat => {
-                            healthy_since.get_or_insert_with(Instant::now);
-                            let state = session.to_state("running");
-                            set_worker_state(shared_state, state.clone());
-                            emit_channel_event_notification(
-                                stdout_lock,
-                                Vec::new(),
-                                Some(state),
-                                Some(0),
-                            )?;
-                        }
-                        DiscordGatewayAction::Reconnect => {
-                            let state = session.to_state("reconnect");
-                            set_worker_state(shared_state, state.clone());
-                            return Ok(state);
-                        }
-                    }
+                    return Ok(state);
                 }
             }
             Ok(Message::Binary(bytes)) => {
@@ -1708,36 +1818,14 @@ fn run_discord_websocket_session(
                     text,
                     &mut session,
                     client.bot_token(),
+                )? && let Some(state) = apply_gateway_action(
+                    action,
+                    &mut session,
+                    shared_state,
+                    stdout_lock,
+                    &mut *healthy_since,
                 )? {
-                    match action {
-                        DiscordGatewayAction::Event(event) => {
-                            healthy_since.get_or_insert_with(Instant::now);
-                            let state = session.to_state("running");
-                            set_worker_state(shared_state, state.clone());
-                            emit_channel_event_notification(
-                                stdout_lock,
-                                vec![*event],
-                                Some(state),
-                                Some(0),
-                            )?;
-                        }
-                        DiscordGatewayAction::Heartbeat => {
-                            healthy_since.get_or_insert_with(Instant::now);
-                            let state = session.to_state("running");
-                            set_worker_state(shared_state, state.clone());
-                            emit_channel_event_notification(
-                                stdout_lock,
-                                Vec::new(),
-                                Some(state),
-                                Some(0),
-                            )?;
-                        }
-                        DiscordGatewayAction::Reconnect => {
-                            let state = session.to_state("reconnect");
-                            set_worker_state(shared_state, state.clone());
-                            return Ok(state);
-                        }
-                    }
+                    return Ok(state);
                 }
             }
             Ok(Message::Ping(payload)) => {
@@ -1808,17 +1896,197 @@ fn emit_channel_event_notification(
     write_stdout_line(stdout_lock, &json).context("failed to write channel event notification")
 }
 
+/// Dispatch frame class used by content-free counters.
+#[derive(Clone, Copy)]
+enum GatewayFrameKind {
+    MessageCreate,
+    Ready,
+    OtherDispatch,
+}
+
+/// Content-free ingress counters persisted through state metadata.
+#[derive(Debug, Clone, Default)]
+struct GatewayCounters {
+    frames_total: u64,
+    frames_message_create: u64,
+    frames_ready: u64,
+    frames_other_dispatch: u64,
+    messages_decoded: u64,
+    message_decode_errors: u64,
+    messages_accepted: u64,
+    notifications_emitted: u64,
+    rejections: BTreeMap<String, u64>,
+    last_dispatch_frame_at: Option<String>,
+    last_message_frame_at: Option<String>,
+    last_heartbeat_at: Option<String>,
+    last_notification_at: Option<String>,
+    /// Cleared only after an event notification succeeds.
+    event_path_degraded: bool,
+}
+
+impl GatewayCounters {
+    fn record_frame(&mut self, kind: GatewayFrameKind) {
+        self.frames_total = self.frames_total.saturating_add(1);
+        match kind {
+            GatewayFrameKind::MessageCreate => {
+                self.frames_message_create = self.frames_message_create.saturating_add(1);
+                self.last_message_frame_at = Some(now_timestamp());
+            }
+            GatewayFrameKind::Ready => {
+                self.frames_ready = self.frames_ready.saturating_add(1);
+            }
+            GatewayFrameKind::OtherDispatch => {
+                self.frames_other_dispatch = self.frames_other_dispatch.saturating_add(1);
+            }
+        }
+        self.last_dispatch_frame_at = Some(now_timestamp());
+    }
+
+    fn record_decoded(&mut self) {
+        self.messages_decoded = self.messages_decoded.saturating_add(1);
+    }
+
+    fn record_decode_error(&mut self) {
+        self.message_decode_errors = self.message_decode_errors.saturating_add(1);
+        self.event_path_degraded = true;
+    }
+
+    fn record_accepted(&mut self) {
+        self.messages_accepted = self.messages_accepted.saturating_add(1);
+    }
+
+    fn record_emitted(&mut self) {
+        self.notifications_emitted = self.notifications_emitted.saturating_add(1);
+        self.last_notification_at = Some(now_timestamp());
+        self.event_path_degraded = false;
+    }
+
+    fn record_rejection(&mut self, reason: &str) {
+        let count = self.rejections.entry(reason.to_string()).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+
+    fn record_heartbeat(&mut self) {
+        self.last_heartbeat_at = Some(now_timestamp());
+    }
+
+    fn mark_emission_failed(&mut self) {
+        self.event_path_degraded = true;
+    }
+
+    /// Write counters and the degraded flag to ingress metadata.
+    fn write_metadata(&self, metadata: &mut BTreeMap<String, String>) {
+        metadata.insert(META_FRAMES_TOTAL.to_string(), self.frames_total.to_string());
+        metadata.insert(
+            META_FRAMES_MESSAGE_CREATE.to_string(),
+            self.frames_message_create.to_string(),
+        );
+        metadata.insert(META_FRAMES_READY.to_string(), self.frames_ready.to_string());
+        metadata.insert(
+            META_FRAMES_OTHER_DISPATCH.to_string(),
+            self.frames_other_dispatch.to_string(),
+        );
+        metadata.insert(
+            META_MESSAGES_DECODED.to_string(),
+            self.messages_decoded.to_string(),
+        );
+        metadata.insert(
+            META_MESSAGE_DECODE_ERRORS.to_string(),
+            self.message_decode_errors.to_string(),
+        );
+        metadata.insert(
+            META_MESSAGES_ACCEPTED.to_string(),
+            self.messages_accepted.to_string(),
+        );
+        metadata.insert(
+            META_NOTIFICATIONS_EMITTED.to_string(),
+            self.notifications_emitted.to_string(),
+        );
+        metadata.insert(
+            META_EVENT_PATH_DEGRADED.to_string(),
+            self.event_path_degraded.to_string(),
+        );
+        for (reason, count) in &self.rejections {
+            metadata.insert(format!("{META_REJECT_PREFIX}{reason}"), count.to_string());
+        }
+        insert_optional(
+            metadata,
+            META_LAST_DISPATCH_FRAME_AT,
+            &self.last_dispatch_frame_at,
+        );
+        insert_optional(
+            metadata,
+            META_LAST_MESSAGE_FRAME_AT,
+            &self.last_message_frame_at,
+        );
+        insert_optional(metadata, META_LAST_HEARTBEAT_AT, &self.last_heartbeat_at);
+        insert_optional(
+            metadata,
+            META_LAST_NOTIFICATION_AT,
+            &self.last_notification_at,
+        );
+    }
+
+    /// Restore counters from ingress metadata after reconnect.
+    fn from_metadata(metadata: &BTreeMap<String, String>) -> Self {
+        let count = |key: &str| {
+            metadata
+                .get(key)
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let mut rejections = BTreeMap::new();
+        for (key, value) in metadata {
+            if let Some(reason) = key.strip_prefix(META_REJECT_PREFIX)
+                && let Ok(parsed) = value.parse::<u64>()
+            {
+                rejections.insert(reason.to_string(), parsed);
+            }
+        }
+        Self {
+            frames_total: count(META_FRAMES_TOTAL),
+            frames_message_create: count(META_FRAMES_MESSAGE_CREATE),
+            frames_ready: count(META_FRAMES_READY),
+            frames_other_dispatch: count(META_FRAMES_OTHER_DISPATCH),
+            messages_decoded: count(META_MESSAGES_DECODED),
+            message_decode_errors: count(META_MESSAGE_DECODE_ERRORS),
+            messages_accepted: count(META_MESSAGES_ACCEPTED),
+            notifications_emitted: count(META_NOTIFICATIONS_EMITTED),
+            rejections,
+            last_dispatch_frame_at: metadata.get(META_LAST_DISPATCH_FRAME_AT).cloned(),
+            last_message_frame_at: metadata.get(META_LAST_MESSAGE_FRAME_AT).cloned(),
+            last_heartbeat_at: metadata.get(META_LAST_HEARTBEAT_AT).cloned(),
+            last_notification_at: metadata.get(META_LAST_NOTIFICATION_AT).cloned(),
+            event_path_degraded: metadata
+                .get(META_EVENT_PATH_DEGRADED)
+                .map(|value| value == "true")
+                .unwrap_or(false),
+        }
+    }
+}
+
+fn now_timestamp() -> String {
+    Timestamp::now().to_string()
+}
+
+fn insert_optional(metadata: &mut BTreeMap<String, String>, key: &str, value: &Option<String>) {
+    if let Some(value) = value {
+        metadata.insert(key.to_string(), value.clone());
+    }
+}
+
 struct DiscordGatewaySession {
     last_sequence: Option<u64>,
     session_id: Option<String>,
     resume_gateway_url: Option<String>,
-    /// Bot account proven at ingress start, carried across reconnect and resume
-    /// so a resumed session enforces the same identity the first one did.
+    /// Bot account proven at ingress start.
     bot_user_id: Option<String>,
     heartbeat_interval: Duration,
     next_heartbeat: Instant,
     awaiting_heartbeat_ack: bool,
     identified: bool,
+    /// Ingress counters carried across reconnects.
+    counters: GatewayCounters,
 }
 
 impl DiscordGatewaySession {
@@ -1840,6 +2108,9 @@ impl DiscordGatewaySession {
             next_heartbeat: Instant::now() + Duration::from_secs(45),
             awaiting_heartbeat_ack: false,
             identified: false,
+            counters: state
+                .map(|state| GatewayCounters::from_metadata(&state.metadata))
+                .unwrap_or_default(),
         }
     }
 
@@ -1856,13 +2127,15 @@ impl DiscordGatewaySession {
     }
 
     fn to_state(&self, status: &str) -> IngressState {
-        websocket_state(
+        let mut state = websocket_state(
             status,
             self.last_sequence,
             self.session_id.as_deref(),
             self.resume_gateway_url.as_deref(),
             self.bot_user_id.as_deref(),
-        )
+        );
+        self.counters.write_metadata(&mut state.metadata);
+        state
     }
 }
 
@@ -1881,15 +2154,21 @@ enum DiscordGatewayCloseAction {
 
 fn discord_gateway_action_response(
     action: DiscordGatewayAction,
-    session: &DiscordGatewaySession,
+    session: &mut DiscordGatewaySession,
 ) -> PluginResponse {
     match action {
-        DiscordGatewayAction::Event(event) => PluginResponse::IngressEventsReceived {
-            events: vec![*event],
-            callback_reply: None,
-            state: Some(session.to_state("running")),
-            poll_after_ms: Some(0),
-        },
+        DiscordGatewayAction::Event(event) => {
+            // The ingress response is the polling path's event delivery, so it
+            // counts as emitted and clears the degraded flag like a websocket
+            // notification does.
+            session.counters.record_emitted();
+            PluginResponse::IngressEventsReceived {
+                events: vec![*event],
+                callback_reply: None,
+                state: Some(session.to_state("running")),
+                poll_after_ms: Some(0),
+            }
+        }
         DiscordGatewayAction::Heartbeat => PluginResponse::IngressEventsReceived {
             events: Vec::new(),
             callback_reply: None,
@@ -1955,6 +2234,7 @@ fn handle_discord_gateway_text(
         0 => {
             match payload.event_type.as_deref() {
                 Some("READY") => {
+                    session.counters.record_frame(GatewayFrameKind::Ready);
                     debug_discord_gateway(format_args!("received READY"));
                     verify_ready_identity(context.identity, &payload.data)?;
                     if let Some(session_id) = payload.data.get("session_id").and_then(Value::as_str)
@@ -1970,19 +2250,46 @@ fn handle_discord_gateway_text(
                     }
                     return Ok(Some(DiscordGatewayAction::Heartbeat));
                 }
-                Some("RESUMED") => return Ok(Some(DiscordGatewayAction::Heartbeat)),
-                Some("MESSAGE_CREATE") => {}
+                Some("RESUMED") => {
+                    session.counters.record_frame(GatewayFrameKind::Ready);
+                    return Ok(Some(DiscordGatewayAction::Heartbeat));
+                }
+                Some("MESSAGE_CREATE") => {
+                    session
+                        .counters
+                        .record_frame(GatewayFrameKind::MessageCreate);
+                }
                 other => {
+                    session
+                        .counters
+                        .record_frame(GatewayFrameKind::OtherDispatch);
                     debug_discord_gateway(format_args!("ignoring gateway event {:?}", other));
                     return Ok(None);
                 }
             }
-            let message: DiscordGatewayMessage = serde_json::from_value(payload.data)
-                .context("failed to parse Discord MESSAGE_CREATE payload")?;
-            let Some(event) = build_websocket_inbound_event(context, &message) else {
-                return Ok(None);
+            // Keep decode errors visible until an event notification succeeds.
+            let message: DiscordGatewayMessage = match serde_json::from_value(payload.data) {
+                Ok(message) => message,
+                Err(error) => {
+                    session.counters.record_decode_error();
+                    debug_discord_gateway(format_args!(
+                        "failed to decode MESSAGE_CREATE payload: {error}"
+                    ));
+                    return Ok(None);
+                }
             };
-            Ok(Some(DiscordGatewayAction::Event(Box::new(event))))
+            session.counters.record_decoded();
+            match build_websocket_inbound_event(context, &message) {
+                Ok(event) => {
+                    session.counters.record_accepted();
+                    Ok(Some(DiscordGatewayAction::Event(Box::new(event))))
+                }
+                Err(reason) => {
+                    session.counters.record_rejection(reason);
+                    debug_discord_reject(reason, &message.id);
+                    Ok(None)
+                }
+            }
         }
         1 => {
             send_discord_session_heartbeat(socket, session)?;
@@ -2016,6 +2323,7 @@ fn handle_discord_gateway_text(
         }
         11 => {
             session.awaiting_heartbeat_ack = false;
+            session.counters.record_heartbeat();
             Ok(Some(DiscordGatewayAction::Heartbeat))
         }
         _ => Ok(None),
@@ -2200,10 +2508,11 @@ fn close_discord_websocket_for_reconnect(socket: &mut WebSocket<MaybeTlsStream<T
     let _ = socket.close(None);
 }
 
+/// Decode a gateway message or return its stable rejection reason.
 fn build_websocket_inbound_event(
     context: &DiscordIngressContext<'_>,
     message: &DiscordGatewayMessage,
-) -> Option<InboundEventEnvelope> {
+) -> Result<InboundEventEnvelope, &'static str> {
     // Only ordinary and reply messages carry a member request. The remaining
     // types are provider notices about the conversation itself, and an
     // interaction response is addressed to one member rather than to this
@@ -2212,8 +2521,7 @@ fn build_websocket_inbound_event(
     if !matches!(message_type, MESSAGE_TYPE_DEFAULT | MESSAGE_TYPE_REPLY)
         || message.flags.unwrap_or(0) & MESSAGE_FLAG_EPHEMERAL != 0
     {
-        debug_discord_reject(REJECT_UNSUPPORTED_MESSAGE_TYPE, &message.id);
-        return None;
+        return Err(REJECT_UNSUPPORTED_MESSAGE_TYPE);
     }
 
     // A reply points at a message; a forward points at a message that was never
@@ -2255,13 +2563,7 @@ fn build_websocket_inbound_event(
     };
 
     let authorized =
-        match evaluate_inbound(context.policy, context.identity, &candidate, context.lookup) {
-            Ok(authorized) => authorized,
-            Err(reason) => {
-                debug_discord_reject(reason, &message.id);
-                return None;
-            }
-        };
+        evaluate_inbound(context.policy, context.identity, &candidate, context.lookup)?;
 
     let mut event_metadata = BTreeMap::new();
     event_metadata.insert(META_TRANSPORT.to_string(), TRANSPORT_WEBSOCKET.to_string());
@@ -2280,7 +2582,7 @@ fn build_websocket_inbound_event(
 
     let reply_to_message_id = reference.and_then(|reference| reference.message_id.clone());
 
-    Some(InboundEventEnvelope {
+    Ok(InboundEventEnvelope {
         event_id: message.id.clone(),
         platform: PLATFORM_DISCORD.to_string(),
         event_type: "message.created".to_string(),
@@ -3678,7 +3980,7 @@ mod tests {
             identity: &identity,
             lookup,
         };
-        build_websocket_inbound_event(&context, message)
+        build_websocket_inbound_event(&context, message).ok()
     }
 
     /// Emit with the provider shape that a normal guild message lookup returns.
@@ -3742,9 +4044,10 @@ mod tests {
 
     #[test]
     fn gateway_heartbeat_action_emits_an_empty_liveness_notification() {
-        let session = DiscordGatewaySession::from_state(None);
+        let mut session = DiscordGatewaySession::from_state(None);
 
-        let response = discord_gateway_action_response(DiscordGatewayAction::Heartbeat, &session);
+        let response =
+            discord_gateway_action_response(DiscordGatewayAction::Heartbeat, &mut session);
 
         match response {
             PluginResponse::IngressEventsReceived {
@@ -3887,6 +4190,263 @@ mod tests {
             event.metadata.get(META_TRANSPORT).map(String::as_str),
             Some(TRANSPORT_WEBSOCKET)
         );
+    }
+
+    #[test]
+    fn websocket_direct_mention_in_allowlisted_channel_emits_without_a_channel_lookup() {
+        let mut message = guild_message(ALLOWED_CHANNEL, "hello websocket");
+        message.mentions = vec![discord_user(BOT_ACCOUNT_ID, true)];
+
+        let event = emit_with_lookup(&scoped_config(), &message, &NoChannelLookup);
+
+        assert!(
+            event.is_some(),
+            "an authorized direct mention in an allow-listed channel must not depend on a per-message channel lookup"
+        );
+    }
+
+    #[test]
+    fn channel_wildcard_does_not_take_the_exact_channel_fallback() {
+        let config = ChannelConfig {
+            allowed_channel_ids: vec![CHANNEL_WILDCARD.to_string()],
+            ..scoped_config()
+        };
+        let mut message = guild_message(OTHER_CHANNEL, "hello");
+        message.mentions = vec![discord_user(BOT_ACCOUNT_ID, true)];
+
+        assert!(
+            emit_with_lookup(&config, &message, &NoChannelLookup).is_none(),
+            "an unresolved conversation must stay rejected under the wildcard"
+        );
+    }
+
+    #[test]
+    fn thread_without_a_provider_parent_does_not_take_the_exact_channel_fallback() {
+        let config = ChannelConfig {
+            allowed_channel_ids: vec![ALLOWED_THREAD.to_string()],
+            ..scoped_config()
+        };
+        let lookup = MapChannelLookup {
+            channels: BTreeMap::from([(
+                ALLOWED_THREAD.to_string(),
+                DiscordChannelInfo {
+                    kind: CHANNEL_TYPE_PUBLIC_THREAD,
+                    parent_id: None,
+                    guild_id: Some(ALLOWED_GUILD.to_string()),
+                    recipient_ids: Vec::new(),
+                },
+            )]),
+        };
+        let mut message = guild_message(ALLOWED_THREAD, "thread message");
+        message.mentions = vec![discord_user(BOT_ACCOUNT_ID, true)];
+
+        assert!(
+            emit_with_lookup(&config, &message, &lookup).is_none(),
+            "a provider-classified thread must not be reclassified as a channel"
+        );
+    }
+
+    #[test]
+    fn gateway_counters_round_trip_through_state_metadata() {
+        let mut counters = GatewayCounters::default();
+        counters.record_frame(GatewayFrameKind::Ready);
+        counters.record_frame(GatewayFrameKind::MessageCreate);
+        counters.record_decoded();
+        counters.record_accepted();
+        counters.record_emitted();
+        counters.record_rejection(REJECT_NOT_ADDRESSED);
+
+        let mut metadata = BTreeMap::new();
+        counters.write_metadata(&mut metadata);
+
+        assert_eq!(
+            metadata.get(META_FRAMES_TOTAL).map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            metadata.get(META_FRAMES_MESSAGE_CREATE).map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            metadata.get(META_MESSAGES_ACCEPTED).map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            metadata.get(META_NOTIFICATIONS_EMITTED).map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            metadata
+                .get(&format!("{META_REJECT_PREFIX}{REJECT_NOT_ADDRESSED}"))
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            metadata.get(META_EVENT_PATH_DEGRADED).map(String::as_str),
+            Some("false")
+        );
+
+        let restored = GatewayCounters::from_metadata(&metadata);
+        assert_eq!(restored.frames_total, 2);
+        assert_eq!(restored.messages_accepted, 1);
+        assert_eq!(restored.rejections.get(REJECT_NOT_ADDRESSED), Some(&1));
+        assert!(!restored.event_path_degraded);
+    }
+
+    #[test]
+    fn event_path_stays_degraded_after_decode_error_until_a_notification_is_emitted() {
+        let mut counters = GatewayCounters::default();
+        counters.record_decode_error();
+        assert!(
+            counters.event_path_degraded,
+            "a decode error degrades the path"
+        );
+
+        counters.record_heartbeat();
+        assert!(
+            counters.event_path_degraded,
+            "a heartbeat must not erase a known decode failure"
+        );
+
+        counters.record_accepted();
+        assert!(counters.event_path_degraded);
+        counters.record_emitted();
+        assert!(!counters.event_path_degraded);
+    }
+
+    #[test]
+    fn session_counters_survive_a_reconnect_through_state() {
+        let mut session = DiscordGatewaySession::from_state(None);
+        session
+            .counters
+            .record_frame(GatewayFrameKind::MessageCreate);
+        session.counters.record_decoded();
+        session.counters.record_accepted();
+        session.counters.record_emitted();
+
+        let state = session.to_state("reconnect");
+        let resumed = DiscordGatewaySession::from_state(Some(&state));
+
+        assert_eq!(resumed.counters.frames_message_create, 1);
+        assert_eq!(resumed.counters.messages_accepted, 1);
+        assert!(!resumed.counters.event_path_degraded);
+    }
+
+    #[test]
+    fn polling_event_response_counts_the_delivery_and_clears_degraded() {
+        let mut message = guild_message(ALLOWED_CHANNEL, "hello");
+        message.mentions = vec![discord_user(BOT_ACCOUNT_ID, true)];
+        let event = emit(&scoped_config(), &message).expect("event");
+
+        let mut session = DiscordGatewaySession::from_state(None);
+        session.counters.record_decode_error();
+
+        let response = discord_gateway_action_response(
+            DiscordGatewayAction::Event(Box::new(event)),
+            &mut session,
+        );
+
+        assert_eq!(session.counters.notifications_emitted, 1);
+        assert!(!session.counters.event_path_degraded);
+        let PluginResponse::IngressEventsReceived { events, state, .. } = response else {
+            panic!("expected an ingress events response");
+        };
+        assert_eq!(events.len(), 1);
+        let metadata = state.expect("state").metadata;
+        assert_eq!(
+            metadata.get(META_NOTIFICATIONS_EMITTED).map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            metadata.get(META_EVENT_PATH_DEGRADED).map(String::as_str),
+            Some("false")
+        );
+    }
+
+    /// Websocket pair over a loopback socket; the driven frames never write, so
+    /// no handshake or server loop is needed.
+    fn loopback_websocket() -> (WebSocket<MaybeTlsStream<TcpStream>>, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        let socket = WebSocket::from_raw_socket(
+            MaybeTlsStream::Plain(client),
+            tungstenite::protocol::Role::Client,
+            None,
+        );
+        (socket, server)
+    }
+
+    #[test]
+    fn gateway_dispatch_sequence_updates_counters_through_real_frames() {
+        let config = scoped_config();
+        let policy = DiscordPolicy::from_config(&config).expect("policy");
+        let identity = bot_identity();
+        let channel_info = |guild_id: &str| DiscordChannelInfo {
+            kind: 0,
+            parent_id: None,
+            guild_id: Some(guild_id.to_string()),
+            recipient_ids: Vec::new(),
+        };
+        let lookup = MapChannelLookup {
+            channels: BTreeMap::from([
+                (ALLOWED_CHANNEL.to_string(), channel_info(ALLOWED_GUILD)),
+                (OTHER_CHANNEL.to_string(), channel_info(ALLOWED_GUILD)),
+            ]),
+        };
+        let context = DiscordIngressContext {
+            config: &config,
+            policy: &policy,
+            identity: &identity,
+            lookup: &lookup,
+        };
+        let (mut socket, _server) = loopback_websocket();
+        let mut session = DiscordGatewaySession::from_state(None);
+        let mut drive = |frame: &str| {
+            handle_discord_gateway_text(&context, &mut socket, frame, &mut session, "token")
+                .expect("gateway frame")
+        };
+
+        let ready = drive(
+            r#"{"op":0,"s":1,"t":"READY","d":{"user":{"id":"bot-account-1"},"session_id":"sess-1"}}"#,
+        );
+        assert!(matches!(ready, Some(DiscordGatewayAction::Heartbeat)));
+
+        let accepted = drive(
+            r#"{"op":0,"s":2,"t":"MESSAGE_CREATE","d":{"id":"msg-10","channel_id":"channel-marketing","content":"hello","guild_id":"guild-marketing","author":{"id":"member-1","username":"member"},"type":0,"mentions":[{"id":"bot-account-1","username":"dispatch","bot":true}]}}"#,
+        );
+        assert!(matches!(accepted, Some(DiscordGatewayAction::Event(_))));
+
+        let unauthorized = drive(
+            r#"{"op":0,"s":3,"t":"MESSAGE_CREATE","d":{"id":"msg-11","channel_id":"channel-team-chat","content":"hello","guild_id":"guild-marketing","author":{"id":"member-1","username":"member"},"type":0,"mentions":[{"id":"bot-account-1","username":"dispatch","bot":true}]}}"#,
+        );
+        assert!(unauthorized.is_none());
+
+        let malformed = drive(r#"{"op":0,"s":4,"t":"MESSAGE_CREATE","d":{"id":"msg-12"}}"#);
+        assert!(malformed.is_none());
+
+        let ack = drive(r#"{"op":11}"#);
+        assert!(matches!(ack, Some(DiscordGatewayAction::Heartbeat)));
+
+        let counters = &session.counters;
+        assert_eq!(counters.frames_total, 4);
+        assert_eq!(counters.frames_ready, 1);
+        assert_eq!(counters.frames_message_create, 3);
+        assert_eq!(counters.messages_decoded, 2);
+        assert_eq!(counters.message_decode_errors, 1);
+        assert_eq!(counters.messages_accepted, 1);
+        assert_eq!(
+            counters.rejections.get(REJECT_UNAUTHORIZED_CHANNEL),
+            Some(&1)
+        );
+        assert!(counters.last_heartbeat_at.is_some());
+        assert!(
+            counters.event_path_degraded,
+            "the decode error must stay visible past the heartbeat acknowledgment"
+        );
+        assert_eq!(session.last_sequence, Some(4));
+        assert_eq!(session.session_id.as_deref(), Some("sess-1"));
     }
 
     #[test]
@@ -4800,6 +5360,25 @@ mod tests {
                 "channel_id":"{OTHER_CHANNEL}",
                 "member":{{"user":{{"id":"member-1","username":"member"}}}},
                 "data":{{"custom_id":"approve","component_type":2}}
+            }}"#
+        );
+
+        assert!(interaction_events(&scoped_config(), &body).is_empty());
+    }
+
+    #[test]
+    fn interaction_without_a_channel_object_fails_closed_in_an_allowed_channel() {
+        // Interactions describe their own channel; the gateway-message fallback
+        // must not place one whose shape the provider left out.
+        let body = format!(
+            r#"{{
+                "id":"interaction-12",
+                "application_id":"app-1",
+                "type":2,
+                "guild_id":"{ALLOWED_GUILD}",
+                "channel_id":"{ALLOWED_CHANNEL}",
+                "member":{{"user":{{"id":"member-1","username":"member"}}}},
+                "data":{{"name":"ask","type":1}}
             }}"#
         );
 
