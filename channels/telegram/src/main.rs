@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use dispatch_channel_protocol::MessageRef;
 use dispatch_channel_runtime::{
     IngressPollContext, IngressWorker, no_after_cycle,
     restart_ingress_worker as restart_runtime_ingress_worker, stop_ingress_worker,
@@ -151,6 +152,10 @@ fn handle_request(
         PluginRequest::Push { config, message } => Ok(PluginResponse::Pushed {
             delivery: deliver(config, message)?,
         }),
+        PluginRequest::GetMessage { .. } | PluginRequest::GetPermalink { .. } => Ok(plugin_error(
+            "unsupported_request",
+            "telegram does not support message read-back",
+        )),
         PluginRequest::IngressEvent {
             config, payload, ..
         } => handle_ingress_event(config, payload),
@@ -466,8 +471,11 @@ fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<Delivery
     }
 
     Ok(DeliveryReceipt {
-        message_id: sent.message_id,
-        conversation_id: sent.chat_id,
+        reference: MessageRef {
+            conversation_id: sent.chat_id,
+            message_id: sent.message_id,
+            thread_id: message_thread_id.map(|value| value.to_string()),
+        },
         metadata,
     })
 }

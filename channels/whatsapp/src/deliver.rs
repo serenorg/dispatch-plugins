@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use dispatch_channel_protocol::MessageRef;
 use std::collections::BTreeMap;
 use std::time::Duration;
 use whatsapp_rust::Jid;
@@ -137,8 +138,11 @@ pub fn deliver_text_message(
     }
 
     Ok(DeliveryReceipt {
-        message_id: sent,
-        conversation_id: recipient_raw,
+        reference: MessageRef {
+            conversation_id: recipient_raw,
+            message_id: sent,
+            thread_id: None,
+        },
         metadata,
     })
 }

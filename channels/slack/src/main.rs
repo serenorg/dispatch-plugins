@@ -21,10 +21,11 @@ mod slack_api;
 
 use protocol::{
     CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ChannelPolicy, ConfiguredChannel,
-    DeliveryReceipt, HealthReport, InboundActor, InboundAttachment, InboundConversationRef,
-    InboundEventEnvelope, InboundMessage, IngressCallbackReply, IngressMode, IngressPayload,
-    IngressState, OutboundMessage, PluginRequest, PluginRequestEnvelope, PluginResponse,
-    StatusAcceptance, StatusFrame, StatusKind, capabilities, parse_jsonrpc_request, plugin_error,
+    DeliveryReceipt, FetchedMessage, FetchedMessageAuthor, HealthReport, InboundActor,
+    InboundAttachment, InboundConversationRef, InboundEventEnvelope, InboundMessage,
+    IngressCallbackReply, IngressMode, IngressPayload, IngressState, MessagePermalink, MessageRef,
+    OutboundMessage, PluginRequest, PluginRequestEnvelope, PluginResponse, StatusAcceptance,
+    StatusFrame, StatusKind, capabilities, parse_jsonrpc_request, plugin_error,
     response_to_jsonrpc,
 };
 use slack_api::{SlackClient, SlackUpload, send_incoming_webhook};
@@ -193,6 +194,8 @@ fn handle_request(
         PluginRequest::Push { config, message } => Ok(PluginResponse::Pushed {
             delivery: deliver(config, message)?,
         }),
+        PluginRequest::GetMessage { config, reference } => get_message(config, reference),
+        PluginRequest::GetPermalink { config, reference } => get_permalink(config, reference),
         PluginRequest::IngressEvent {
             config,
             state,
@@ -485,8 +488,11 @@ fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<Delivery
         }
 
         return Ok(DeliveryReceipt {
-            message_id: posted.message_id,
-            conversation_id: posted.channel_id,
+            reference: MessageRef {
+                conversation_id: posted.channel_id.clone(),
+                message_id: posted.message_id.clone(),
+                thread_id: posted.thread_ts.clone(),
+            },
             metadata,
         });
     }
@@ -512,10 +518,89 @@ fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<Delivery
     metadata.insert(META_DESTINATION_URL.to_string(), "configured".to_string());
 
     Ok(DeliveryReceipt {
-        message_id: posted.message_id,
-        conversation_id: posted.channel_id,
+        reference: MessageRef {
+            conversation_id: posted.channel_id,
+            message_id: posted.message_id,
+            thread_id: None,
+        },
         metadata,
     })
+}
+
+/// Fetch a message for an authorized receipt-bound reference.
+fn get_message(config: &ChannelConfig, reference: &MessageRef) -> Result<PluginResponse> {
+    let channel_id = authorize_read_back(config, reference)?;
+    let client = SlackClient::from_env(bot_token_env(config))?;
+    let Some(fetched) = client.fetch_message(
+        &channel_id,
+        &reference.message_id,
+        reference.thread_id.as_deref(),
+    )?
+    else {
+        return Ok(PluginResponse::MessageNotFound {
+            reference: reference.clone(),
+        });
+    };
+    let permalink = client.message_permalink(&channel_id, &reference.message_id)?;
+    let author = fetched.author_id.clone().map(|id| FetchedMessageAuthor {
+        id,
+        display_name: None,
+        username: fetched.author_username.clone(),
+        is_bot: fetched.author_is_bot,
+    });
+    Ok(PluginResponse::MessageFetched {
+        message: FetchedMessage {
+            reference: MessageRef {
+                conversation_id: channel_id,
+                message_id: fetched.message_id,
+                thread_id: fetched.thread_id,
+            },
+            content: fetched.content,
+            content_type: Some("text/plain".to_string()),
+            author,
+            permalink,
+            metadata: BTreeMap::new(),
+        },
+    })
+}
+
+/// Resolve a permalink for an authorized receipt-bound reference.
+fn get_permalink(config: &ChannelConfig, reference: &MessageRef) -> Result<PluginResponse> {
+    let channel_id = authorize_read_back(config, reference)?;
+    let client = SlackClient::from_env(bot_token_env(config))?;
+    match client.message_permalink(&channel_id, &reference.message_id)? {
+        Some(url) => Ok(PluginResponse::PermalinkResolved {
+            permalink: MessagePermalink {
+                reference: MessageRef {
+                    conversation_id: channel_id,
+                    message_id: reference.message_id.clone(),
+                    thread_id: reference.thread_id.clone(),
+                },
+                url,
+            },
+        }),
+        None => Ok(PluginResponse::MessageNotFound {
+            reference: reference.clone(),
+        }),
+    }
+}
+
+/// Authorize the referenced conversation and require bot-token transport.
+fn authorize_read_back(config: &ChannelConfig, reference: &MessageRef) -> Result<String> {
+    if reference.message_id.trim().is_empty() {
+        return Err(channel_target_denied(
+            "Slack read-back requires a message id",
+        ));
+    }
+    // Authorize scope before checking transport credentials.
+    let channel_id = reference.conversation_id.clone();
+    authorize_channel_id(config, &channel_id)?;
+    if !has_optional_env(bot_token_env(config)) {
+        return Err(anyhow!(
+            "slack read-back requires a bot token; incoming-webhook delivery cannot be read back"
+        ));
+    }
+    Ok(channel_id)
 }
 
 fn send_status(config: &ChannelConfig, update: &StatusFrame) -> Result<StatusAcceptance> {
@@ -2104,6 +2189,57 @@ mod tests {
         let error = authorize_channel_id(&ChannelConfig::default(), "C123")
             .expect_err("empty allowlist must deny");
         assert!(error.downcast_ref::<ChannelTargetDenied>().is_some());
+    }
+
+    #[test]
+    fn read_back_denies_channel_outside_allowlist_before_any_slack_call() {
+        let config = ChannelConfig {
+            bot_token_env: Some("SLACK_BOT_TOKEN".to_string()),
+            allowed_channel_ids: vec!["C0BJSQDLURY".to_string()],
+            ..ChannelConfig::default()
+        };
+        let reference = MessageRef {
+            conversation_id: "C04UZHV2U5Q".to_string(),
+            message_id: "1712860000.000001".to_string(),
+            thread_id: None,
+        };
+        let error = authorize_read_back(&config, &reference)
+            .expect_err("channel outside the allowlist must be denied");
+        assert!(error.downcast_ref::<ChannelTargetDenied>().is_some());
+    }
+
+    #[test]
+    fn read_back_requires_a_message_id() {
+        let config = ChannelConfig {
+            bot_token_env: Some("SLACK_BOT_TOKEN".to_string()),
+            allowed_channel_ids: vec!["C0BJSQDLURY".to_string()],
+            ..ChannelConfig::default()
+        };
+        let reference = MessageRef {
+            conversation_id: "C0BJSQDLURY".to_string(),
+            message_id: "   ".to_string(),
+            thread_id: None,
+        };
+        let error =
+            authorize_read_back(&config, &reference).expect_err("blank message id must be denied");
+        assert!(error.downcast_ref::<ChannelTargetDenied>().is_some());
+    }
+
+    #[test]
+    fn read_back_requires_a_bot_token() {
+        let config = ChannelConfig {
+            bot_token_env: Some("SLACK_BOT_TOKEN_UNSET_FOR_READ_BACK_TEST".to_string()),
+            unrestricted_channel_access: true,
+            ..ChannelConfig::default()
+        };
+        let reference = MessageRef {
+            conversation_id: "C0BJSQDLURY".to_string(),
+            message_id: "1712860000.000001".to_string(),
+            thread_id: None,
+        };
+        let error = authorize_read_back(&config, &reference)
+            .expect_err("read-back without a bot token must fail");
+        assert!(error.downcast_ref::<ChannelTargetDenied>().is_none());
     }
 
     #[test]

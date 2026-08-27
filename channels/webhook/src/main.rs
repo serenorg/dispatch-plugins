@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use dispatch_channel_protocol::MessageRef;
 use jiff::Timestamp;
 use serde_json::Value;
 use std::{
@@ -82,6 +83,10 @@ fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
         PluginRequest::Push { config, message } => Ok(PluginResponse::Pushed {
             delivery: deliver(config, message)?,
         }),
+        PluginRequest::GetMessage { .. } | PluginRequest::GetPermalink { .. } => Ok(plugin_error(
+            "unsupported_request",
+            "webhook does not support message read-back",
+        )),
         PluginRequest::IngressEvent {
             config, payload, ..
         } => handle_ingress_event(config, payload),
@@ -231,8 +236,11 @@ fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<Delivery
     }
 
     Ok(DeliveryReceipt {
-        message_id,
-        conversation_id,
+        reference: MessageRef {
+            conversation_id,
+            message_id,
+            thread_id: None,
+        },
         metadata,
     })
 }

@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use dispatch_channel_protocol::{
-    ChannelEventNotification, PluginNotificationEnvelope, notification_to_jsonrpc,
+    ChannelEventNotification, MessageRef, PluginNotificationEnvelope, notification_to_jsonrpc,
 };
 use dispatch_channel_runtime::write_stdout_line;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -290,6 +290,10 @@ fn handle_request(
         PluginRequest::Push { config, message } => Ok(PluginResponse::Pushed {
             delivery: deliver(config, message)?,
         }),
+        PluginRequest::GetMessage { .. } | PluginRequest::GetPermalink { .. } => Ok(plugin_error(
+            "unsupported_request",
+            "discord does not support message read-back",
+        )),
         PluginRequest::IngressEvent {
             config, payload, ..
         } => handle_ingress_event(config, payload),
@@ -2518,8 +2522,13 @@ fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<Delivery
     }
 
     Ok(DeliveryReceipt {
-        message_id: posted.id,
-        conversation_id: posted.channel_id,
+        reference: MessageRef {
+            conversation_id: posted.channel_id,
+            message_id: posted.id,
+            // A thread is itself the addressed Discord channel, so the thread
+            // route is already `conversation_id`; `metadata` keeps the label.
+            thread_id: None,
+        },
         metadata,
     })
 }

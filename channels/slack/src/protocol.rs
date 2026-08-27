@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 
 pub use proto::{
     AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities, ChannelPolicy,
-    ConfiguredChannel, DeliveryReceipt, HealthReport, InboundActor, InboundAttachment,
-    InboundConversationRef, InboundEventEnvelope, InboundMessage, IngressCallbackReply,
-    IngressMode, IngressPayload, IngressState, OutboundAttachment, PluginResponse,
-    StatusAcceptance, StatusFrame, StatusKind, ThreadingModel, parse_jsonrpc_request, plugin_error,
-    response_to_jsonrpc,
+    ConfiguredChannel, DeliveryReceipt, FetchedMessage, FetchedMessageAuthor, HealthReport,
+    InboundActor, InboundAttachment, InboundConversationRef, InboundEventEnvelope, InboundMessage,
+    IngressCallbackReply, IngressMode, IngressPayload, IngressState, MessagePermalink, MessageRef,
+    OutboundAttachment, PluginResponse, StatusAcceptance, StatusFrame, StatusKind, ThreadingModel,
+    parse_jsonrpc_request, plugin_error, response_to_jsonrpc,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

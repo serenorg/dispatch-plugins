@@ -16,6 +16,7 @@
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use dispatch_channel_protocol::MessageRef;
 use jiff::Timestamp;
 use presage::Manager;
 use presage::libsignal_service::content::DataMessage;
@@ -100,8 +101,11 @@ pub fn deliver_text_message(
     metadata.insert("signal_timestamp_ms".to_string(), timestamp_ms.to_string());
     metadata.insert("attachment_count".to_string(), attachment_count.to_string());
     Ok(DeliveryReceipt {
-        message_id: timestamp_ms.to_string(),
-        conversation_id: recipient_raw,
+        reference: MessageRef {
+            conversation_id: recipient_raw,
+            message_id: timestamp_ms.to_string(),
+            thread_id: None,
+        },
         metadata,
     })
 }

@@ -119,6 +119,18 @@ pub struct SlackMessage {
     pub thread_ts: Option<String>,
 }
 
+/// One message read back from Slack by its exact `ts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlackFetchedMessage {
+    pub message_id: String,
+    pub channel_id: String,
+    pub thread_id: Option<String>,
+    pub content: String,
+    pub author_id: Option<String>,
+    pub author_username: Option<String>,
+    pub author_is_bot: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlackUpload {
     pub name: String,
@@ -365,6 +377,133 @@ impl SlackClient {
             );
         }
         Ok(())
+    }
+
+    /// Fetch one Slack message by its exact timestamp.
+    ///
+    /// Thread replies use `conversations.replies`; other messages use
+    /// `conversations.history`. Both queries require the requested timestamp.
+    pub fn fetch_message(
+        &self,
+        channel_id: &str,
+        message_ts: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<Option<SlackFetchedMessage>> {
+        let body = match thread_ts {
+            // `conversations.replies` can include the thread parent alongside the
+            // bounded reply, so allow two rows and gate on the exact `ts` match.
+            Some(thread_ts) if thread_ts != message_ts => self.get_json(
+                "conversations.replies",
+                &[
+                    ("channel", channel_id),
+                    ("ts", thread_ts),
+                    ("latest", message_ts),
+                    ("oldest", message_ts),
+                    ("inclusive", "true"),
+                    ("limit", "2"),
+                ],
+                "failed to fetch Slack thread reply",
+            )?,
+            _ => self.get_json(
+                "conversations.history",
+                &[
+                    ("channel", channel_id),
+                    ("latest", message_ts),
+                    ("oldest", message_ts),
+                    ("inclusive", "true"),
+                    ("limit", "1"),
+                ],
+                "failed to fetch Slack message",
+            )?,
+        };
+
+        if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            let error = body
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown_slack_error");
+            // `thread_not_found` is the only documented absence signal for these
+            // methods; every other error is an operational failure, not proof
+            // the message is gone.
+            if error == "thread_not_found" {
+                return Ok(None);
+            }
+            bail!("failed to fetch Slack message: {error}");
+        }
+
+        let Some(message) = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message.get("ts").and_then(Value::as_str) == Some(message_ts))
+            })
+        else {
+            return Ok(None);
+        };
+
+        let author_is_bot = message.get("bot_id").is_some()
+            || message.get("subtype").and_then(Value::as_str) == Some("bot_message");
+        Ok(Some(SlackFetchedMessage {
+            message_id: message_ts.to_string(),
+            channel_id: channel_id.to_string(),
+            thread_id: message
+                .get("thread_ts")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            content: message
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            author_id: message
+                .get("user")
+                .and_then(Value::as_str)
+                .or_else(|| message.get("bot_id").and_then(Value::as_str))
+                .map(ToOwned::to_owned),
+            author_username: message
+                .get("username")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            author_is_bot,
+        }))
+    }
+
+    /// Resolve a message permalink, returning `None` when Slack cannot find it.
+    pub fn message_permalink(&self, channel_id: &str, message_ts: &str) -> Result<Option<String>> {
+        let body = self.get_json(
+            "chat.getPermalink",
+            &[("channel", channel_id), ("message_ts", message_ts)],
+            "failed to resolve Slack permalink",
+        )?;
+        if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            let error = body
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown_slack_error");
+            if error == "message_not_found" {
+                return Ok(None);
+            }
+            bail!("failed to resolve Slack permalink: {error}");
+        }
+        Ok(body
+            .get("permalink")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned))
+    }
+
+    fn get_json(&self, method: &str, params: &[(&str, &str)], context: &str) -> Result<Value> {
+        let url = format!("{}/{}", self.base_url, method);
+        let mut request =
+            ureq::get(&url).header("Authorization", &format!("Bearer {}", self.bot_token));
+        for (key, value) in params {
+            request = request.query(*key, *value);
+        }
+        let mut response = request
+            .call()
+            .map_err(|error| anyhow!("{context}: {error}"))?;
+        read_json_body(&mut response, context)
     }
 }
 
@@ -1097,5 +1236,204 @@ mod tests {
         )
         .expect("write response body");
         stream.flush().expect("flush response");
+    }
+
+    /// Serve one JSON response and capture the request.
+    fn serve_once(
+        body: &'static str,
+    ) -> (
+        String,
+        mpsc::Receiver<CapturedRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        listener
+            .set_nonblocking(false)
+            .expect("listener blocking mode");
+        let address = listener.local_addr().expect("listener addr");
+        let base_url = format!("http://{address}/api");
+        let (request_tx, request_rx) = mpsc::channel();
+        let response = StubResponse {
+            content_type: "application/json",
+            body: body.to_string(),
+        };
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let request = read_request(&mut stream);
+            request_tx.send(request).expect("send request");
+            write_response(&mut stream, &response);
+        });
+        (base_url, request_rx, server)
+    }
+
+    #[test]
+    fn fetch_message_reads_single_history_message() {
+        let (base_url, request_rx, server) = serve_once(
+            r#"{"ok":true,"messages":[{"type":"message","ts":"1712860000.000001","text":"hello world","user":"U1","team":"T1"}]}"#,
+        );
+
+        let client = SlackClient::new_for_tests(&base_url);
+        let fetched = client
+            .fetch_message("C0BJSQDLURY", "1712860000.000001", None)
+            .expect("fetch message")
+            .expect("message present");
+
+        assert_eq!(fetched.message_id, "1712860000.000001");
+        assert_eq!(fetched.channel_id, "C0BJSQDLURY");
+        assert_eq!(fetched.content, "hello world");
+        assert_eq!(fetched.author_id.as_deref(), Some("U1"));
+        assert!(!fetched.author_is_bot);
+
+        let request = request_rx.recv().expect("history request");
+        assert!(
+            request
+                .request_line
+                .starts_with("GET /api/conversations.history"),
+            "unexpected request line: {}",
+            request.request_line
+        );
+        assert!(request.request_line.contains("channel=C0BJSQDLURY"));
+        assert!(request.request_line.contains("latest=1712860000.000001"));
+        assert!(request.request_line.contains("limit=1"));
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer test-token")
+        );
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn fetch_message_uses_replies_for_threaded_message() {
+        let (base_url, request_rx, server) = serve_once(
+            r#"{"ok":true,"messages":[{"type":"message","ts":"1712860050.000009","thread_ts":"1712860000.000001","text":"reply","bot_id":"B1"}]}"#,
+        );
+
+        let client = SlackClient::new_for_tests(&base_url);
+        let fetched = client
+            .fetch_message(
+                "C0BJSQDLURY",
+                "1712860050.000009",
+                Some("1712860000.000001"),
+            )
+            .expect("fetch reply")
+            .expect("reply present");
+
+        assert_eq!(fetched.message_id, "1712860050.000009");
+        assert_eq!(fetched.thread_id.as_deref(), Some("1712860000.000001"));
+        assert!(fetched.author_is_bot);
+
+        let request = request_rx.recv().expect("replies request");
+        assert!(
+            request
+                .request_line
+                .starts_with("GET /api/conversations.replies"),
+            "unexpected request line: {}",
+            request.request_line
+        );
+        assert!(request.request_line.contains("ts=1712860000.000001"));
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn fetch_message_finds_reply_when_parent_is_included_in_replies() {
+        let (base_url, request_rx, server) = serve_once(
+            r#"{"ok":true,"messages":[{"type":"message","ts":"1712860000.000001","thread_ts":"1712860000.000001","text":"parent"},{"type":"message","ts":"1712860050.000009","thread_ts":"1712860000.000001","text":"reply","user":"U2"}]}"#,
+        );
+
+        let client = SlackClient::new_for_tests(&base_url);
+        let fetched = client
+            .fetch_message(
+                "C0BJSQDLURY",
+                "1712860050.000009",
+                Some("1712860000.000001"),
+            )
+            .expect("fetch reply")
+            .expect("reply present");
+
+        assert_eq!(fetched.message_id, "1712860050.000009");
+        assert_eq!(fetched.content, "reply");
+
+        let request = request_rx.recv().expect("replies request");
+        assert!(request.request_line.contains("limit=2"));
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn fetch_message_treats_provider_error_as_failure_not_absence() {
+        let (base_url, _request_rx, server) =
+            serve_once(r#"{"ok":false,"error":"not_in_channel"}"#);
+        let client = SlackClient::new_for_tests(&base_url);
+        let error = client
+            .fetch_message("C0BJSQDLURY", "1712860000.000001", None)
+            .expect_err("provider error must not read as message absence");
+        assert!(error.to_string().contains("not_in_channel"));
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn fetch_message_reports_missing_message_as_none() {
+        let (base_url, _request_rx, server) = serve_once(r#"{"ok":true,"messages":[]}"#);
+        let client = SlackClient::new_for_tests(&base_url);
+        let fetched = client
+            .fetch_message("C0BJSQDLURY", "1712860000.000001", None)
+            .expect("fetch message");
+        assert!(fetched.is_none());
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn message_permalink_returns_url() {
+        let (base_url, request_rx, server) = serve_once(
+            r#"{"ok":true,"channel":"C0BJSQDLURY","permalink":"https://example.slack.com/archives/C0BJSQDLURY/p1712860000000001"}"#,
+        );
+
+        let client = SlackClient::new_for_tests(&base_url);
+        let permalink = client
+            .message_permalink("C0BJSQDLURY", "1712860000.000001")
+            .expect("permalink")
+            .expect("permalink present");
+        assert_eq!(
+            permalink,
+            "https://example.slack.com/archives/C0BJSQDLURY/p1712860000000001"
+        );
+
+        let request = request_rx.recv().expect("permalink request");
+        assert!(
+            request
+                .request_line
+                .starts_with("GET /api/chat.getPermalink"),
+            "unexpected request line: {}",
+            request.request_line
+        );
+        assert!(
+            request
+                .request_line
+                .contains("message_ts=1712860000.000001")
+        );
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn message_permalink_channel_error_is_failure_not_absence() {
+        let (base_url, _request_rx, server) =
+            serve_once(r#"{"ok":false,"error":"channel_not_found"}"#);
+        let client = SlackClient::new_for_tests(&base_url);
+        let error = client
+            .message_permalink("C0BJSQDLURY", "1712860000.000001")
+            .expect_err("channel_not_found must surface as an error");
+        assert!(error.to_string().contains("channel_not_found"));
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn message_permalink_missing_message_is_none() {
+        let (base_url, _request_rx, server) =
+            serve_once(r#"{"ok":false,"error":"message_not_found"}"#);
+        let client = SlackClient::new_for_tests(&base_url);
+        let permalink = client
+            .message_permalink("C0BJSQDLURY", "1712860000.000001")
+            .expect("permalink call");
+        assert!(permalink.is_none());
+        server.join().expect("server thread");
     }
 }

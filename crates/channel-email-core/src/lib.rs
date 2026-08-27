@@ -256,6 +256,10 @@ fn handle_request<P: EmailPreset>(
         PluginRequest::Push { config, message } => Ok(PluginResponse::Pushed {
             delivery: deliver::<P>(config, message)?,
         }),
+        PluginRequest::GetMessage { .. } | PluginRequest::GetPermalink { .. } => Ok(plugin_error(
+            "unsupported_request",
+            "email does not support message read-back",
+        )),
         PluginRequest::IngressEvent { .. } => Ok(plugin_error(
             "webhook_not_supported",
             format!(
@@ -634,8 +638,11 @@ fn delivery_receipt<P: EmailPreset>(outgoing: &OutgoingEmail, sent: &SentEmail) 
     }
 
     DeliveryReceipt {
-        message_id: sent.message_id.clone(),
-        conversation_id: outgoing.to.clone(),
+        reference: proto::MessageRef {
+            conversation_id: outgoing.to.clone(),
+            message_id: sent.message_id.clone(),
+            thread_id: outgoing.in_reply_to.clone(),
+        },
         metadata,
     }
 }
