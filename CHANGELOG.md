@@ -2,6 +2,23 @@
 
 All notable changes to Dispatch Plugins are documented in this file.
 
+## [0.6.0] - 2026-08-28
+
+### Added
+
+- Discord now uses native typing activity for processing states, refreshes it during active turns, and stops refreshing after terminal status or successful delivery.
+- Discord now supports authorized receipt-bound exact-message read-back and permalink resolution using provider-confirmed coordinates.
+
+### Changed
+
+- All channel plugins now target Dispatch channel protocol `v0.7.0`.
+
+### Fixed
+
+- Discord now splits long outbound text into ordered messages within the provider limit while preserving reply and attachment routing on the first message.
+- Discord delivery now honors provider rate-limit waits, reports partial progress, and returns stable redacted provider errors.
+- Discord typing activity now survives isolated refresh failures, stops after three consecutive failures, reports capacity refusals separately, and rejects unexpected successful provider responses.
+
 ## [0.5.0] - 2026-08-27
 
 ### Added
