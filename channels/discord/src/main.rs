@@ -14,8 +14,9 @@ use std::{
     io::{self, BufRead},
     net::TcpStream,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError, Sender},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -90,6 +91,14 @@ const META_MAX_MESSAGE_CHARACTERS: &str = "max_message_characters";
 const META_LONG_TEXT_DELIVERY: &str = "long_text_delivery";
 const META_CHUNK_COUNT: &str = "chunk_count";
 const META_DELIVERY_STATE: &str = "delivery_state";
+const META_TYPING_STATE: &str = "typing_state";
+const META_TYPING_ACTIVE: &str = "typing_active";
+const META_TYPING_STARTS: &str = "typing_starts";
+const META_TYPING_REFRESHES: &str = "typing_refreshes";
+const META_TYPING_STOPS: &str = "typing_stops";
+const META_TYPING_FAILURES: &str = "typing_failures";
+const META_LAST_TYPING_AT: &str = "last_typing_at";
+const META_LAST_TYPING_FAILURE_AT: &str = "last_typing_failure_at";
 
 // Content-free ingress health metadata.
 const META_FRAMES_TOTAL: &str = "frames_dispatch_total";
@@ -217,6 +226,12 @@ const DISCORD_CHANNEL_CACHE_TTL: Duration = Duration::from_secs(300);
 /// Bound on cached channels so an unbounded stream of conversation IDs cannot
 /// grow the process footprint without limit.
 const DISCORD_CHANNEL_CACHE_CAPACITY: usize = 256;
+/// Refresh before Discord's ten-second typing expiry.
+const DISCORD_TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
+/// Bound activity when the producer does not send a terminal frame.
+const DISCORD_TYPING_MAX_LIFETIME: Duration = Duration::from_secs(300);
+/// Bound the threads and provider traffic created by active destinations.
+const DISCORD_TYPING_MAX_WORKERS: usize = 64;
 
 const DISCORD_GATEWAY_VERSION: u8 = 10;
 const DISCORD_GATEWAY_BASE_INTENTS: u64 = 1 | (1 << 9) | (1 << 12);
@@ -230,6 +245,7 @@ fn main() -> Result<()> {
     let stdin = io::stdin().lock();
     let stdout_lock = Arc::new(Mutex::new(()));
     let mut ingress_worker: Option<DiscordIngressWorker> = None;
+    let mut typing_manager = DiscordTypingManager::default();
 
     for line in stdin.lines() {
         let line = line.context("failed to read stdin")?;
@@ -241,7 +257,12 @@ fn main() -> Result<()> {
             .map_err(|error| anyhow!("failed to parse channel request: {error}"))?;
         let should_exit = matches!(envelope.request, PluginRequest::Shutdown);
 
-        let response = match handle_request(&envelope, &stdout_lock, &mut ingress_worker) {
+        let response = match handle_request(
+            &envelope,
+            &stdout_lock,
+            &mut ingress_worker,
+            &mut typing_manager,
+        ) {
             Ok(response) => response,
             Err(error) => plugin_error(
                 delivery_error_code(&error).unwrap_or("internal_error"),
@@ -257,6 +278,7 @@ fn main() -> Result<()> {
     }
 
     let _ = stop_ingress_worker(&mut ingress_worker);
+    typing_manager.stop_all();
     Ok(())
 }
 
@@ -264,6 +286,7 @@ fn handle_request(
     envelope: &PluginRequestEnvelope,
     stdout_lock: &Arc<Mutex<()>>,
     ingress_worker: &mut Option<DiscordIngressWorker>,
+    typing_manager: &mut DiscordTypingManager,
 ) -> Result<PluginResponse> {
     if envelope.protocol_version != CHANNEL_PLUGIN_PROTOCOL_VERSION {
         return Ok(plugin_error(
@@ -279,12 +302,18 @@ fn handle_request(
         PluginRequest::Capabilities => Ok(PluginResponse::Capabilities {
             capabilities: capabilities(),
         }),
-        PluginRequest::Configure { config } => Ok(PluginResponse::Configured {
-            configuration: Box::new(configure(config)?),
-        }),
-        PluginRequest::Health { config } => Ok(PluginResponse::Health {
-            health: health(config)?,
-        }),
+        PluginRequest::Configure { config } => {
+            // End activity authorized by the configuration being replaced.
+            typing_manager.stop_all();
+            Ok(PluginResponse::Configured {
+                configuration: Box::new(configure(config)?),
+            })
+        }
+        PluginRequest::Health { config } => {
+            let mut report = health(config)?;
+            typing_manager.write_metadata(&mut report.metadata);
+            Ok(PluginResponse::Health { health: report })
+        }
         PluginRequest::PollIngress { config, state } => {
             handle_websocket_receive(config, state.as_ref())
         }
@@ -308,18 +337,25 @@ fn handle_request(
             }
             Ok(PluginResponse::IngressStarted { state: started })
         }
-        PluginRequest::StopIngress { config, state } => Ok(PluginResponse::IngressStopped {
-            state: stop_ingress(
-                config,
-                stop_ingress_worker(ingress_worker).or(state.clone()),
-            )?,
-        }),
-        PluginRequest::Deliver { config, message } => Ok(PluginResponse::Delivered {
-            delivery: deliver(config, message)?,
-        }),
-        PluginRequest::Push { config, message } => Ok(PluginResponse::Pushed {
-            delivery: deliver(config, message)?,
-        }),
+        PluginRequest::StopIngress { config, state } => {
+            typing_manager.stop_all();
+            Ok(PluginResponse::IngressStopped {
+                state: stop_ingress(
+                    config,
+                    stop_ingress_worker(ingress_worker).or(state.clone()),
+                )?,
+            })
+        }
+        PluginRequest::Deliver { config, message } => {
+            let delivery = deliver(config, message)?;
+            stop_typing_for_delivery(typing_manager, &delivery);
+            Ok(PluginResponse::Delivered { delivery })
+        }
+        PluginRequest::Push { config, message } => {
+            let delivery = deliver(config, message)?;
+            stop_typing_for_delivery(typing_manager, &delivery);
+            Ok(PluginResponse::Pushed { delivery })
+        }
         PluginRequest::GetMessage { .. } | PluginRequest::GetPermalink { .. } => Ok(plugin_error(
             "unsupported_request",
             "discord does not support message read-back",
@@ -328,10 +364,11 @@ fn handle_request(
             config, payload, ..
         } => handle_ingress_event(config, payload),
         PluginRequest::Status { config, update } => Ok(PluginResponse::StatusAccepted {
-            status: send_status(config, update)?,
+            status: send_status(config, update, typing_manager)?,
         }),
         PluginRequest::Shutdown => {
             let _ = stop_ingress_worker(ingress_worker);
+            typing_manager.stop_all();
             Ok(PluginResponse::Ok)
         }
     }
@@ -1272,6 +1309,235 @@ struct DiscordIngressWorker {
     stop: Arc<AtomicBool>,
     state: Arc<Mutex<Option<IngressState>>>,
     handle: JoinHandle<()>,
+}
+
+trait DiscordTypingClient: Send + 'static {
+    fn trigger_typing(&self, destination: &str) -> Result<()>;
+}
+
+impl DiscordTypingClient for DiscordClient {
+    fn trigger_typing(&self, destination: &str) -> Result<()> {
+        DiscordClient::trigger_typing(self, destination)
+    }
+}
+
+/// Provider timing and resource bounds for typing activity.
+#[derive(Debug, Clone, Copy)]
+struct DiscordTypingLimits {
+    refresh_interval: Duration,
+    max_lifetime: Duration,
+    max_workers: usize,
+}
+
+impl Default for DiscordTypingLimits {
+    fn default() -> Self {
+        Self {
+            refresh_interval: DISCORD_TYPING_REFRESH_INTERVAL,
+            max_lifetime: DISCORD_TYPING_MAX_LIFETIME,
+            max_workers: DISCORD_TYPING_MAX_WORKERS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscordTypingStart {
+    Started,
+    AlreadyActive,
+    /// Refused before the provider request because all worker slots are in use.
+    AtCapacity,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DiscordTypingMetrics {
+    starts: u64,
+    refreshes: u64,
+    stops: u64,
+    failures: u64,
+    last_typing_at: Option<String>,
+    last_failure_at: Option<String>,
+}
+
+impl DiscordTypingMetrics {
+    fn record_start(&mut self) {
+        self.starts = self.starts.saturating_add(1);
+        self.last_typing_at = Some(now_timestamp());
+    }
+
+    fn record_refresh(&mut self) {
+        self.refreshes = self.refreshes.saturating_add(1);
+        self.last_typing_at = Some(now_timestamp());
+    }
+
+    fn record_stop(&mut self) {
+        self.stops = self.stops.saturating_add(1);
+    }
+
+    fn record_failure(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+        self.last_failure_at = Some(now_timestamp());
+    }
+
+    fn write_metadata(&self, metadata: &mut BTreeMap<String, String>, active: usize) {
+        metadata.insert(META_TYPING_ACTIVE.to_string(), active.to_string());
+        metadata.insert(META_TYPING_STARTS.to_string(), self.starts.to_string());
+        metadata.insert(
+            META_TYPING_REFRESHES.to_string(),
+            self.refreshes.to_string(),
+        );
+        metadata.insert(META_TYPING_STOPS.to_string(), self.stops.to_string());
+        metadata.insert(META_TYPING_FAILURES.to_string(), self.failures.to_string());
+        insert_optional(metadata, META_LAST_TYPING_AT, &self.last_typing_at);
+        insert_optional(metadata, META_LAST_TYPING_FAILURE_AT, &self.last_failure_at);
+    }
+}
+
+struct DiscordTypingWorker {
+    stop: Sender<()>,
+    handle: JoinHandle<()>,
+}
+
+/// Owns one typing lifecycle per effective destination.
+///
+/// The status protocol has no turn identifier, so concurrent turns in one
+/// destination share an indicator and the first terminal frame stops it.
+struct DiscordTypingManager {
+    workers: BTreeMap<String, DiscordTypingWorker>,
+    metrics: Arc<Mutex<DiscordTypingMetrics>>,
+    limits: DiscordTypingLimits,
+}
+
+impl Default for DiscordTypingManager {
+    fn default() -> Self {
+        Self::with_limits(DiscordTypingLimits::default())
+    }
+}
+
+impl DiscordTypingManager {
+    fn with_limits(limits: DiscordTypingLimits) -> Self {
+        Self {
+            workers: BTreeMap::new(),
+            metrics: Arc::new(Mutex::new(DiscordTypingMetrics::default())),
+            limits,
+        }
+    }
+
+    fn start(
+        &mut self,
+        destination: String,
+        client: Box<dyn DiscordTypingClient>,
+    ) -> Result<DiscordTypingStart> {
+        self.reap_finished();
+        if self.workers.contains_key(&destination) {
+            return Ok(DiscordTypingStart::AlreadyActive);
+        }
+        if self.workers.len() >= self.limits.max_workers {
+            // Do not start an indicator that cannot receive a refresh worker.
+            return Ok(DiscordTypingStart::AtCapacity);
+        }
+        let started_at = Instant::now();
+        if let Err(error) = client.trigger_typing(&destination) {
+            update_typing_metrics(&self.metrics, DiscordTypingMetrics::record_failure);
+            return Err(error);
+        }
+        update_typing_metrics(&self.metrics, DiscordTypingMetrics::record_start);
+
+        let (stop, stopped) = mpsc::channel();
+        let metrics = Arc::clone(&self.metrics);
+        let limits = self.limits;
+        let worker_destination = destination.clone();
+        let handle = thread::spawn(move || {
+            let deadline = started_at + limits.max_lifetime;
+            let mut next_refresh = started_at + limits.refresh_interval;
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let wait = next_refresh.min(deadline).saturating_duration_since(now);
+                match stopped.recv_timeout(wait) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        let request_started_at = Instant::now();
+                        if client.trigger_typing(&worker_destination).is_err() {
+                            update_typing_metrics(&metrics, DiscordTypingMetrics::record_failure);
+                            break;
+                        }
+                        update_typing_metrics(&metrics, DiscordTypingMetrics::record_refresh);
+                        next_refresh = request_started_at + limits.refresh_interval;
+                    }
+                }
+            }
+            // Record one stop for every worker exit path.
+            update_typing_metrics(&metrics, DiscordTypingMetrics::record_stop);
+        });
+        self.workers
+            .insert(destination, DiscordTypingWorker { stop, handle });
+        Ok(DiscordTypingStart::Started)
+    }
+
+    /// Stop and join one destination so no refresh can occur after return.
+    fn stop(&mut self, destination: &str) -> bool {
+        self.reap_finished();
+        let Some(worker) = self.workers.remove(destination) else {
+            return false;
+        };
+        let _ = worker.stop.send(());
+        let _ = worker.handle.join();
+        true
+    }
+
+    /// Signal every worker before joining so in-flight waits overlap.
+    fn stop_all(&mut self) {
+        let workers = std::mem::take(&mut self.workers);
+        for worker in workers.values() {
+            let _ = worker.stop.send(());
+        }
+        for (_, worker) in workers {
+            let _ = worker.handle.join();
+        }
+    }
+
+    fn write_metadata(&mut self, metadata: &mut BTreeMap<String, String>) {
+        self.reap_finished();
+        let metrics = self
+            .metrics
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        metrics.write_metadata(metadata, self.workers.len());
+    }
+
+    fn reap_finished(&mut self) {
+        let finished: Vec<_> = self
+            .workers
+            .iter()
+            .filter(|(_, worker)| worker.handle.is_finished())
+            .map(|(destination, _)| destination.clone())
+            .collect();
+        for destination in finished {
+            if let Some(worker) = self.workers.remove(&destination) {
+                let _ = worker.handle.join();
+            }
+        }
+    }
+}
+
+impl Drop for DiscordTypingManager {
+    fn drop(&mut self) {
+        self.stop_all();
+    }
+}
+
+fn update_typing_metrics(
+    metrics: &Arc<Mutex<DiscordTypingMetrics>>,
+    update: impl FnOnce(&mut DiscordTypingMetrics),
+) {
+    // Metrics remain valid after recovering a poisoned lock.
+    let mut metrics = metrics.lock().unwrap_or_else(PoisonError::into_inner);
+    update(&mut metrics);
 }
 
 fn restart_ingress_worker(
@@ -2757,16 +3023,29 @@ fn discord_gateway_websocket_url(gateway_url: &str) -> String {
     )
 }
 
-fn send_status(config: &ChannelConfig, update: &StatusFrame) -> Result<StatusAcceptance> {
-    let content = render_status_message(update);
-    if content.trim().is_empty() {
-        return Ok(rejected_status(
-            "missing_message",
-            "discord status frames require a message or discord_status_text override",
-        ));
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscordStatusPresentation {
+    StartTyping,
+    StopTyping,
+    VisibleMessage,
+}
 
-    let message = OutboundMessage {
+/// Preserve unknown status kinds as visible messages.
+fn status_presentation(kind: &StatusKind) -> DiscordStatusPresentation {
+    match kind {
+        StatusKind::Processing | StatusKind::OperationStarted | StatusKind::Delivering => {
+            DiscordStatusPresentation::StartTyping
+        }
+        StatusKind::Completed | StatusKind::Cancelled | StatusKind::OperationFinished => {
+            DiscordStatusPresentation::StopTyping
+        }
+        // Includes actionable, informational, unknown, and future kinds.
+        _ => DiscordStatusPresentation::VisibleMessage,
+    }
+}
+
+fn status_message(update: &StatusFrame, content: String) -> OutboundMessage {
+    OutboundMessage {
         content,
         attachments: Vec::new(),
         channel_id: update
@@ -2779,9 +3058,75 @@ fn send_status(config: &ChannelConfig, update: &StatusFrame) -> Result<StatusAcc
             .or_else(|| update.metadata.get(ROUTE_THREAD_ID).cloned()),
         reply_to_message_id: update.metadata.get(ROUTE_REPLY_TO_MESSAGE_ID).cloned(),
         metadata: BTreeMap::new(),
-    };
+    }
+}
 
-    let delivery = match deliver(config, &message) {
+fn authorized_status_destination(
+    config: &ChannelConfig,
+    update: &StatusFrame,
+) -> Result<(String, DiscordClient)> {
+    let message = status_message(update, String::new());
+    let policy = DiscordPolicy::from_config(config)?;
+    policy.validate_for_ingress(uses_interaction_webhook(config))?;
+    let destination = resolve_destination(config, &message)?;
+    let client = DiscordClient::from_env(bot_token_env(config))?;
+    authorize_outbound_destination(
+        &policy,
+        &destination,
+        &RestChannelLookup { client: &client },
+    )?;
+    Ok((destination, client))
+}
+
+fn typing_status(
+    update: &StatusFrame,
+    state: &str,
+    reason_code: Option<&str>,
+    typing_manager: &mut DiscordTypingManager,
+) -> StatusAcceptance {
+    let mut metadata = BTreeMap::from([
+        (META_PLATFORM.to_string(), PLATFORM_DISCORD.to_string()),
+        (META_STATUS_KIND.to_string(), status_kind_name(&update.kind)),
+        (META_TYPING_STATE.to_string(), state.to_string()),
+    ]);
+    if let Some(reason_code) = reason_code {
+        metadata.insert(META_REASON_CODE.to_string(), reason_code.to_string());
+    }
+    typing_manager.write_metadata(&mut metadata);
+    StatusAcceptance {
+        accepted: true,
+        metadata,
+    }
+}
+
+fn send_status(
+    config: &ChannelConfig,
+    update: &StatusFrame,
+    typing_manager: &mut DiscordTypingManager,
+) -> Result<StatusAcceptance> {
+    match status_presentation(&update.kind) {
+        DiscordStatusPresentation::VisibleMessage => visible_status(config, update, typing_manager),
+        DiscordStatusPresentation::StopTyping => stop_typing_status(config, update, typing_manager),
+        DiscordStatusPresentation::StartTyping => {
+            Ok(start_typing_status(config, update, typing_manager))
+        }
+    }
+}
+
+/// Post a visible status and stop typing after delivery.
+fn visible_status(
+    config: &ChannelConfig,
+    update: &StatusFrame,
+    typing_manager: &mut DiscordTypingManager,
+) -> Result<StatusAcceptance> {
+    let content = render_status_message(update);
+    if content.trim().is_empty() {
+        return Ok(rejected_status(
+            "missing_message",
+            "discord status frames require a message or discord_status_text override",
+        ));
+    }
+    let delivery = match deliver(config, &status_message(update, content)) {
         Ok(delivery) => delivery,
         Err(error) => {
             // Status frames answer to the same outbound scope as replies, so a
@@ -2795,14 +3140,84 @@ fn send_status(config: &ChannelConfig, update: &StatusFrame) -> Result<StatusAcc
             return Ok(rejected_status(reason_code, error.to_string()));
         }
     };
+    stop_typing_for_delivery(typing_manager, &delivery);
 
-    let mut metadata = delivery.metadata.clone();
+    let mut metadata = delivery.metadata;
     metadata.insert(META_PLATFORM.to_string(), PLATFORM_DISCORD.to_string());
     metadata.insert(META_STATUS_KIND.to_string(), status_kind_name(&update.kind));
+    typing_manager.write_metadata(&mut metadata);
     Ok(StatusAcceptance {
         accepted: true,
         metadata,
     })
+}
+
+/// Stop local typing refresh without provider access.
+fn stop_typing_status(
+    config: &ChannelConfig,
+    update: &StatusFrame,
+    typing_manager: &mut DiscordTypingManager,
+) -> Result<StatusAcceptance> {
+    let destination = match resolve_destination(config, &status_message(update, String::new())) {
+        Ok(destination) => destination,
+        Err(error) => {
+            if let Some(rejected) = error.downcast_ref::<OutboundRejected>() {
+                return Ok(rejected_status(rejected.code, error.to_string()));
+            }
+            return Err(error);
+        }
+    };
+    let state = if typing_manager.stop(&destination) {
+        "stopped"
+    } else {
+        "inactive"
+    };
+    Ok(typing_status(update, state, None, typing_manager))
+}
+
+/// Authorize typing and isolate provider failures from the managed turn.
+fn start_typing_status(
+    config: &ChannelConfig,
+    update: &StatusFrame,
+    typing_manager: &mut DiscordTypingManager,
+) -> StatusAcceptance {
+    let (destination, client) = match authorized_status_destination(config, update) {
+        Ok(authorized) => authorized,
+        Err(error) => {
+            if let Some(rejected) = error.downcast_ref::<OutboundRejected>() {
+                return rejected_status(rejected.code, error.to_string());
+            }
+            return typing_status(
+                update,
+                "failed",
+                Some(delivery_error_code(&error).unwrap_or("typing_failed")),
+                typing_manager,
+            );
+        }
+    };
+
+    match typing_manager.start(destination, Box::new(client)) {
+        Ok(DiscordTypingStart::Started) => typing_status(update, "started", None, typing_manager),
+        Ok(DiscordTypingStart::AlreadyActive) => {
+            typing_status(update, "active", None, typing_manager)
+        }
+        Ok(DiscordTypingStart::AtCapacity) => {
+            typing_status(update, "at_capacity", None, typing_manager)
+        }
+        Err(error) => typing_status(
+            update,
+            "failed",
+            Some(delivery_error_code(&error).unwrap_or("typing_failed")),
+            typing_manager,
+        ),
+    }
+}
+
+/// Stop typing for the destination resolved and authorized during delivery.
+fn stop_typing_for_delivery(typing_manager: &mut DiscordTypingManager, delivery: &DeliveryReceipt) {
+    if let Some(destination) = delivery.metadata.get(META_RESOLVED_DESTINATION) {
+        typing_manager.stop(destination);
+    }
 }
 
 fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<DeliveryReceipt> {
@@ -3831,6 +4246,7 @@ mod tests {
     use super::*;
     use crate::protocol::OutboundAttachment;
     use ed25519_dalek::{Signer, SigningKey};
+    use std::sync::atomic::AtomicU64;
 
     struct EnvGuard {
         key: &'static str,
@@ -3868,6 +4284,116 @@ mod tests {
     const ALLOWED_THREAD: &str = "thread-in-marketing";
     const OTHER_THREAD: &str = "thread-in-team-chat";
     const MEMBER_ID: &str = "member-1";
+
+    /// Provider double that makes each typing request observable to tests.
+    struct CountingTypingClient {
+        calls: Arc<AtomicU64>,
+        observed: Sender<()>,
+        /// One-based request numbers answered with a failure.
+        failing_calls: Vec<u64>,
+    }
+
+    impl DiscordTypingClient for CountingTypingClient {
+        fn trigger_typing(&self, _destination: &str) -> Result<()> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = self.observed.send(());
+            if self.failing_calls.contains(&call) {
+                Err(anyhow!("typing unavailable"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Observer side of a `CountingTypingClient`.
+    struct TypingProbe {
+        calls: Arc<AtomicU64>,
+        observed: mpsc::Receiver<()>,
+    }
+
+    impl TypingProbe {
+        fn total(&self) -> u64 {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        /// Block until `count` further provider requests have been issued.
+        fn await_calls(&self, count: usize) {
+            for _ in 0..count {
+                self.observed
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("typing request");
+            }
+        }
+
+        fn drain(&self) {
+            while self.observed.try_recv().is_ok() {}
+        }
+
+        fn expect_quiet(&self, window: Duration) {
+            assert!(matches!(
+                self.observed.recv_timeout(window),
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected)
+            ));
+        }
+    }
+
+    fn typing_probe_client() -> (Box<dyn DiscordTypingClient>, TypingProbe) {
+        build_typing_probe(Vec::new())
+    }
+
+    fn typing_probe_client_failing_calls(
+        failing_calls: &[u64],
+    ) -> (Box<dyn DiscordTypingClient>, TypingProbe) {
+        build_typing_probe(failing_calls.to_vec())
+    }
+
+    fn build_typing_probe(failing_calls: Vec<u64>) -> (Box<dyn DiscordTypingClient>, TypingProbe) {
+        let calls = Arc::new(AtomicU64::new(0));
+        let (observed, receiver) = mpsc::channel();
+        (
+            Box::new(CountingTypingClient {
+                calls: Arc::clone(&calls),
+                observed,
+                failing_calls,
+            }),
+            TypingProbe {
+                calls,
+                observed: receiver,
+            },
+        )
+    }
+
+    fn short_typing_manager() -> DiscordTypingManager {
+        DiscordTypingManager::with_limits(DiscordTypingLimits {
+            refresh_interval: Duration::from_millis(10),
+            max_lifetime: Duration::from_secs(30),
+            ..DiscordTypingLimits::default()
+        })
+    }
+
+    fn expiring_typing_manager() -> DiscordTypingManager {
+        DiscordTypingManager::with_limits(DiscordTypingLimits {
+            refresh_interval: Duration::from_millis(20),
+            max_lifetime: Duration::from_millis(200),
+            ..DiscordTypingLimits::default()
+        })
+    }
+
+    fn await_no_active_typing(manager: &mut DiscordTypingManager) -> BTreeMap<String, String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut metadata = BTreeMap::new();
+            manager.write_metadata(&mut metadata);
+            if metadata.get(META_TYPING_ACTIVE).map(String::as_str) == Some("0") {
+                return metadata;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "typing lifecycle did not end within the deadline"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     /// One guild, one channel, mention-or-reply activation, DMs denied.
     fn scoped_config() -> ChannelConfig {
@@ -5943,15 +6469,18 @@ mod tests {
     fn status_frames_answer_to_the_outbound_allowlist() {
         let guard = EnvGuard::set("DISCORD_BOT_TOKEN", "token");
         let update = StatusFrame {
-            kind: StatusKind::Info,
+            kind: StatusKind::Processing,
             message: "working".to_string(),
             conversation_id: Some(OTHER_CHANNEL.to_string()),
             thread_id: None,
             metadata: BTreeMap::new(),
         };
 
-        let acceptance = send_status(&scoped_config(), &update).expect("send status");
+        let mut manager = DiscordTypingManager::default();
+        let acceptance = send_status(&scoped_config(), &update, &mut manager).expect("send status");
 
+        // Authorization stays a rejection; it does not fail open into a
+        // provider error the way a typing fault does.
         assert!(!acceptance.accepted);
         assert_eq!(
             acceptance
@@ -5960,7 +6489,322 @@ mod tests {
                 .map(String::as_str),
             Some(REJECT_UNAUTHORIZED_DESTINATION)
         );
+
+        // A destination outside the outbound scope is typed into zero times.
+        let mut metadata = BTreeMap::new();
+        manager.write_metadata(&mut metadata);
+        assert_eq!(
+            metadata.get(META_TYPING_STARTS).map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            metadata.get(META_TYPING_ACTIVE).map(String::as_str),
+            Some("0")
+        );
         drop(guard);
+    }
+
+    #[test]
+    fn terminal_status_without_a_destination_is_rejected() {
+        let update = StatusFrame {
+            kind: StatusKind::Completed,
+            message: String::new(),
+            conversation_id: None,
+            thread_id: None,
+            metadata: BTreeMap::new(),
+        };
+
+        let acceptance = send_status(
+            &scoped_config(),
+            &update,
+            &mut DiscordTypingManager::default(),
+        )
+        .expect("send status");
+
+        assert!(!acceptance.accepted);
+        assert_eq!(
+            acceptance
+                .metadata
+                .get(META_REASON_CODE)
+                .map(String::as_str),
+            Some(REJECT_MISSING_DESTINATION)
+        );
+    }
+
+    #[test]
+    fn status_kinds_select_native_activity_or_visible_messages() {
+        for kind in [
+            StatusKind::Processing,
+            StatusKind::OperationStarted,
+            StatusKind::Delivering,
+        ] {
+            assert_eq!(
+                status_presentation(&kind),
+                DiscordStatusPresentation::StartTyping
+            );
+        }
+        for kind in [
+            StatusKind::Completed,
+            StatusKind::Cancelled,
+            StatusKind::OperationFinished,
+        ] {
+            assert_eq!(
+                status_presentation(&kind),
+                DiscordStatusPresentation::StopTyping
+            );
+        }
+        for kind in [
+            StatusKind::ApprovalNeeded,
+            StatusKind::AuthRequired,
+            StatusKind::Info,
+            StatusKind::Unknown,
+        ] {
+            assert_eq!(
+                status_presentation(&kind),
+                DiscordStatusPresentation::VisibleMessage
+            );
+        }
+    }
+
+    #[test]
+    fn typing_refresh_is_idempotent_and_stops_promptly() {
+        let (client, probe) = typing_probe_client();
+        let (repeat_client, repeat_probe) = typing_probe_client();
+        let mut manager = short_typing_manager();
+
+        assert_eq!(
+            manager
+                .start(ALLOWED_CHANNEL.to_string(), client)
+                .expect("start typing"),
+            DiscordTypingStart::Started
+        );
+        assert_eq!(
+            manager
+                .start(ALLOWED_CHANNEL.to_string(), repeat_client)
+                .expect("repeat typing"),
+            DiscordTypingStart::AlreadyActive
+        );
+        // A repeat start joins the live lifecycle and issues no second request.
+        assert_eq!(repeat_probe.total(), 0);
+
+        // Initial request plus two refreshes from the one lifecycle.
+        probe.await_calls(3);
+
+        assert!(manager.stop(ALLOWED_CHANNEL));
+        // `stop` joins the lifecycle, so the count is final once it returns.
+        let calls_after_stop = probe.total();
+        probe.drain();
+        probe.expect_quiet(Duration::from_millis(50));
+        assert_eq!(probe.total(), calls_after_stop);
+
+        let mut metadata = BTreeMap::new();
+        manager.write_metadata(&mut metadata);
+        assert_eq!(
+            metadata.get(META_TYPING_ACTIVE).map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            metadata.get(META_TYPING_STARTS).map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            metadata.get(META_TYPING_STOPS).map(String::as_str),
+            Some("1")
+        );
+        // Every request after the initial one is a refresh of the same lifecycle.
+        let expected_refreshes = (calls_after_stop - 1).to_string();
+        assert_eq!(
+            metadata.get(META_TYPING_REFRESHES),
+            Some(&expected_refreshes)
+        );
+        assert!(metadata.contains_key(META_LAST_TYPING_AT));
+    }
+
+    #[test]
+    fn a_refresh_failure_ends_only_its_typing_lifecycle() {
+        let (client, probe) = typing_probe_client_failing_calls(&[2]);
+        let mut manager = short_typing_manager();
+        manager
+            .start(ALLOWED_CHANNEL.to_string(), client)
+            .expect("start typing");
+
+        let metadata = await_no_active_typing(&mut manager);
+
+        assert_eq!(probe.total(), 2);
+        assert_eq!(
+            metadata.get(META_TYPING_FAILURES).map(String::as_str),
+            Some("1")
+        );
+        assert!(metadata.contains_key(META_LAST_TYPING_FAILURE_AT));
+        assert_eq!(
+            metadata.get(META_TYPING_STARTS).map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            metadata.get(META_TYPING_STOPS).map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn initial_typing_failure_does_not_leave_an_active_worker() {
+        let (client, probe) = typing_probe_client_failing_calls(&[1]);
+        let mut manager = short_typing_manager();
+
+        manager
+            .start(ALLOWED_CHANNEL.to_string(), client)
+            .expect_err("initial typing failure");
+
+        let mut metadata = BTreeMap::new();
+        manager.write_metadata(&mut metadata);
+        assert_eq!(probe.total(), 1);
+        assert_eq!(
+            metadata.get(META_TYPING_ACTIVE).map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            metadata.get(META_TYPING_STARTS).map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            metadata.get(META_TYPING_FAILURES).map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn typing_lifecycles_expire_at_the_maximum_lifetime() {
+        let (client, probe) = typing_probe_client();
+        let mut manager = expiring_typing_manager();
+        manager
+            .start(ALLOWED_CHANNEL.to_string(), client)
+            .expect("start typing");
+
+        let metadata = await_no_active_typing(&mut manager);
+
+        assert!(
+            probe.total() >= 2,
+            "expected at least one refresh before expiry"
+        );
+        probe.drain();
+        probe.expect_quiet(Duration::from_millis(60));
+        assert_eq!(
+            metadata.get(META_TYPING_STOPS).map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn typing_lifecycles_are_capped_and_refused_before_the_provider() {
+        let mut manager = DiscordTypingManager::with_limits(DiscordTypingLimits {
+            refresh_interval: Duration::from_millis(10),
+            max_lifetime: Duration::from_secs(30),
+            max_workers: 1,
+        });
+        let (first, first_probe) = typing_probe_client();
+        let (second, second_probe) = typing_probe_client();
+
+        assert_eq!(
+            manager
+                .start(ALLOWED_CHANNEL.to_string(), first)
+                .expect("first destination"),
+            DiscordTypingStart::Started
+        );
+        assert_eq!(
+            manager
+                .start(ALLOWED_THREAD.to_string(), second)
+                .expect("second destination"),
+            DiscordTypingStart::AtCapacity
+        );
+        assert_eq!(second_probe.total(), 0);
+        first_probe.await_calls(1);
+
+        assert!(manager.stop(ALLOWED_CHANNEL));
+        let (third, third_probe) = typing_probe_client();
+        assert_eq!(
+            manager
+                .start(ALLOWED_THREAD.to_string(), third)
+                .expect("third destination"),
+            DiscordTypingStart::Started
+        );
+        third_probe.await_calls(2);
+        manager.stop_all();
+    }
+
+    #[test]
+    fn terminal_status_stops_typing_without_provider_access() {
+        let (client, probe) = typing_probe_client();
+        let mut manager = short_typing_manager();
+        manager
+            .start(ALLOWED_CHANNEL.to_string(), client)
+            .expect("start typing");
+        probe.await_calls(1);
+        let update = StatusFrame {
+            kind: StatusKind::Completed,
+            message: String::new(),
+            conversation_id: Some(ALLOWED_CHANNEL.to_string()),
+            thread_id: None,
+            metadata: BTreeMap::new(),
+        };
+
+        let acceptance = send_status(&scoped_config(), &update, &mut manager).expect("stop typing");
+
+        assert!(acceptance.accepted);
+        assert_eq!(
+            acceptance
+                .metadata
+                .get(META_TYPING_STATE)
+                .map(String::as_str),
+            Some("stopped")
+        );
+        let calls_after_stop = probe.total();
+        probe.drain();
+        probe.expect_quiet(Duration::from_millis(50));
+        assert_eq!(probe.total(), calls_after_stop);
+
+        let repeat = send_status(&scoped_config(), &update, &mut manager).expect("repeat stop");
+        assert!(repeat.accepted);
+        assert_eq!(
+            repeat.metadata.get(META_TYPING_STATE).map(String::as_str),
+            Some("inactive")
+        );
+    }
+
+    #[test]
+    fn typing_workers_are_scoped_to_one_destination() {
+        let (first, first_probe) = typing_probe_client();
+        let (second, second_probe) = typing_probe_client();
+        let mut manager = short_typing_manager();
+        manager
+            .start(ALLOWED_CHANNEL.to_string(), first)
+            .expect("first destination");
+        manager
+            .start(ALLOWED_THREAD.to_string(), second)
+            .expect("second destination");
+
+        assert!(manager.stop(ALLOWED_CHANNEL));
+        let first_after_stop = first_probe.total();
+        // The surviving destination keeps refreshing on its own lifecycle.
+        second_probe.await_calls(3);
+        first_probe.drain();
+        first_probe.expect_quiet(Duration::from_millis(50));
+        assert_eq!(first_probe.total(), first_after_stop);
+
+        manager.stop_all();
+        let mut metadata = BTreeMap::new();
+        manager.write_metadata(&mut metadata);
+        assert_eq!(
+            metadata.get(META_TYPING_ACTIVE).map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            metadata.get(META_TYPING_STARTS).map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            metadata.get(META_TYPING_STOPS).map(String::as_str),
+            Some("2")
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -6477,7 +7321,12 @@ mod tests {
             metadata: BTreeMap::new(),
         };
 
-        let acceptance = send_status(&scoped_config(), &update).expect("send status");
+        let acceptance = send_status(
+            &scoped_config(),
+            &update,
+            &mut DiscordTypingManager::default(),
+        )
+        .expect("send status");
 
         assert!(!acceptance.accepted);
         assert_eq!(

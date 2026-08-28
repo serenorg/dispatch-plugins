@@ -13,6 +13,8 @@ const CODE_FENCE_CHUNK_LIMIT: usize = MESSAGE_CONTENT_LIMIT - CODE_FENCE_MARKER_
 const RATE_LIMIT_WAIT_BUDGET: Duration = Duration::from_secs(10);
 /// Floor for a provider-stated retry wait, so a zero value does not spin.
 const RATE_LIMIT_MIN_WAIT: Duration = Duration::from_millis(250);
+/// Bound typing requests so worker shutdown cannot wait indefinitely.
+const TYPING_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct DiscordClient {
@@ -335,6 +337,19 @@ impl DiscordClient {
         Ok(messages)
     }
 
+    pub fn trigger_typing(&self, channel_id: &str) -> Result<()> {
+        let url = format!("{}/channels/{}/typing", self.base_url, channel_id);
+        let mut response = ureq::post(url)
+            .config()
+            .http_status_as_error(false)
+            .timeout_global(Some(TYPING_REQUEST_TIMEOUT))
+            .build()
+            .header("Authorization", &format!("Bot {}", self.bot_token))
+            .send_empty()
+            .map_err(|error| transport_error("failed to trigger Discord typing", error))?;
+        read_empty_response(&mut response, "failed to trigger Discord typing")
+    }
+
     fn get_json(&self, url: &str, context: &str) -> Result<Value> {
         let mut response = ureq::get(url)
             .config()
@@ -638,6 +653,22 @@ fn read_json_body(response: &mut ureq::http::Response<ureq::Body>, context: &str
         .with_context(|| format!("{context}: failed to parse response body as JSON"))
 }
 
+fn read_empty_response(
+    response: &mut ureq::http::Response<ureq::Body>,
+    context: &str,
+) -> Result<()> {
+    if response.status() == ureq::http::StatusCode::NO_CONTENT {
+        return Ok(());
+    }
+    if response.status().is_success() {
+        return Err(anyhow!(
+            "{context}: expected HTTP 204, got {}",
+            response.status().as_u16()
+        ));
+    }
+    read_json_body(response, context).map(|_| ())
+}
+
 fn find_error_detail(
     value: &Value,
     path: &mut Vec<String>,
@@ -911,6 +942,70 @@ mod tests {
 
         assert!(error.to_string().starts_with("message_too_long:"));
         assert_eq!(delivery_error_code(&error), Some("message_too_long"));
+    }
+
+    #[test]
+    fn trigger_typing_posts_an_empty_request_and_accepts_no_content() {
+        let (base_url, server) = spawn_provider(vec![("204 No Content", String::new())]);
+        let client = DiscordClient::new_for_tests(&base_url);
+
+        client.trigger_typing("chan-1").expect("trigger typing");
+
+        let requests = server.join().expect("server thread");
+        let request = &requests[0];
+        assert_eq!(
+            request.request_line,
+            "POST /api/v10/channels/chan-1/typing HTTP/1.1"
+        );
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bot test-token")
+        );
+        assert!(request.body.is_empty());
+    }
+
+    #[test]
+    fn trigger_typing_keeps_provider_failures_redacted_and_classified() {
+        let (base_url, server) = spawn_provider(vec![(
+            "403 Forbidden",
+            r#"{"message":"PRIVATE SENTINEL","code":50013}"#.to_string(),
+        )]);
+        let client = DiscordClient::new_for_tests(&base_url);
+
+        let error = client.trigger_typing("chan-1").expect_err("typing denied");
+
+        assert_eq!(
+            delivery_error_code(&error),
+            Some("provider_permission_denied")
+        );
+        assert!(!error.to_string().contains("PRIVATE SENTINEL"));
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn trigger_typing_classifies_rate_limits_and_transport_failures() {
+        let (base_url, server) = spawn_provider(vec![(
+            "429 Too Many Requests",
+            r#"{"message":"PRIVATE SENTINEL","retry_after":1.0}"#.to_string(),
+        )]);
+        let rate_limited = DiscordClient::new_for_tests(&base_url)
+            .trigger_typing("chan-1")
+            .expect_err("typing rate limited");
+        assert_eq!(
+            delivery_error_code(&rate_limited),
+            Some("provider_rate_limited")
+        );
+        assert!(!rate_limited.to_string().contains("PRIVATE SENTINEL"));
+        server.join().expect("server thread");
+
+        let transport = DiscordClient::new_for_tests("http://127.0.0.1:1/api/v10")
+            .trigger_typing("chan-1")
+            .expect_err("typing transport failure");
+        assert_eq!(
+            delivery_error_code(&transport),
+            Some("provider_transport_error")
+        );
+        assert!(!transport.to_string().contains("chan-1"));
     }
 
     #[test]

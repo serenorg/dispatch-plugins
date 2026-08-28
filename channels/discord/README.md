@@ -21,13 +21,14 @@ Behavior:
 - inbound events are emitted only for guilds, channels, threads, and DMs the binding explicitly allows, and only when the event addresses the bot
 - outbound delivery sends bot messages to a Discord channel or thread inside the configured outbound scope
 - outbound text over Discord's 2,000-character limit is delivered in ordered chunks; the first chunk keeps the reply reference and attachment, and the receipt reports the completed chunk count
+- processing status uses Discord's temporary typing indicator; terminal status and successful delivery stop refreshes, while statuses that require user action remain visible messages
 - outbound attachments support one inline `data_base64` file upload per message
 - health checks validate the bot token against `GET /users/@me` and report the redacted effective policy
 - ingress verifies Discord interaction signatures and normalizes interaction payloads
 - `start_ingress` reports the expected public interaction endpoint and verification-key requirement when `webhook_public_url` is configured
 - `start_ingress` uses a long-running Discord websocket when no webhook URL is configured, and resolves the bot account identity before opening the gateway
 - websocket ingress resumes Discord sessions after transient reconnects when Discord marks the session resumable, and carries the proven bot identity across the resume
-- status frames render visible status messages into a Discord channel or thread inside the configured outbound scope
+- status frames that render a visible message post it to a Discord channel or thread inside the configured outbound scope; typing is authorized against the same scope before the first indicator request
 
 Not implemented:
 
@@ -196,6 +197,14 @@ Discord accepts at most 2,000 characters of message content. Longer text is spli
 Only the first chunk carries the reply reference and attachment. Its coordinates anchor the receipt, which also reports the chunk count and completion state. Reply deliveries use Discord nonces to avoid duplication during the provider's short retry window; other deliveries cannot be deduplicated without a stable delivery identity from Dispatch.
 
 When Discord rate limits a chunk, the plugin waits for the provider-stated interval within a bounded retry budget. A later failure reports partial progress, but the current Dispatch error contract cannot return the completed chunks' message references.
+
+## Notes on status
+
+`processing`, `operation_started`, and `delivering` start native typing activity and post no message. `completed`, `cancelled`, and `operation_finished` stop refreshing it. Actionable and informational statuses remain visible messages, including status kinds the plugin does not recognize.
+
+Typing uses the same destination resolution and authorization as delivery. Each destination has at most one worker, concurrent turns in that destination share it, and the first terminal frame stops it because status frames have no turn identifier. Workers are capped, expire after five minutes, and stop after a typing request fails. Successful delivery, configuration replacement, ingress stop, shutdown, and process exit also stop the relevant workers.
+
+Typing failures do not fail the managed turn. Status metadata reports `typing_state` as `started`, `active`, `at_capacity`, `failed`, `stopped`, or `inactive`, and health metadata reports content-free counts and UTC timestamps for starts, refreshes, stops, and failures.
 
 ## Notes on ingress
 
