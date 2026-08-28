@@ -1,9 +1,18 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
-use std::io::Read;
+use sha2::{Digest, Sha256};
+use std::{fmt, io::Read, time::Duration};
 use ureq::unversioned::multipart::{Form, Part};
 
 const DEFAULT_API_BASE: &str = "https://discord.com/api/v10";
+pub const MESSAGE_CONTENT_LIMIT: usize = 2_000;
+/// Units reserved for closing and reopening a continued code block.
+const CODE_FENCE_MARKER_UNITS: usize = 8;
+const CODE_FENCE_CHUNK_LIMIT: usize = MESSAGE_CONTENT_LIMIT - CODE_FENCE_MARKER_UNITS;
+/// Maximum cumulative provider-requested wait per delivery.
+const RATE_LIMIT_WAIT_BUDGET: Duration = Duration::from_secs(10);
+/// Floor for a provider-stated retry wait, so a zero value does not spin.
+const RATE_LIMIT_MIN_WAIT: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub struct DiscordClient {
@@ -23,6 +32,94 @@ pub struct DiscordMessage {
     pub id: String,
     pub channel_id: String,
 }
+
+#[derive(Debug)]
+struct DiscordMessageTooLong {
+    content_units: usize,
+}
+
+impl fmt::Display for DiscordMessageTooLong {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "message_too_long: Discord content uses {} characters; limit is {}",
+            self.content_units, MESSAGE_CONTENT_LIMIT
+        )
+    }
+}
+
+impl std::error::Error for DiscordMessageTooLong {}
+
+#[derive(Debug)]
+struct DiscordTransportError {
+    context: String,
+    code: &'static str,
+}
+
+impl fmt::Display for DiscordTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.context, self.code)
+    }
+}
+
+impl std::error::Error for DiscordTransportError {}
+
+#[derive(Debug)]
+struct DiscordChunkDeliveryError {
+    failed_chunk: usize,
+    chunk_count: usize,
+    completed_chunks: usize,
+    source: anyhow::Error,
+}
+
+impl fmt::Display for DiscordChunkDeliveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "discord_chunk_delivery_failed: chunk {} of {} failed after {} completed chunks: {}",
+            self.failed_chunk, self.chunk_count, self.completed_chunks, self.source
+        )
+    }
+}
+
+impl std::error::Error for DiscordChunkDeliveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscordApiError {
+    http_status: u16,
+    code: Option<i64>,
+    field: Option<String>,
+    detail: Option<String>,
+    /// Provider-stated wait before retrying, read from a 429 response.
+    retry_after: Option<Duration>,
+    context: String,
+}
+
+impl fmt::Display for DiscordApiError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}: discord_api_error http_status={}",
+            self.context, self.http_status
+        )?;
+        if let Some(code) = self.code {
+            write!(formatter, " code={code}")?;
+        }
+        if let Some(field) = &self.field {
+            write!(formatter, " field={field}")?;
+        }
+        if let Some(detail) = &self.detail {
+            write!(formatter, " detail={detail}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for DiscordApiError {}
 
 /// Provider-reported shape of a channel, used to prove thread parentage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,13 +222,29 @@ impl DiscordClient {
         })
     }
 
-    pub fn send_message(
+    #[cfg(test)]
+    fn send_message(
         &self,
         channel_id: &str,
         content: &str,
         reply_to_message_id: Option<&str>,
         upload: Option<&DiscordUpload>,
     ) -> Result<DiscordMessage> {
+        self.send_message_with_nonce(channel_id, content, reply_to_message_id, upload, None)
+    }
+
+    fn send_message_with_nonce(
+        &self,
+        channel_id: &str,
+        content: &str,
+        reply_to_message_id: Option<&str>,
+        upload: Option<&DiscordUpload>,
+        nonce: Option<&str>,
+    ) -> Result<DiscordMessage> {
+        let content_units = message_content_units(content);
+        if content_units > MESSAGE_CONTENT_LIMIT {
+            return Err(anyhow!(DiscordMessageTooLong { content_units }));
+        }
         let url = format!("{}/channels/{}/messages", self.base_url, channel_id);
         let mut payload = json!({
             "content": content,
@@ -140,6 +253,10 @@ impl DiscordClient {
             payload["message_reference"] = json!({
                 "message_id": reply_to_message_id,
             });
+        }
+        if let Some(nonce) = nonce {
+            payload["nonce"] = json!(nonce);
+            payload["enforce_nonce"] = json!(true);
         }
 
         let body = match upload {
@@ -164,20 +281,80 @@ impl DiscordClient {
         Ok(DiscordMessage { id, channel_id })
     }
 
+    pub fn send_message_chunks(
+        &self,
+        channel_id: &str,
+        content: &str,
+        reply_to_message_id: Option<&str>,
+        upload: Option<&DiscordUpload>,
+    ) -> Result<Vec<DiscordMessage>> {
+        let chunks = render_message_chunks(content);
+        let chunk_count = chunks.len();
+        let mut messages = Vec::with_capacity(chunk_count);
+
+        let mut wait_budget = RATE_LIMIT_WAIT_BUDGET;
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let nonce = reply_to_message_id.map(|reply_to_message_id| {
+                message_chunk_nonce(
+                    channel_id,
+                    reply_to_message_id,
+                    &chunk,
+                    index,
+                    (index == 0).then_some(upload).flatten(),
+                )
+            });
+            let send = || {
+                self.send_message_with_nonce(
+                    channel_id,
+                    &chunk,
+                    (index == 0).then_some(reply_to_message_id).flatten(),
+                    (index == 0).then_some(upload).flatten(),
+                    nonce.as_deref(),
+                )
+            };
+            let mut result = send();
+            // Discord rejects a rate-limited request before message creation.
+            while let Some(wait) = rate_limit_wait(result.as_ref().err(), wait_budget) {
+                std::thread::sleep(wait);
+                wait_budget -= wait;
+                result = send();
+            }
+            match result {
+                Ok(message) => messages.push(message),
+                Err(source) => {
+                    return Err(anyhow!(DiscordChunkDeliveryError {
+                        failed_chunk: index + 1,
+                        chunk_count,
+                        completed_chunks: messages.len(),
+                        source,
+                    }));
+                }
+            }
+        }
+
+        Ok(messages)
+    }
+
     fn get_json(&self, url: &str, context: &str) -> Result<Value> {
         let mut response = ureq::get(url)
+            .config()
+            .http_status_as_error(false)
+            .build()
             .header("Authorization", &format!("Bot {}", self.bot_token))
             .call()
-            .map_err(|error| anyhow!("{context}: {error}"))?;
+            .map_err(|error| transport_error(context, error))?;
         read_json_body(&mut response, context)
     }
 
     fn post_json(&self, url: &str, payload: Value, context: &str) -> Result<Value> {
         let mut response = ureq::post(url)
+            .config()
+            .http_status_as_error(false)
+            .build()
             .header("Authorization", &format!("Bot {}", self.bot_token))
             .header("Content-Type", "application/json")
             .send_json(payload)
-            .map_err(|error| anyhow!("{context}: {error}"))?;
+            .map_err(|error| transport_error(context, error))?;
         read_json_body(&mut response, context)
     }
 
@@ -197,15 +374,238 @@ impl DiscordClient {
             .text("payload_json", &payload_json)
             .part("files[0]", file_part);
         let mut response = ureq::post(url)
+            .config()
+            .http_status_as_error(false)
+            .build()
             .header("Authorization", &format!("Bot {}", self.bot_token))
             .send(form)
-            .map_err(|error| anyhow!("{context}: {error}"))?;
+            .map_err(|error| transport_error(context, error))?;
         read_json_body(&mut response, context)
     }
 }
 
+/// Discord states the limit in characters. UTF-16 code units are the widest
+/// reading of that, so a chunk sized this way is accepted under either count.
+fn message_content_units(content: &str) -> usize {
+    content.chars().map(char::len_utf16).sum()
+}
+
+fn split_message_content(content: &str) -> Vec<&str> {
+    split_message_content_with_limit(content, MESSAGE_CONTENT_LIMIT)
+}
+
+fn split_message_content_with_limit(content: &str, limit: usize) -> Vec<&str> {
+    if content.is_empty() {
+        return vec![content];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = content;
+    while message_content_units(remaining) > limit {
+        let hard_end = bounded_content_end(remaining, limit);
+        let candidate = &remaining[..hard_end];
+        let split_at = preferred_split(candidate, limit).unwrap_or(hard_end);
+        let split_at = backtick_run_start(remaining, split_at);
+        chunks.push(&remaining[..split_at]);
+        remaining = &remaining[split_at..];
+    }
+    chunks.push(remaining);
+    chunks
+}
+
+/// Keep a split out of a backtick run so delimiter parity remains intact.
+fn backtick_run_start(content: &str, split_at: usize) -> usize {
+    let bytes = content.as_bytes();
+    if split_at == 0 || split_at >= bytes.len() || bytes[split_at] != b'`' {
+        return split_at;
+    }
+    let mut start = split_at;
+    while start > 0 && bytes[start - 1] == b'`' {
+        start -= 1;
+    }
+    // Retain the hard split when moving it would prevent progress.
+    if start == 0 { split_at } else { start }
+}
+
+fn render_message_chunks(content: &str) -> Vec<String> {
+    if message_content_units(content) <= MESSAGE_CONTENT_LIMIT || !content.contains("```") {
+        return split_message_content(content)
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect();
+    }
+
+    // Track triple-backtick parity across the original chunks.
+    let raw_chunks = split_message_content_with_limit(content, CODE_FENCE_CHUNK_LIMIT);
+    let chunk_count = raw_chunks.len();
+    let mut code_fence_open = false;
+    raw_chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            let mut chunk = String::with_capacity(raw.len() + 8);
+            if code_fence_open {
+                chunk.push_str("```\n");
+            }
+            chunk.push_str(raw);
+            if raw.match_indices("```").count() % 2 == 1 {
+                code_fence_open = !code_fence_open;
+            }
+            if code_fence_open && index + 1 < chunk_count {
+                chunk.push_str("\n```");
+            }
+            chunk
+        })
+        .collect()
+}
+
+fn bounded_content_end(content: &str, limit: usize) -> usize {
+    let mut units = 0;
+    let mut end = 0;
+    for (index, character) in content.char_indices() {
+        let width = character.len_utf16();
+        if units + width > limit {
+            break;
+        }
+        units += width;
+        end = index + character.len_utf8();
+    }
+    end
+}
+
+fn preferred_split(candidate: &str, limit: usize) -> Option<usize> {
+    candidate
+        .rfind("\n\n")
+        .map(|index| index + 2)
+        .filter(|index| preferred_boundary_is_full(candidate, *index, limit))
+        .or_else(|| {
+            candidate
+                .rfind('\n')
+                .map(|index| index + 1)
+                .filter(|index| preferred_boundary_is_full(candidate, *index, limit))
+        })
+        .or_else(|| {
+            candidate
+                .char_indices()
+                .rev()
+                .find(|(index, character)| {
+                    character.is_whitespace()
+                        && preferred_boundary_is_full(
+                            candidate,
+                            *index + character.len_utf8(),
+                            limit,
+                        )
+                })
+                .map(|(index, character)| index + character.len_utf8())
+        })
+}
+
+fn preferred_boundary_is_full(candidate: &str, index: usize, limit: usize) -> bool {
+    index > 0 && message_content_units(&candidate[..index]) >= limit / 2
+}
+
+/// Return the permitted wait for a rate-limited request.
+fn rate_limit_wait(error: Option<&anyhow::Error>, budget: Duration) -> Option<Duration> {
+    let api_error = error?
+        .chain()
+        .find_map(|source| source.downcast_ref::<DiscordApiError>())?;
+    if api_error.http_status != 429 {
+        return None;
+    }
+    let wait = api_error.retry_after?.max(RATE_LIMIT_MIN_WAIT);
+    (wait <= budget).then_some(wait)
+}
+
+/// Parse the provider wait, preferring the more precise response body.
+fn parse_retry_after(header_seconds: Option<f64>, body: Option<&Value>) -> Option<Duration> {
+    let body_seconds = body
+        .and_then(|body| body.get("retry_after"))
+        .and_then(Value::as_f64);
+    body_seconds
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+        .or_else(|| header_seconds.and_then(|seconds| Duration::try_from_secs_f64(seconds).ok()))
+}
+
+fn transport_error(context: &str, error: ureq::Error) -> anyhow::Error {
+    let code = match error {
+        ureq::Error::Timeout(_) => "discord_timeout",
+        _ => "discord_transport_error",
+    };
+    anyhow!(DiscordTransportError {
+        context: context.to_string(),
+        code,
+    })
+}
+
+fn message_chunk_nonce(
+    channel_id: &str,
+    reply_to_message_id: &str,
+    content: &str,
+    index: usize,
+    upload: Option<&DiscordUpload>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest_field(&mut digest, channel_id.as_bytes());
+    digest_field(&mut digest, reply_to_message_id.as_bytes());
+    digest_field(&mut digest, &(index as u64).to_be_bytes());
+    digest_field(&mut digest, content.as_bytes());
+    if let Some(upload) = upload {
+        digest_field(&mut digest, upload.name.as_bytes());
+        digest_field(&mut digest, upload.mime_type.as_bytes());
+        digest_field(&mut digest, &upload.data);
+    }
+    format!("dispatch-{}", hex::encode(&digest.finalize()[..8]))
+}
+
+fn digest_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
+pub fn delivery_error_code(error: &anyhow::Error) -> Option<&'static str> {
+    if let Some(partial) = error
+        .chain()
+        .find_map(|source| source.downcast_ref::<DiscordChunkDeliveryError>())
+        && partial.completed_chunks > 0
+    {
+        return Some("partial_delivery");
+    }
+    if error
+        .chain()
+        .any(|source| source.is::<DiscordMessageTooLong>())
+    {
+        return Some("message_too_long");
+    }
+    if let Some(transport) = error
+        .chain()
+        .find_map(|source| source.downcast_ref::<DiscordTransportError>())
+    {
+        return Some(match transport.code {
+            "discord_timeout" => "provider_timeout",
+            _ => "provider_transport_error",
+        });
+    }
+    error
+        .chain()
+        .find_map(|source| source.downcast_ref::<DiscordApiError>())
+        .map(|error| match error.http_status {
+            400 => "provider_invalid_request",
+            401 => "provider_authentication_failed",
+            403 => "provider_permission_denied",
+            404 => "provider_not_found",
+            429 => "provider_rate_limited",
+            500..=599 => "provider_unavailable",
+            _ => "provider_error",
+        })
+}
+
 fn read_json_body(response: &mut ureq::http::Response<ureq::Body>, context: &str) -> Result<Value> {
     let status = response.status();
+    let retry_after_header = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<f64>().ok());
     let mut body = response
         .body_mut()
         .with_config()
@@ -215,10 +615,69 @@ fn read_json_body(response: &mut ureq::http::Response<ureq::Body>, context: &str
     body.read_to_string(&mut text)
         .with_context(|| format!("{context}: failed to read response body"))?;
     if !status.is_success() {
-        bail!("{context}: HTTP {}: {}", status.as_u16(), text);
+        let parsed = serde_json::from_str::<Value>(&text).ok();
+        let code = parsed
+            .as_ref()
+            .and_then(|body| body.get("code"))
+            .and_then(Value::as_i64);
+        let (field, detail) = parsed
+            .as_ref()
+            .and_then(|body| body.get("errors"))
+            .and_then(|errors| find_error_detail(errors, &mut Vec::new()))
+            .unwrap_or((None, None));
+        return Err(anyhow!(DiscordApiError {
+            http_status: status.as_u16(),
+            code,
+            field,
+            detail,
+            retry_after: parse_retry_after(retry_after_header, parsed.as_ref()),
+            context: context.to_string(),
+        }));
     }
     serde_json::from_str(&text)
         .with_context(|| format!("{context}: failed to parse response body as JSON"))
+}
+
+fn find_error_detail(
+    value: &Value,
+    path: &mut Vec<String>,
+) -> Option<(Option<String>, Option<String>)> {
+    let object = value.as_object()?;
+    if let Some(detail) = object
+        .get("_errors")
+        .and_then(Value::as_array)
+        .and_then(|errors| errors.first())
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .and_then(safe_token)
+    {
+        let field = (!path.is_empty()).then(|| path.join("."));
+        return Some((field, Some(detail)));
+    }
+
+    for (key, child) in object {
+        if key == "_errors" {
+            continue;
+        }
+        let Some(key) = safe_token(key) else {
+            continue;
+        };
+        path.push(key);
+        if let Some(detail) = find_error_detail(child, path) {
+            return Some(detail);
+        }
+        path.pop();
+    }
+    None
+}
+
+fn safe_token(value: &str) -> Option<String> {
+    (!value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    .then(|| value.to_string())
 }
 
 #[cfg(test)]
@@ -238,25 +697,349 @@ mod tests {
     }
 
     #[test]
-    fn send_message_posts_multipart_attachment_payload() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let address = listener.local_addr().expect("listener addr");
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept connection");
-            let request = read_request(&mut stream);
-            let body = br#"{"id":"msg-1","channel_id":"chan-1"}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .expect("write response headers");
-            stream.write_all(body).expect("write response body");
-            stream.flush().expect("flush response");
-            request
+    fn message_content_at_the_provider_limit_stays_in_one_chunk() {
+        let content = "a".repeat(MESSAGE_CONTENT_LIMIT);
+
+        let chunks = split_message_content(&content);
+
+        assert_eq!(chunks, vec![content.as_str()]);
+    }
+
+    #[test]
+    fn message_content_over_the_provider_limit_is_complete_and_bounded() {
+        let content = "a".repeat(MESSAGE_CONTENT_LIMIT + 52);
+
+        let chunks = split_message_content(&content);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.concat(), content);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| message_content_units(chunk) <= MESSAGE_CONTENT_LIMIT)
+        );
+    }
+
+    #[test]
+    fn message_chunks_use_unicode_safe_boundaries() {
+        let content = format!("{}{}", "🙂".repeat(1_001), "e\u{301}".repeat(20));
+
+        let chunks = split_message_content(&content);
+
+        assert_eq!(chunks.concat(), content);
+        assert!(chunks.len() > 1);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| message_content_units(chunk) <= MESSAGE_CONTENT_LIMIT)
+        );
+    }
+
+    #[test]
+    fn message_chunks_prefer_paragraph_boundaries() {
+        let content = format!("{}\n\n{}", "a".repeat(1_200), "b".repeat(1_200));
+
+        let chunks = split_message_content(&content);
+
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].ends_with("\n\n"));
+        assert_eq!(chunks.concat(), content);
+    }
+
+    #[test]
+    fn message_chunks_do_not_stop_at_an_early_boundary() {
+        let content = format!("intro\n\n{}", "a".repeat(MESSAGE_CONTENT_LIMIT + 1));
+
+        let chunks = split_message_content(&content);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(message_content_units(chunks[0]), MESSAGE_CONTENT_LIMIT);
+        assert_eq!(chunks.concat(), content);
+    }
+
+    #[test]
+    fn message_chunks_balance_fenced_code() {
+        let content = format!("```rust\n{}\n```", "a".repeat(MESSAGE_CONTENT_LIMIT + 1));
+
+        let chunks = render_message_chunks(&content);
+
+        assert_eq!(chunks.len(), 2);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| message_content_units(chunk) <= MESSAGE_CONTENT_LIMIT)
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.match_indices("```").count() % 2 == 0)
+        );
+        let reconstructed = format!(
+            "{}{}",
+            chunks[0].strip_suffix("\n```").expect("continuation close"),
+            chunks[1].strip_prefix("```\n").expect("continuation open")
+        );
+        assert_eq!(reconstructed, content);
+    }
+
+    #[test]
+    fn message_chunks_never_divide_a_fence_delimiter() {
+        // The hard boundary lands inside the closing delimiter of this block.
+        let content = format!("```\n{}```{}", "a".repeat(1_987), "b".repeat(1_500));
+
+        let chunks = render_message_chunks(&content);
+
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| message_content_units(chunk) <= MESSAGE_CONTENT_LIMIT)
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.match_indices("```").count() % 2 == 0),
+            "a divided delimiter would leave a code block open to the end of the message"
+        );
+    }
+
+    #[test]
+    fn message_chunks_keep_every_backtick_run_intact() {
+        let content = format!("{}```{}", "a".repeat(1_999), "b".repeat(1_000));
+
+        let chunks = split_message_content(&content);
+
+        assert_eq!(chunks.concat(), content);
+        for pair in chunks.windows(2) {
+            assert!(
+                !(pair[0].ends_with('`') && pair[1].starts_with('`')),
+                "a backtick run was divided across a chunk boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_longer_than_one_chunk_still_advances() {
+        let content = "`".repeat(MESSAGE_CONTENT_LIMIT * 2 + 5);
+
+        let chunks = split_message_content(&content);
+
+        assert_eq!(chunks.concat(), content);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| message_content_units(chunk) <= MESSAGE_CONTENT_LIMIT)
+        );
+    }
+
+    #[test]
+    fn rate_limited_chunks_wait_for_the_provider_and_then_succeed() {
+        // The first chunk is rate limited once, then both chunks are accepted.
+        let (base_url, server) = spawn_provider(vec![
+            (
+                "429 Too Many Requests",
+                r#"{"message":"PRIVATE SENTINEL","retry_after":0.05,"global":false}"#.to_string(),
+            ),
+            created_message("msg-1"),
+            created_message("msg-2"),
+        ]);
+        let client = DiscordClient::new_for_tests(&base_url);
+        let content = "a".repeat(MESSAGE_CONTENT_LIMIT + 1);
+
+        let messages = client
+            .send_message_chunks("chan-1", &content, None, None)
+            .expect("rate limited chunk is retried");
+
+        assert_eq!(messages.len(), 2);
+        let requests = server.join().expect("server thread");
+        assert_eq!(requests.len(), 3, "the limited chunk is sent again");
+        let first: Value = serde_json::from_slice(&requests[0].body).expect("first request JSON");
+        let retried: Value = serde_json::from_slice(&requests[1].body).expect("retry request JSON");
+        assert_eq!(first["content"], retried["content"]);
+    }
+
+    #[test]
+    fn a_rate_limit_beyond_the_wait_budget_is_not_retried() {
+        let error = anyhow!(DiscordApiError {
+            http_status: 429,
+            code: None,
+            field: None,
+            detail: None,
+            retry_after: Some(Duration::from_secs(120)),
+            context: "failed to send Discord message".to_string(),
         });
 
-        let client = DiscordClient::new_for_tests(&format!("http://{address}/api/v10"));
+        assert_eq!(rate_limit_wait(Some(&error), RATE_LIMIT_WAIT_BUDGET), None);
+        assert_eq!(delivery_error_code(&error), Some("provider_rate_limited"));
+    }
+
+    #[test]
+    fn a_rate_limit_without_a_valid_wait_is_not_retried() {
+        for retry_after in [
+            None,
+            parse_retry_after(None, Some(&json!({ "retry_after": 1e300 }))),
+        ] {
+            let error = anyhow!(DiscordApiError {
+                http_status: 429,
+                code: None,
+                field: None,
+                detail: None,
+                retry_after,
+                context: "failed to send Discord message".to_string(),
+            });
+
+            assert_eq!(rate_limit_wait(Some(&error), RATE_LIMIT_WAIT_BUDGET), None);
+            assert_eq!(delivery_error_code(&error), Some("provider_rate_limited"));
+        }
+    }
+
+    #[test]
+    fn an_invalid_body_retry_interval_falls_back_to_the_header() {
+        assert_eq!(
+            parse_retry_after(Some(1.5), Some(&json!({ "retry_after": 1e300 }))),
+            Some(Duration::from_millis(1_500))
+        );
+    }
+
+    #[test]
+    fn send_message_rejects_over_limit_content_before_transport() {
+        let client = DiscordClient::new_for_tests("http://127.0.0.1:1/api/v10");
+        let content = "a".repeat(MESSAGE_CONTENT_LIMIT + 1);
+
+        let error = client
+            .send_message("chan-1", &content, None, None)
+            .expect_err("over-limit message");
+
+        assert!(error.to_string().starts_with("message_too_long:"));
+        assert_eq!(delivery_error_code(&error), Some("message_too_long"));
+    }
+
+    #[test]
+    fn send_message_chunks_preserves_order_and_replies_only_once() {
+        let (base_url, server) =
+            spawn_provider(vec![created_message("msg-1"), created_message("msg-2")]);
+        let client = DiscordClient::new_for_tests(&base_url);
+        let content = "a".repeat(MESSAGE_CONTENT_LIMIT + 1);
+        let messages = client
+            .send_message_chunks("chan-1", &content, Some("parent-1"), None)
+            .expect("send chunks");
+
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["msg-1", "msg-2"]
+        );
+        let requests = server.join().expect("server thread");
+        let first: Value = serde_json::from_slice(&requests[0].body).expect("first request JSON");
+        let second: Value = serde_json::from_slice(&requests[1].body).expect("second request JSON");
+        assert_eq!(
+            first["content"].as_str().map(message_content_units),
+            Some(MESSAGE_CONTENT_LIMIT)
+        );
+        assert_eq!(first["message_reference"]["message_id"], "parent-1");
+        assert_eq!(first["enforce_nonce"], true);
+        assert_eq!(first["nonce"].as_str().map(str::len), Some(25));
+        assert_eq!(second["content"], "a");
+        assert!(second.get("message_reference").is_none());
+        assert_eq!(second["enforce_nonce"], true);
+        assert_eq!(second["nonce"].as_str().map(str::len), Some(25));
+        assert_ne!(first["nonce"], second["nonce"]);
+    }
+
+    #[test]
+    fn send_message_chunks_uploads_an_attachment_only_once() {
+        let (base_url, server) =
+            spawn_provider(vec![created_message("msg-1"), created_message("msg-2")]);
+        let client = DiscordClient::new_for_tests(&base_url);
+        let content = "a".repeat(MESSAGE_CONTENT_LIMIT + 1);
+        let upload = DiscordUpload {
+            name: "report.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            data: b"report".to_vec(),
+        };
+        client
+            .send_message_chunks("chan-1", &content, Some("parent-1"), Some(&upload))
+            .expect("send chunks");
+
+        let requests = server.join().expect("server thread");
+        assert!(
+            requests[0]
+                .headers
+                .get("content-type")
+                .is_some_and(|value| value.starts_with("multipart/form-data; boundary="))
+        );
+        let first_body = String::from_utf8_lossy(&requests[0].body);
+        assert!(first_body.contains("report.txt"));
+        assert!(first_body.contains("parent-1"));
+        assert!(first_body.contains("enforce_nonce"));
+
+        assert_eq!(
+            requests[1].headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        let second: Value = serde_json::from_slice(&requests[1].body).expect("second request JSON");
+        assert!(second.get("message_reference").is_none());
+        assert!(second.get("attachments").is_none());
+    }
+
+    #[test]
+    fn chunk_failure_reports_progress_and_redacted_provider_classification() {
+        let (base_url, server) = spawn_provider(vec![
+            created_message("msg-1"),
+            (
+                "400 Bad Request",
+                r#"{"message":"PRIVATE SENTINEL","code":50035,"errors":{"content":{"_errors":[{"code":"BASE_TYPE_MAX_LENGTH","message":"PRIVATE SENTINEL"}]}}}"#.to_string(),
+            ),
+        ]);
+        let client = DiscordClient::new_for_tests(&base_url);
+        let content = "a".repeat(MESSAGE_CONTENT_LIMIT + 1);
+        let error = client
+            .send_message_chunks("chan-1", &content, None, None)
+            .expect_err("second chunk fails");
+
+        let partial = error
+            .downcast_ref::<DiscordChunkDeliveryError>()
+            .expect("partial delivery error");
+        assert_eq!(partial.failed_chunk, 2);
+        assert_eq!(partial.chunk_count, 2);
+        assert_eq!(partial.completed_chunks, 1);
+        assert_eq!(delivery_error_code(&error), Some("partial_delivery"));
+        let message = error.to_string();
+        assert!(message.contains("http_status=400"));
+        assert!(message.contains("code=50035"));
+        assert!(message.contains("field=content"));
+        assert!(message.contains("detail=BASE_TYPE_MAX_LENGTH"));
+        assert!(!message.contains("PRIVATE SENTINEL"));
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn provider_statuses_have_stable_delivery_error_codes() {
+        for (status, expected) in [
+            (400, "provider_invalid_request"),
+            (401, "provider_authentication_failed"),
+            (403, "provider_permission_denied"),
+            (404, "provider_not_found"),
+            (429, "provider_rate_limited"),
+            (500, "provider_unavailable"),
+        ] {
+            let error = anyhow!(DiscordApiError {
+                http_status: status,
+                code: None,
+                field: None,
+                detail: None,
+                retry_after: None,
+                context: "failed to send Discord message".to_string(),
+            });
+            assert_eq!(delivery_error_code(&error), Some(expected));
+        }
+    }
+
+    #[test]
+    fn send_message_posts_multipart_attachment_payload() {
+        let (base_url, server) = spawn_provider(vec![created_message("msg-1")]);
+        let client = DiscordClient::new_for_tests(&base_url);
         let message = client
             .send_message(
                 "chan-1",
@@ -273,7 +1056,8 @@ mod tests {
         assert_eq!(message.id, "msg-1");
         assert_eq!(message.channel_id, "chan-1");
 
-        let request = server.join().expect("server thread");
+        let requests = server.join().expect("server thread");
+        let request = &requests[0];
         assert_eq!(
             request.request_line,
             "POST /api/v10/channels/chan-1/messages HTTP/1.1"
@@ -296,6 +1080,38 @@ mod tests {
         assert!(body.contains("\"message_id\":\"parent-1\""));
         assert!(body.contains("report.txt"));
         assert!(body.contains("hello"));
+    }
+
+    /// Answer one canned response per expected request and return what arrived.
+    fn spawn_provider(
+        responses: Vec<(&'static str, String)>,
+    ) -> (String, thread::JoinHandle<Vec<CapturedRequest>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("listener addr");
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept connection");
+                requests.push(read_request(&mut stream));
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write response");
+                stream.flush().expect("flush response");
+            }
+            requests
+        });
+        (format!("http://{address}/api/v10"), handle)
+    }
+
+    fn created_message(id: &str) -> (&'static str, String) {
+        (
+            "200 OK",
+            format!(r#"{{"id":"{id}","channel_id":"chan-1"}}"#),
+        )
     }
 
     fn read_request(stream: &mut std::net::TcpStream) -> CapturedRequest {

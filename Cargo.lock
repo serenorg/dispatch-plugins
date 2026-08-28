@@ -413,6 +413,7 @@ dependencies = [
  "jiff",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tungstenite 0.29.0",
  "ureq",
 ]

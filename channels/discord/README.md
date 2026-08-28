@@ -20,6 +20,7 @@ Behavior:
 
 - inbound events are emitted only for guilds, channels, threads, and DMs the binding explicitly allows, and only when the event addresses the bot
 - outbound delivery sends bot messages to a Discord channel or thread inside the configured outbound scope
+- outbound text over Discord's 2,000-character limit is delivered in ordered chunks; the first chunk keeps the reply reference and attachment, and the receipt reports the completed chunk count
 - outbound attachments support one inline `data_base64` file upload per message
 - health checks validate the bot token against `GET /users/@me` and report the redacted effective policy
 - ingress verifies Discord interaction signatures and normalizes interaction payloads
@@ -187,6 +188,14 @@ dispatch channel call channel-discord \
 A `push`, `deliver`, or `status` request to a destination outside the outbound allowlist is rejected before any Discord request, with the reason code `unauthorized_destination`.
 
 The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Dispatch operators normally use the host CLI rather than writing raw envelopes.
+
+## Notes on delivery
+
+Discord accepts at most 2,000 characters of message content. Longer text is split into ordered chunks at natural Unicode-safe boundaries, with code fences continued when necessary. `configure` and `health` report the limit and chunking behavior.
+
+Only the first chunk carries the reply reference and attachment. Its coordinates anchor the receipt, which also reports the chunk count and completion state. Reply deliveries use Discord nonces to avoid duplication during the provider's short retry window; other deliveries cannot be deduplicated without a stable delivery identity from Dispatch.
+
+When Discord rate limits a chunk, the plugin waits for the provider-stated interval within a bounded retry budget. A later failure reports partial progress, but the current Dispatch error contract cannot return the completed chunks' message references.
 
 ## Notes on ingress
 

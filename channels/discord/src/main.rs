@@ -29,7 +29,9 @@ use tungstenite::{
 mod discord_api;
 mod protocol;
 
-use discord_api::{DiscordChannelInfo, DiscordClient, DiscordUpload};
+use discord_api::{
+    DiscordChannelInfo, DiscordClient, DiscordUpload, MESSAGE_CONTENT_LIMIT, delivery_error_code,
+};
 use protocol::{
     CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ChannelPolicy, ConfiguredChannel,
     DeliveryReceipt, HealthReport, InboundActivation, InboundActor, InboundAttachment,
@@ -84,6 +86,10 @@ const META_REPLY_DELIVERY: &str = "reply_delivery";
 const META_CHANNEL_WILDCARD: &str = "channel_wildcard";
 const META_BOT_USER_ID: &str = "bot_user_id";
 const META_PARENT_CHANNEL_ID: &str = "parent_channel_id";
+const META_MAX_MESSAGE_CHARACTERS: &str = "max_message_characters";
+const META_LONG_TEXT_DELIVERY: &str = "long_text_delivery";
+const META_CHUNK_COUNT: &str = "chunk_count";
+const META_DELIVERY_STATE: &str = "delivery_state";
 
 // Content-free ingress health metadata.
 const META_FRAMES_TOTAL: &str = "frames_dispatch_total";
@@ -237,7 +243,10 @@ fn main() -> Result<()> {
 
         let response = match handle_request(&envelope, &stdout_lock, &mut ingress_worker) {
             Ok(response) => response,
-            Err(error) => plugin_error("internal_error", error.to_string()),
+            Err(error) => plugin_error(
+                delivery_error_code(&error).unwrap_or("internal_error"),
+                error.to_string(),
+            ),
         };
 
         let json = response_to_jsonrpc(&request_id, &response).map_err(|error| anyhow!(error))?;
@@ -345,6 +354,11 @@ fn configure(config: &ChannelConfig) -> Result<ConfiguredChannel> {
             default_channel_id.clone(),
         );
     }
+    metadata.insert(
+        META_MAX_MESSAGE_CHARACTERS.to_string(),
+        MESSAGE_CONTENT_LIMIT.to_string(),
+    );
+    metadata.insert(META_LONG_TEXT_DELIVERY.to_string(), "chunked".to_string());
     metadata.extend(policy.diagnostics());
     if let Some(endpoint) = resolved_endpoint(config) {
         let public_key_env = interaction_public_key_env(config);
@@ -1301,6 +1315,11 @@ fn health(config: &ChannelConfig) -> Result<HealthReport> {
             default_channel_id.clone(),
         );
     }
+    metadata.insert(
+        META_MAX_MESSAGE_CHARACTERS.to_string(),
+        MESSAGE_CONTENT_LIMIT.to_string(),
+    );
+    metadata.insert(META_LONG_TEXT_DELIVERY.to_string(), "chunked".to_string());
     metadata.extend(policy.diagnostics());
 
     Ok(HealthReport {
@@ -2771,6 +2790,7 @@ fn send_status(config: &ChannelConfig, update: &StatusFrame) -> Result<StatusAcc
             let reason_code = error
                 .downcast_ref::<OutboundRejected>()
                 .map(|rejected| rejected.code)
+                .or_else(|| delivery_error_code(&error))
                 .unwrap_or("delivery_failed");
             return Ok(rejected_status(reason_code, error.to_string()));
         }
@@ -2799,17 +2819,22 @@ fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<Delivery
     )?;
     let reply_to_message_id = resolve_reply_to_message_id(message);
     let upload = discord_upload(message)?;
-    let posted = client.send_message(
+    let posted = client.send_message_chunks(
         &destination,
         &message.content,
         reply_to_message_id.as_deref(),
         upload.as_ref(),
     )?;
+    let primary = posted
+        .first()
+        .ok_or_else(|| anyhow!("discord delivery returned no message references"))?;
 
     let mut metadata = BTreeMap::new();
     metadata.insert(META_PLATFORM.to_string(), PLATFORM_DISCORD.to_string());
-    metadata.insert(META_CHANNEL_ID.to_string(), posted.channel_id.clone());
+    metadata.insert(META_CHANNEL_ID.to_string(), primary.channel_id.clone());
     metadata.insert(META_RESOLVED_DESTINATION.to_string(), destination.clone());
+    metadata.insert(META_CHUNK_COUNT.to_string(), posted.len().to_string());
+    metadata.insert(META_DELIVERY_STATE.to_string(), "complete".to_string());
     if upload.is_some() {
         metadata.insert(META_ATTACHMENT_COUNT.to_string(), "1".to_string());
     }
@@ -2825,8 +2850,8 @@ fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<Delivery
 
     Ok(DeliveryReceipt {
         reference: MessageRef {
-            conversation_id: posted.channel_id,
-            message_id: posted.id,
+            conversation_id: primary.channel_id.clone(),
+            message_id: primary.id.clone(),
             // A thread is itself the addressed Discord channel, so the thread
             // route is already `conversation_id`; `metadata` keeps the label.
             thread_id: None,
