@@ -1,7 +1,11 @@
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{fmt, io::Read, time::Duration};
+use std::{
+    fmt,
+    io::{ErrorKind, Read},
+    time::Duration,
+};
 use ureq::unversioned::multipart::{Form, Part};
 
 const DEFAULT_API_BASE: &str = "https://discord.com/api/v10";
@@ -13,8 +17,13 @@ const CODE_FENCE_CHUNK_LIMIT: usize = MESSAGE_CONTENT_LIMIT - CODE_FENCE_MARKER_
 const RATE_LIMIT_WAIT_BUDGET: Duration = Duration::from_secs(10);
 /// Floor for a provider-stated retry wait, so a zero value does not spin.
 const RATE_LIMIT_MIN_WAIT: Duration = Duration::from_millis(250);
+/// Bound provider reads so read-back cannot occupy the plugin indefinitely.
+const READ_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound typing requests so worker shutdown cannot wait indefinitely.
 const TYPING_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Discord JSON error codes that prove an addressed resource is absent.
+const UNKNOWN_CHANNEL: i64 = 10_003;
+const UNKNOWN_MESSAGE: i64 = 10_008;
 
 #[derive(Debug)]
 pub struct DiscordClient {
@@ -33,6 +42,21 @@ pub struct DiscordIdentity {
 pub struct DiscordMessage {
     pub id: String,
     pub channel_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DiscordFetchedMessage {
+    pub(super) guild_id: Option<String>,
+    pub(super) content: String,
+    pub(super) author: Option<DiscordFetchedMessageAuthor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DiscordFetchedMessageAuthor {
+    pub(super) id: String,
+    pub(super) display_name: Option<String>,
+    pub(super) username: Option<String>,
+    pub(super) is_bot: bool,
 }
 
 #[derive(Debug)]
@@ -65,6 +89,29 @@ impl fmt::Display for DiscordTransportError {
 }
 
 impl std::error::Error for DiscordTransportError {}
+
+/// A provider response that cannot be trusted as an answer to the request that
+/// produced it. `reason` is a fixed token so no response body reaches the host.
+#[derive(Debug)]
+struct DiscordInvalidResponse {
+    context: String,
+    reason: &'static str,
+    /// Response field the reason refers to. Field names are this plugin's own
+    /// tokens, never provider data.
+    field: Option<&'static str>,
+}
+
+impl fmt::Display for DiscordInvalidResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.context, self.reason)?;
+        if let Some(field) = self.field {
+            write!(formatter, " field={field}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for DiscordInvalidResponse {}
 
 #[derive(Debug)]
 struct DiscordChunkDeliveryError {
@@ -197,31 +244,116 @@ impl DiscordClient {
     /// allowlist applies.
     pub fn channel(&self, channel_id: &str) -> Result<DiscordChannelInfo> {
         let url = format!("{}/channels/{}", self.base_url, channel_id);
-        let body = self.get_json(&url, "failed to query Discord channel")?;
+        let context = "failed to query Discord channel";
+        let body = self.get_json_with_rate_limit(&url, context)?;
         let kind = body
             .get("type")
             .and_then(Value::as_u64)
             .and_then(|kind| u8::try_from(kind).ok())
-            .ok_or_else(|| anyhow!("discord channel response missing type"))?;
+            .ok_or_else(|| {
+                invalid_response_field(context, "Discord returned an invalid field", "type")
+            })?;
+        let recipient_ids = match body.get("recipients") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(recipients)) => recipients
+                .iter()
+                .map(|recipient| required_response_string(recipient, "id", context))
+                .collect::<Result<Vec<_>>>()?,
+            Some(_) => {
+                return Err(invalid_response_field(
+                    context,
+                    "Discord returned an invalid field",
+                    "recipients",
+                ));
+            }
+        };
         Ok(DiscordChannelInfo {
             kind,
-            parent_id: body
-                .get("parent_id")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            guild_id: body
-                .get("guild_id")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            recipient_ids: body
-                .get("recipients")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|recipient| recipient.get("id").and_then(Value::as_str))
-                .map(ToOwned::to_owned)
-                .collect(),
+            parent_id: optional_response_string(&body, "parent_id", context)?,
+            guild_id: optional_response_string(&body, "guild_id", context)?,
+            recipient_ids,
         })
+    }
+
+    /// Fetch one exact message without listing neighboring channel history.
+    pub(super) fn fetch_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        expected_guild_id: Option<&str>,
+    ) -> Result<Option<DiscordFetchedMessage>> {
+        let url = format!(
+            "{}/channels/{}/messages/{}",
+            self.base_url, channel_id, message_id
+        );
+        let context = "failed to fetch Discord message";
+        let body = match self.get_json_with_rate_limit(&url, context) {
+            Ok(body) => body,
+            Err(error) if message_reference_is_absent(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+
+        let id = required_response_string(&body, "id", context)?;
+        let returned_channel_id = required_response_string(&body, "channel_id", context)?;
+        if id != message_id || returned_channel_id != channel_id {
+            return Err(invalid_response(
+                context,
+                "Discord returned different message coordinates",
+            ));
+        }
+
+        let member_nick = match body.get("member") {
+            None | Some(Value::Null) => None,
+            Some(member @ Value::Object(_)) => optional_response_string(member, "nick", context)?,
+            Some(_) => {
+                return Err(invalid_response_field(
+                    context,
+                    "Discord returned an invalid field",
+                    "member",
+                ));
+            }
+        };
+        let webhook_author = optional_response_string(&body, "webhook_id", context)?.is_some();
+        let author = match body.get("author") {
+            None | Some(Value::Null) => None,
+            Some(author @ Value::Object(_)) => Some(DiscordFetchedMessageAuthor {
+                id: required_response_string(author, "id", context)?,
+                display_name: member_nick.or(optional_response_string(
+                    author,
+                    "global_name",
+                    context,
+                )?),
+                username: optional_response_string(author, "username", context)?,
+                is_bot: optional_response_bool(author, "bot", context)?.unwrap_or(false)
+                    || webhook_author,
+            }),
+            Some(_) => {
+                return Err(invalid_response_field(
+                    context,
+                    "Discord returned an invalid field",
+                    "author",
+                ));
+            }
+        };
+
+        let guild_id = optional_response_string(&body, "guild_id", context)?;
+        // Discord omits `guild_id` on this route, so absence is expected; a
+        // reported guild that disagrees with the authorized channel is not.
+        if guild_id
+            .as_deref()
+            .is_some_and(|guild_id| expected_guild_id != Some(guild_id))
+        {
+            return Err(invalid_response(
+                context,
+                "Discord returned a different message guild",
+            ));
+        }
+
+        Ok(Some(DiscordFetchedMessage {
+            guild_id,
+            content: required_response_string(&body, "content", context)?,
+            author,
+        }))
     }
 
     #[cfg(test)]
@@ -270,17 +402,19 @@ impl DiscordClient {
             )?,
             None => self.post_json(&url, payload, "failed to send Discord message")?,
         };
-        let id = body
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("discord message response missing id"))?
-            .to_string();
-        let channel_id = body
-            .get("channel_id")
-            .and_then(Value::as_str)
-            .unwrap_or(channel_id)
-            .to_string();
-        Ok(DiscordMessage { id, channel_id })
+        let context = "failed to send Discord message";
+        let id = required_response_string(&body, "id", context)?;
+        let returned_channel_id = required_response_string(&body, "channel_id", context)?;
+        if returned_channel_id != channel_id {
+            return Err(invalid_response(
+                context,
+                "Discord returned a different delivery channel",
+            ));
+        }
+        Ok(DiscordMessage {
+            id,
+            channel_id: returned_channel_id,
+        })
     }
 
     pub fn send_message_chunks(
@@ -354,11 +488,28 @@ impl DiscordClient {
         let mut response = ureq::get(url)
             .config()
             .http_status_as_error(false)
+            .timeout_global(Some(READ_REQUEST_TIMEOUT))
             .build()
             .header("Authorization", &format!("Bot {}", self.bot_token))
             .call()
             .map_err(|error| transport_error(context, error))?;
         read_json_body(&mut response, context)
+    }
+
+    fn get_json_with_rate_limit(&self, url: &str, context: &str) -> Result<Value> {
+        let mut wait_budget = RATE_LIMIT_WAIT_BUDGET;
+        loop {
+            match self.get_json(url, context) {
+                Ok(body) => return Ok(body),
+                Err(error) => {
+                    let Some(wait) = rate_limit_wait(Some(&error), wait_budget) else {
+                        return Err(error);
+                    };
+                    std::thread::sleep(wait);
+                    wait_budget -= wait;
+                }
+            }
+        }
     }
 
     fn post_json(&self, url: &str, payload: Value, context: &str) -> Result<Value> {
@@ -552,6 +703,95 @@ fn transport_error(context: &str, error: ureq::Error) -> anyhow::Error {
     })
 }
 
+fn response_body_error(context: &str, error: std::io::Error) -> anyhow::Error {
+    let code = match error.kind() {
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => "discord_timeout",
+        _ => "discord_transport_error",
+    };
+    anyhow!(DiscordTransportError {
+        context: context.to_string(),
+        code,
+    })
+}
+
+fn invalid_response(context: &str, reason: &'static str) -> anyhow::Error {
+    anyhow!(DiscordInvalidResponse {
+        context: context.to_string(),
+        reason,
+        field: None,
+    })
+}
+
+fn invalid_response_field(
+    context: &str,
+    reason: &'static str,
+    field: &'static str,
+) -> anyhow::Error {
+    anyhow!(DiscordInvalidResponse {
+        context: context.to_string(),
+        reason,
+        field: Some(field),
+    })
+}
+
+fn required_response_string(body: &Value, field: &'static str, context: &str) -> Result<String> {
+    match body.get(field) {
+        Some(Value::String(value)) => Ok(value.clone()),
+        None => Err(invalid_response_field(
+            context,
+            "Discord response is missing a required field",
+            field,
+        )),
+        Some(_) => Err(invalid_response_field(
+            context,
+            "Discord returned an invalid field",
+            field,
+        )),
+    }
+}
+
+fn optional_response_string(
+    body: &Value,
+    field: &'static str,
+    context: &str,
+) -> Result<Option<String>> {
+    match body.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(invalid_response_field(
+            context,
+            "Discord returned an invalid field",
+            field,
+        )),
+    }
+}
+
+fn optional_response_bool(
+    body: &Value,
+    field: &'static str,
+    context: &str,
+) -> Result<Option<bool>> {
+    match body.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(invalid_response_field(
+            context,
+            "Discord returned an invalid field",
+            field,
+        )),
+    }
+}
+
+pub(super) fn message_reference_is_absent(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|source| source.downcast_ref::<DiscordApiError>())
+        .is_some_and(|error| {
+            error.http_status == 404
+                && matches!(error.code, Some(UNKNOWN_CHANNEL | UNKNOWN_MESSAGE))
+        })
+}
+
 fn message_chunk_nonce(
     channel_id: &str,
     reply_to_message_id: &str,
@@ -600,6 +840,12 @@ pub fn delivery_error_code(error: &anyhow::Error) -> Option<&'static str> {
             _ => "provider_transport_error",
         });
     }
+    if error
+        .chain()
+        .any(|source| source.is::<DiscordInvalidResponse>())
+    {
+        return Some("provider_invalid_response");
+    }
     error
         .chain()
         .find_map(|source| source.downcast_ref::<DiscordApiError>())
@@ -628,7 +874,7 @@ fn read_json_body(response: &mut ureq::http::Response<ureq::Body>, context: &str
         .reader();
     let mut text = String::new();
     body.read_to_string(&mut text)
-        .with_context(|| format!("{context}: failed to read response body"))?;
+        .map_err(|error| response_body_error(context, error))?;
     if !status.is_success() {
         let parsed = serde_json::from_str::<Value>(&text).ok();
         let code = parsed
@@ -650,7 +896,7 @@ fn read_json_body(response: &mut ureq::http::Response<ureq::Body>, context: &str
         }));
     }
     serde_json::from_str(&text)
-        .with_context(|| format!("{context}: failed to parse response body as JSON"))
+        .map_err(|_| invalid_response(context, "Discord returned malformed JSON"))
 }
 
 fn read_empty_response(
@@ -725,6 +971,238 @@ mod tests {
         request_line: String,
         headers: BTreeMap<String, String>,
         body: Vec<u8>,
+    }
+
+    #[test]
+    fn channel_rejects_malformed_provider_shape() {
+        for body in [
+            json!({ "guild_id": "333" }),
+            json!({ "type": "0", "guild_id": "333" }),
+            json!({ "type": 0, "guild_id": 333 }),
+            json!({ "type": 11, "guild_id": "333", "parent_id": false }),
+            json!({ "type": 1, "recipients": {} }),
+            json!({ "type": 1, "recipients": [{ "id": 444 }] }),
+        ] {
+            let (base_url, server) = spawn_provider(vec![("200 OK", body.to_string())]);
+            let error = DiscordClient::new_for_tests(&base_url)
+                .channel("111")
+                .expect_err("malformed channel shape");
+
+            assert_eq!(
+                delivery_error_code(&error),
+                Some("provider_invalid_response")
+            );
+            server.join().expect("server thread");
+        }
+    }
+
+    #[test]
+    fn fetch_message_reads_only_the_exact_provider_route() {
+        let body = json!({
+            "id": "222222222222222222",
+            "channel_id": "111111111111111111",
+            "guild_id": "333333333333333333",
+            "content": "hello from Discord",
+            "author": {
+                "id": "444444444444444444",
+                "username": "dispatch-bot",
+                "global_name": "Dispatch Bot",
+                "bot": true
+            },
+            "member": { "nick": "Agent" }
+        });
+        let (base_url, server) = spawn_provider(vec![("200 OK", body.to_string())]);
+        let message = DiscordClient::new_for_tests(&base_url)
+            .fetch_message(
+                "111111111111111111",
+                "222222222222222222",
+                Some("333333333333333333"),
+            )
+            .expect("fetch exact message")
+            .expect("message exists");
+
+        assert_eq!(message.guild_id.as_deref(), Some("333333333333333333"));
+        assert_eq!(message.content, "hello from Discord");
+        assert_eq!(
+            message.author,
+            Some(DiscordFetchedMessageAuthor {
+                id: "444444444444444444".to_string(),
+                display_name: Some("Agent".to_string()),
+                username: Some("dispatch-bot".to_string()),
+                is_bot: true,
+            })
+        );
+
+        let requests = server.join().expect("server thread");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].request_line,
+            "GET /api/v10/channels/111111111111111111/messages/222222222222222222 HTTP/1.1"
+        );
+        assert_eq!(
+            requests[0].headers.get("authorization").map(String::as_str),
+            Some("Bot test-token")
+        );
+    }
+
+    #[test]
+    fn fetch_message_distinguishes_webhook_authors_from_null_webhook_ids() {
+        for (webhook_id, expected_is_bot) in [(Value::Null, false), (json!("555"), true)] {
+            let body = json!({
+                "id": "222",
+                "channel_id": "111",
+                "guild_id": "333",
+                "content": "hello",
+                "webhook_id": webhook_id,
+                "author": { "id": "444", "username": "sender", "bot": false }
+            });
+            let (base_url, server) = spawn_provider(vec![("200 OK", body.to_string())]);
+            let message = DiscordClient::new_for_tests(&base_url)
+                .fetch_message("111", "222", Some("333"))
+                .expect("fetch message")
+                .expect("message exists");
+
+            assert_eq!(
+                message.author.as_ref().map(|author| author.is_bot),
+                Some(expected_is_bot)
+            );
+            server.join().expect("server thread");
+        }
+    }
+
+    #[test]
+    fn fetch_message_maps_only_documented_absence_codes_to_not_found() {
+        for code in [UNKNOWN_CHANNEL, UNKNOWN_MESSAGE] {
+            let (base_url, server) = spawn_provider(vec![(
+                "404 Not Found",
+                json!({ "code": code, "message": "PRIVATE SENTINEL" }).to_string(),
+            )]);
+            let message = DiscordClient::new_for_tests(&base_url)
+                .fetch_message("111", "222", Some("333"))
+                .expect("documented absence");
+
+            assert!(message.is_none());
+            server.join().expect("server thread");
+        }
+
+        let (base_url, server) = spawn_provider(vec![(
+            "404 Not Found",
+            json!({ "code": 10_004, "message": "PRIVATE SENTINEL" }).to_string(),
+        )]);
+        let error = DiscordClient::new_for_tests(&base_url)
+            .fetch_message("111", "222", Some("333"))
+            .expect_err("other not-found responses are operational failures");
+
+        assert_eq!(delivery_error_code(&error), Some("provider_not_found"));
+        assert!(!error.to_string().contains("PRIVATE SENTINEL"));
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn fetch_message_retries_a_bounded_provider_rate_limit() {
+        let message = json!({
+            "id": "222",
+            "channel_id": "111",
+            "guild_id": "333",
+            "content": "hello"
+        });
+        let (base_url, server) = spawn_provider(vec![
+            (
+                "429 Too Many Requests",
+                json!({ "code": 20_028, "retry_after": 0.01 }).to_string(),
+            ),
+            ("200 OK", message.to_string()),
+        ]);
+        let fetched = DiscordClient::new_for_tests(&base_url)
+            .fetch_message("111", "222", Some("333"))
+            .expect("rate-limited fetch")
+            .expect("message exists");
+
+        assert_eq!(fetched.content, "hello");
+        let requests = server.join().expect("server thread");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].request_line, requests[1].request_line);
+    }
+
+    #[test]
+    fn fetch_message_rejects_mismatched_provider_coordinates() {
+        for body in [
+            json!({ "id": "other", "channel_id": "111", "guild_id": "333" }),
+            json!({ "id": "222", "channel_id": "other", "guild_id": "333" }),
+            json!({ "id": "222", "channel_id": "111", "guild_id": "other" }),
+        ] {
+            let (base_url, server) = spawn_provider(vec![("200 OK", body.to_string())]);
+            let error = DiscordClient::new_for_tests(&base_url)
+                .fetch_message("111", "222", Some("333"))
+                .expect_err("mismatched coordinates");
+
+            assert_eq!(
+                delivery_error_code(&error),
+                Some("provider_invalid_response")
+            );
+            server.join().expect("server thread");
+        }
+    }
+
+    #[test]
+    fn fetch_message_rejects_malformed_provider_fields() {
+        for body in [
+            json!({ "id": "222", "channel_id": "111", "guild_id": "333" }),
+            json!({ "id": "222", "channel_id": "111", "guild_id": "333", "content": 1 }),
+            json!({ "id": "222", "channel_id": "111", "guild_id": 333, "content": "ok" }),
+            json!({ "id": "222", "channel_id": "111", "guild_id": "333", "content": "ok", "author": "user" }),
+            json!({ "id": "222", "channel_id": "111", "guild_id": "333", "content": "ok", "author": { "id": 444 } }),
+            json!({ "id": "222", "channel_id": "111", "guild_id": "333", "content": "ok", "member": "member" }),
+            json!({ "id": "222", "channel_id": "111", "guild_id": "333", "content": "ok", "webhook_id": 555 }),
+        ] {
+            let (base_url, server) = spawn_provider(vec![("200 OK", body.to_string())]);
+            let error = DiscordClient::new_for_tests(&base_url)
+                .fetch_message("111", "222", Some("333"))
+                .expect_err("malformed message fields");
+
+            assert_eq!(
+                delivery_error_code(&error),
+                Some("provider_invalid_response")
+            );
+            server.join().expect("server thread");
+        }
+    }
+
+    #[test]
+    fn fetch_message_keeps_provider_failures_distinct_and_redacted() {
+        for (status, code, expected) in [
+            ("401 Unauthorized", 0, "provider_authentication_failed"),
+            ("403 Forbidden", 50_001, "provider_permission_denied"),
+            ("500 Internal Server Error", 0, "provider_unavailable"),
+        ] {
+            let (base_url, server) = spawn_provider(vec![(
+                status,
+                json!({ "code": code, "message": "PRIVATE SENTINEL" }).to_string(),
+            )]);
+            let error = DiscordClient::new_for_tests(&base_url)
+                .fetch_message("111", "222", Some("333"))
+                .expect_err("provider failure");
+
+            assert_eq!(delivery_error_code(&error), Some(expected));
+            assert!(!error.to_string().contains("PRIVATE SENTINEL"));
+            server.join().expect("server thread");
+        }
+    }
+
+    #[test]
+    fn fetch_message_classifies_malformed_success_responses() {
+        let malformed = "PRIVATE SENTINEL {".to_string();
+        let (base_url, server) = spawn_provider(vec![("200 OK", malformed)]);
+        let error = DiscordClient::new_for_tests(&base_url)
+            .fetch_message("111", "222", Some("333"))
+            .expect_err("malformed provider response");
+
+        assert_eq!(
+            delivery_error_code(&error),
+            Some("provider_invalid_response")
+        );
+        assert!(!error.to_string().contains("PRIVATE SENTINEL"));
+        server.join().expect("server thread");
     }
 
     #[test]
@@ -942,6 +1420,23 @@ mod tests {
 
         assert!(error.to_string().starts_with("message_too_long:"));
         assert_eq!(delivery_error_code(&error), Some("message_too_long"));
+    }
+
+    #[test]
+    fn send_message_rejects_mismatched_provider_coordinates() {
+        let (base_url, server) = spawn_provider(vec![(
+            "200 OK",
+            json!({ "id": "msg-1", "channel_id": "channel-other" }).to_string(),
+        )]);
+        let error = DiscordClient::new_for_tests(&base_url)
+            .send_message("chan-1", "hello", None, None)
+            .expect_err("mismatched delivery coordinates");
+
+        assert_eq!(
+            delivery_error_code(&error),
+            Some("provider_invalid_response")
+        );
+        server.join().expect("server thread");
     }
 
     #[test]

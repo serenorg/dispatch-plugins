@@ -2,7 +2,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use dispatch_channel_protocol::{
-    ChannelEventNotification, MessageRef, PluginNotificationEnvelope, notification_to_jsonrpc,
+    ChannelEventNotification, FetchedMessage, FetchedMessageAuthor, MessagePermalink, MessageRef,
+    PluginNotificationEnvelope, notification_to_jsonrpc,
 };
 use dispatch_channel_runtime::write_stdout_line;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -31,7 +32,8 @@ mod discord_api;
 mod protocol;
 
 use discord_api::{
-    DiscordChannelInfo, DiscordClient, DiscordUpload, MESSAGE_CONTENT_LIMIT, delivery_error_code,
+    DiscordChannelInfo, DiscordClient, DiscordFetchedMessage, DiscordUpload, MESSAGE_CONTENT_LIMIT,
+    delivery_error_code, message_reference_is_absent,
 };
 use protocol::{
     CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ChannelPolicy, ConfiguredChannel,
@@ -197,6 +199,7 @@ const REJECT_APPLICATION_MISMATCH: &str = "application_mismatch";
 const REJECT_INVALID_POLICY: &str = "invalid_policy";
 const REJECT_MISSING_DESTINATION: &str = "missing_destination";
 const REJECT_UNAUTHORIZED_DESTINATION: &str = "unauthorized_destination";
+const REJECT_CHANNEL_TARGET_DENIED: &str = "channel_target_denied";
 /// A channel event notification could not be written to the host.
 const REJECT_NOTIFICATION_WRITE: &str = "notification_write_error";
 
@@ -264,10 +267,7 @@ fn main() -> Result<()> {
             &mut typing_manager,
         ) {
             Ok(response) => response,
-            Err(error) => plugin_error(
-                delivery_error_code(&error).unwrap_or("internal_error"),
-                error.to_string(),
-            ),
+            Err(error) => plugin_error(request_error_code(&error), error.to_string()),
         };
 
         let json = response_to_jsonrpc(&request_id, &response).map_err(|error| anyhow!(error))?;
@@ -356,10 +356,8 @@ fn handle_request(
             stop_typing_for_delivery(typing_manager, &delivery);
             Ok(PluginResponse::Pushed { delivery })
         }
-        PluginRequest::GetMessage { .. } | PluginRequest::GetPermalink { .. } => Ok(plugin_error(
-            "unsupported_request",
-            "discord does not support message read-back",
-        )),
+        PluginRequest::GetMessage { config, reference } => get_message(config, reference),
+        PluginRequest::GetPermalink { config, reference } => get_permalink(config, reference),
         PluginRequest::IngressEvent {
             config, payload, ..
         } => handle_ingress_event(config, payload),
@@ -710,6 +708,18 @@ impl DiscordPolicy {
                 .outbound_channel_ids
                 .iter()
                 .any(|allowed| allowed == channel_id)
+    }
+
+    /// Return whether some provider shape could place this destination inside
+    /// the outbound scope. A true result still requires shape authorization.
+    fn may_resolve_outbound_destination(&self, destination: &str) -> bool {
+        self.outbound_channel_is_allowed(destination)
+            || self.dm_policy != DmPolicy::Deny
+            || match self.thread_policy {
+                ThreadPolicy::Deny => false,
+                ThreadPolicy::InheritParent => true,
+                ThreadPolicy::Allowlist => self.thread_is_listed(destination),
+            }
     }
 
     /// Redacted effective policy for `configure` and health diagnostics. Counts
@@ -3220,6 +3230,141 @@ fn stop_typing_for_delivery(typing_manager: &mut DiscordTypingManager, delivery:
     }
 }
 
+struct DiscordReadBack {
+    message: DiscordFetchedMessage,
+    permalink: String,
+}
+
+fn get_message(config: &ChannelConfig, reference: &MessageRef) -> Result<PluginResponse> {
+    let Some(read_back) = read_back_message(config, reference)? else {
+        return Ok(PluginResponse::MessageNotFound {
+            reference: reference.clone(),
+        });
+    };
+    let author = read_back.message.author.map(|author| FetchedMessageAuthor {
+        id: author.id,
+        display_name: author.display_name,
+        username: author.username,
+        is_bot: author.is_bot,
+    });
+    Ok(PluginResponse::MessageFetched {
+        message: FetchedMessage {
+            reference: reference.clone(),
+            content: read_back.message.content,
+            content_type: Some("text/plain".to_string()),
+            author,
+            permalink: Some(read_back.permalink),
+            metadata: BTreeMap::new(),
+        },
+    })
+}
+
+fn get_permalink(config: &ChannelConfig, reference: &MessageRef) -> Result<PluginResponse> {
+    let Some(read_back) = read_back_message(config, reference)? else {
+        return Ok(PluginResponse::MessageNotFound {
+            reference: reference.clone(),
+        });
+    };
+    Ok(PluginResponse::PermalinkResolved {
+        permalink: MessagePermalink {
+            reference: reference.clone(),
+            url: read_back.permalink,
+        },
+    })
+}
+
+/// Authorize and fetch the exact message named by a receipt. Permalinks use the
+/// same fetch, so the provider must first confirm that the message exists.
+fn read_back_message(
+    config: &ChannelConfig,
+    reference: &MessageRef,
+) -> Result<Option<DiscordReadBack>> {
+    // Policy decides before credentials are read, so a reference this binding
+    // could never reach never touches the token or the provider.
+    let policy = read_back_policy(config, reference)?;
+    let client = DiscordClient::from_env(bot_token_env(config))?;
+    let lookup = RestChannelLookup { client: &client };
+    let channel = match authorize_read_back_with_policy(&policy, reference, &lookup) {
+        Ok(channel) => channel,
+        Err(error) if message_reference_is_absent(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Some(message) = client.fetch_message(
+        &reference.conversation_id,
+        &reference.message_id,
+        channel.guild_id.as_deref(),
+    )?
+    else {
+        return Ok(None);
+    };
+    // REST messages can omit `guild_id`; use the authorized channel's guild
+    // after `fetch_message` rejects any reported conflict.
+    let guild_id = message.guild_id.as_deref().or(channel.guild_id.as_deref());
+    let permalink =
+        discord_message_permalink(guild_id, &reference.conversation_id, &reference.message_id);
+    Ok(Some(DiscordReadBack { message, permalink }))
+}
+
+fn read_back_policy(config: &ChannelConfig, reference: &MessageRef) -> Result<DiscordPolicy> {
+    validate_read_back_reference(reference)?;
+    let policy = DiscordPolicy::from_config(config)?;
+    policy.validate_for_ingress(uses_interaction_webhook(config))?;
+    if !policy.may_resolve_outbound_destination(&reference.conversation_id) {
+        return Err(channel_target_denied(
+            "Discord message reference is outside this binding's scope",
+        ));
+    }
+    Ok(policy)
+}
+
+/// Decide a reference against the shape Discord reports for its conversation,
+/// using the rule that governs delivery to the same destination.
+fn authorize_read_back_with_policy(
+    policy: &DiscordPolicy,
+    reference: &MessageRef,
+    lookup: &dyn DiscordChannelLookup,
+) -> Result<DiscordChannelInfo> {
+    let channel = lookup.channel(&reference.conversation_id)?;
+    let destination = &reference.conversation_id;
+    // The rejection reason is dropped on purpose: a refusal must not echo the
+    // coordinates it refused.
+    authorize_resolved_outbound_destination(policy, destination, &channel).map_err(|_| {
+        channel_target_denied("Discord message reference is outside this binding's scope")
+    })?;
+    Ok(channel)
+}
+
+fn validate_read_back_reference(reference: &MessageRef) -> Result<()> {
+    if !is_discord_snowflake(&reference.conversation_id)
+        || !is_discord_snowflake(&reference.message_id)
+    {
+        return Err(channel_target_denied(
+            "Discord read-back requires provider-issued conversation and message IDs",
+        ));
+    }
+    if reference.thread_id.is_some() {
+        return Err(channel_target_denied(
+            "Discord read-back does not accept a separate thread ID",
+        ));
+    }
+    Ok(())
+}
+
+/// Require one canonical decimal spelling because the identifier is returned
+/// to the host and embedded in the permalink.
+fn is_discord_snowflake(value: &str) -> bool {
+    value.len() <= 20
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value
+            .parse::<u64>()
+            .is_ok_and(|parsed| parsed > 0 && parsed.to_string() == value)
+}
+
+fn discord_message_permalink(guild_id: Option<&str>, channel_id: &str, message_id: &str) -> String {
+    let guild_id = guild_id.unwrap_or("@me");
+    format!("https://discord.com/channels/{guild_id}/{channel_id}/{message_id}")
+}
+
 fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<DeliveryReceipt> {
     let policy = DiscordPolicy::from_config(config)?;
     policy.validate_for_ingress(uses_interaction_webhook(config))?;
@@ -3741,6 +3886,30 @@ impl std::fmt::Display for OutboundRejected {
 
 impl std::error::Error for OutboundRejected {}
 
+/// A fixed reason prevents authorization failures from echoing coordinates.
+#[derive(Debug)]
+struct ChannelTargetDenied(&'static str);
+
+impl std::fmt::Display for ChannelTargetDenied {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ChannelTargetDenied {}
+
+fn channel_target_denied(reason: &'static str) -> anyhow::Error {
+    anyhow::Error::new(ChannelTargetDenied(reason))
+}
+
+fn request_error_code(error: &anyhow::Error) -> &'static str {
+    if error.downcast_ref::<ChannelTargetDenied>().is_some() {
+        REJECT_CHANNEL_TARGET_DENIED
+    } else {
+        delivery_error_code(error).unwrap_or("internal_error")
+    }
+}
+
 fn outbound_rejected(code: &'static str, reason: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(OutboundRejected {
         code,
@@ -3787,6 +3956,14 @@ fn authorize_outbound_destination(
             format!("discord destination {destination} could not be resolved: {error}"),
         )
     })?;
+    authorize_resolved_outbound_destination(policy, destination, &resolved)
+}
+
+fn authorize_resolved_outbound_destination(
+    policy: &DiscordPolicy,
+    destination: &str,
+    resolved: &DiscordChannelInfo,
+) -> Result<()> {
     if resolved.kind == CHANNEL_TYPE_DM && resolved.guild_id.is_none() {
         let allowed = match policy.dm_policy {
             DmPolicy::Deny => false,
@@ -6217,6 +6394,208 @@ mod tests {
                 &json!({"user":{"id":BOT_ACCOUNT_ID},"application":{"id":"app-other"}}),
             )
             .is_err()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Receipt-bound read-back
+    // -------------------------------------------------------------------------
+
+    const READ_BACK_GUILD: &str = "111111111111111111";
+    const READ_BACK_CHANNEL: &str = "222222222222222222";
+    const READ_BACK_MESSAGE: &str = "333333333333333333";
+    const READ_BACK_THREAD: &str = "444444444444444444";
+    const READ_BACK_OTHER_GUILD: &str = "555555555555555555";
+    const READ_BACK_DM_CHANNEL: &str = "666666666666666666";
+    const READ_BACK_DM_SENDER: &str = "777777777777777777";
+
+    fn read_back_config() -> ChannelConfig {
+        ChannelConfig {
+            allowed_guild_ids: vec![READ_BACK_GUILD.to_string()],
+            allowed_channel_ids: vec![READ_BACK_CHANNEL.to_string()],
+            ..ChannelConfig::default()
+        }
+    }
+
+    fn read_back_reference(conversation_id: &str) -> MessageRef {
+        MessageRef {
+            conversation_id: conversation_id.to_string(),
+            message_id: READ_BACK_MESSAGE.to_string(),
+            thread_id: None,
+        }
+    }
+
+    fn authorize_read_back(
+        config: &ChannelConfig,
+        reference: &MessageRef,
+        lookup: &dyn DiscordChannelLookup,
+    ) -> Result<DiscordChannelInfo> {
+        let policy = read_back_policy(config, reference)?;
+        authorize_read_back_with_policy(&policy, reference, lookup)
+    }
+
+    #[test]
+    fn read_back_authorizes_the_receipt_conversation_against_outbound_scope() {
+        let reference = read_back_reference(READ_BACK_CHANNEL);
+        let channel = authorize_read_back(
+            &read_back_config(),
+            &reference,
+            &MapChannelLookup::channel(READ_BACK_CHANNEL, READ_BACK_GUILD),
+        )
+        .expect("authorized receipt");
+
+        assert_eq!(channel.guild_id.as_deref(), Some(READ_BACK_GUILD));
+    }
+
+    #[test]
+    fn read_back_rejects_an_out_of_scope_conversation_before_lookup() {
+        // `NoChannelLookup` fails if it is consulted, so reaching a denial
+        // proves the reference was refused without a provider request.
+        let error = authorize_read_back(
+            &read_back_config(),
+            &read_back_reference(READ_BACK_THREAD),
+            &NoChannelLookup,
+        )
+        .expect_err("out-of-scope receipt");
+
+        assert!(error.downcast_ref::<ChannelTargetDenied>().is_some());
+        assert_eq!(request_error_code(&error), REJECT_CHANNEL_TARGET_DENIED);
+    }
+
+    #[test]
+    fn read_back_rejects_malformed_or_conflicting_coordinates_before_lookup() {
+        for reference in [
+            MessageRef {
+                conversation_id: "../channel".to_string(),
+                message_id: READ_BACK_MESSAGE.to_string(),
+                thread_id: None,
+            },
+            MessageRef {
+                conversation_id: READ_BACK_CHANNEL.to_string(),
+                message_id: String::new(),
+                thread_id: None,
+            },
+            // Not canonical: a leading zero addresses the same message under a
+            // second spelling.
+            MessageRef {
+                conversation_id: READ_BACK_CHANNEL.to_string(),
+                message_id: format!("0{READ_BACK_MESSAGE}"),
+                thread_id: None,
+            },
+            // Wider than a snowflake.
+            MessageRef {
+                conversation_id: READ_BACK_CHANNEL.to_string(),
+                message_id: "1".repeat(21),
+                thread_id: None,
+            },
+            MessageRef {
+                conversation_id: READ_BACK_CHANNEL.to_string(),
+                message_id: "0".to_string(),
+                thread_id: None,
+            },
+            // A Discord thread is itself the addressed channel, so a separate
+            // thread coordinate cannot be honored.
+            MessageRef {
+                conversation_id: READ_BACK_CHANNEL.to_string(),
+                message_id: READ_BACK_MESSAGE.to_string(),
+                thread_id: Some(READ_BACK_THREAD.to_string()),
+            },
+        ] {
+            let error = authorize_read_back(&read_back_config(), &reference, &NoChannelLookup)
+                .expect_err("invalid receipt");
+            assert!(error.downcast_ref::<ChannelTargetDenied>().is_some());
+        }
+    }
+
+    #[test]
+    fn read_back_threads_follow_the_declared_thread_policy() {
+        let config = ChannelConfig {
+            thread_policy: Some(THREAD_POLICY_ALLOWLIST.to_string()),
+            allowed_thread_ids: vec![READ_BACK_THREAD.to_string()],
+            ..read_back_config()
+        };
+        let reference = read_back_reference(READ_BACK_THREAD);
+
+        authorize_read_back(
+            &config,
+            &reference,
+            &MapChannelLookup::thread(READ_BACK_THREAD, READ_BACK_CHANNEL, READ_BACK_GUILD),
+        )
+        .expect("thread under an allowed parent");
+
+        let denied = authorize_read_back(
+            &config,
+            &reference,
+            &MapChannelLookup::thread(READ_BACK_THREAD, READ_BACK_CHANNEL, READ_BACK_OTHER_GUILD),
+        )
+        .expect_err("thread in another guild");
+        assert!(denied.downcast_ref::<ChannelTargetDenied>().is_some());
+    }
+
+    #[test]
+    fn read_back_direct_messages_follow_the_declared_dm_policy() {
+        let config = ChannelConfig {
+            dm_policy: Some(DM_POLICY_ALLOWLIST.to_string()),
+            allowed_dm_sender_ids: vec![READ_BACK_DM_SENDER.to_string()],
+            ..read_back_config()
+        };
+        let reference = read_back_reference(READ_BACK_DM_CHANNEL);
+
+        authorize_read_back(
+            &config,
+            &reference,
+            &MapChannelLookup::direct_message(READ_BACK_DM_CHANNEL, READ_BACK_DM_SENDER),
+        )
+        .expect("direct message from an allowed sender");
+
+        let denied = authorize_read_back(
+            &config,
+            &reference,
+            &MapChannelLookup::direct_message(READ_BACK_DM_CHANNEL, "888888888888888888"),
+        )
+        .expect_err("direct message from an unlisted sender");
+        assert!(denied.downcast_ref::<ChannelTargetDenied>().is_some());
+
+        let denied = authorize_read_back(
+            &ChannelConfig {
+                dm_policy: Some(DM_POLICY_DENY.to_string()),
+                ..read_back_config()
+            },
+            &reference,
+            &NoChannelLookup,
+        )
+        .expect_err("direct messages denied");
+        assert!(denied.downcast_ref::<ChannelTargetDenied>().is_some());
+    }
+
+    #[test]
+    fn read_back_denies_a_guild_channel_the_static_preflight_cannot_rule_out() {
+        // `dm_policy = open` means no reference can be ruled out statically, so
+        // the resolved shape has to carry the whole decision.
+        let config = ChannelConfig {
+            dm_policy: Some(DM_POLICY_OPEN.to_string()),
+            ..read_back_config()
+        };
+        let outside = "888888888888888888";
+
+        let denied = authorize_read_back(
+            &config,
+            &read_back_reference(outside),
+            &MapChannelLookup::channel(outside, READ_BACK_GUILD),
+        )
+        .expect_err("channel outside the outbound allowlist");
+        assert!(denied.downcast_ref::<ChannelTargetDenied>().is_some());
+    }
+
+    #[test]
+    fn message_permalinks_use_guild_or_direct_message_coordinates() {
+        assert_eq!(
+            discord_message_permalink(Some(READ_BACK_GUILD), READ_BACK_CHANNEL, READ_BACK_MESSAGE),
+            "https://discord.com/channels/111111111111111111/222222222222222222/333333333333333333"
+        );
+        assert_eq!(
+            discord_message_permalink(None, READ_BACK_CHANNEL, READ_BACK_MESSAGE),
+            "https://discord.com/channels/@me/222222222222222222/333333333333333333"
         );
     }
 

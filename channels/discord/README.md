@@ -14,12 +14,15 @@ Implemented:
 - `ingress_event`
 - `deliver`
 - `push`
+- `get_message`
+- `get_permalink`
 - `status`
 
 Behavior:
 
 - inbound events are emitted only for guilds, channels, threads, and DMs the binding explicitly allows, and only when the event addresses the bot
 - outbound delivery sends bot messages to a Discord channel or thread inside the configured outbound scope
+- receipt-bound read-back fetches only the exact Discord message named by the receipt and can return its canonical Discord link
 - outbound text over Discord's 2,000-character limit is delivered in ordered chunks; the first chunk keeps the reply reference and attachment, and the receipt reports the completed chunk count
 - processing status uses Discord's temporary typing indicator; terminal status and successful delivery stop refreshes, while statuses that require user action remain visible messages
 - outbound attachments support one inline `data_base64` file upload per message
@@ -61,7 +64,7 @@ To obtain the required Discord credentials:
 3. Copy the bot token and export it as `DISCORD_BOT_TOKEN`.
 4. If you are using interaction webhooks, copy the application's public key and export it as `DISCORD_INTERACTION_PUBLIC_KEY`.
 5. If you are using websocket ingress and need to read arbitrary guild message text, enable the bot's Message Content privileged intent in the Discord Developer Portal and set `message_content_intent = true` in the channel config. Without that opt-in, Discord may deliver guild message events with empty content unless the message is a DM, mention, or reply.
-6. Install the bot into the target server with the permissions needed to post messages in the destination channel or thread.
+6. Install the bot into the target server with the permissions needed to post messages in the destination channel or thread. Receipt-bound read-back also requires `VIEW_CHANNEL` and `READ_MESSAGE_HISTORY`.
 
 ### Channel policy
 
@@ -187,6 +190,12 @@ dispatch channel call channel-discord \
 ```
 
 A `push`, `deliver`, or `status` request to a destination outside the outbound allowlist is rejected before any Discord request, with the reason code `unauthorized_destination`.
+
+`get_message` and `get_permalink` accept the exact `conversation_id` and `message_id` from a Discord delivery receipt. They reauthorize that conversation against the outbound policy, resolve its provider-reported channel, thread, guild, or DM shape, and fetch only `GET /channels/{conversation_id}/messages/{message_id}`. Neither operation lists channel history or falls back to a neighboring message, and a response whose message, channel, or guild disagrees with the authorized coordinates is refused rather than returned. A Discord thread is itself the receipt conversation, so a separate `thread_id` is rejected. `get_permalink` fetches the same exact message before returning a link, so a link is only ever produced for a message the provider confirmed. Read-back uses the REST API and does not require the Message Content privileged intent.
+
+Unknown messages and unknown channels return `message_not_found`. Authentication, permission, rate-limit, transport, malformed-response, and other provider failures remain operational errors. A reference outside this binding's scope, or one whose coordinates are not canonical Discord snowflakes, is rejected with `channel_target_denied` before any Discord request.
+
+When long text was delivered in chunks, the receipt anchors the first posted message, so read-back returns that message rather than the reassembled text.
 
 The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Dispatch operators normally use the host CLI rather than writing raw envelopes.
 
