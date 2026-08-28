@@ -907,9 +907,10 @@ fn read_empty_response(
         return Ok(());
     }
     if response.status().is_success() {
-        return Err(anyhow!(
-            "{context}: expected HTTP 204, got {}",
-            response.status().as_u16()
+        // A non-204 success does not prove that typing was triggered.
+        return Err(invalid_response(
+            context,
+            "Discord answered a no-content route with a status other than 204",
         ));
     }
     read_json_body(response, context).map(|_| ())
@@ -1457,6 +1458,22 @@ mod tests {
             Some("Bot test-token")
         );
         assert!(request.body.is_empty());
+    }
+
+    #[test]
+    fn trigger_typing_refuses_a_success_other_than_no_content() {
+        let (base_url, server) = spawn_provider(vec![("200 OK", r#"{"ok":true}"#.to_string())]);
+
+        let error = DiscordClient::new_for_tests(&base_url)
+            .trigger_typing("chan-1")
+            .expect_err("only 204 proves the request took effect");
+
+        assert_eq!(
+            delivery_error_code(&error),
+            Some("provider_invalid_response")
+        );
+        assert!(!error.to_string().contains("chan-1"));
+        server.join().expect("server thread");
     }
 
     #[test]

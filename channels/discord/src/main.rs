@@ -99,6 +99,7 @@ const META_TYPING_STARTS: &str = "typing_starts";
 const META_TYPING_REFRESHES: &str = "typing_refreshes";
 const META_TYPING_STOPS: &str = "typing_stops";
 const META_TYPING_FAILURES: &str = "typing_failures";
+const META_TYPING_CAPACITY_REFUSALS: &str = "typing_capacity_refusals";
 const META_LAST_TYPING_AT: &str = "last_typing_at";
 const META_LAST_TYPING_FAILURE_AT: &str = "last_typing_failure_at";
 
@@ -235,6 +236,9 @@ const DISCORD_TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
 const DISCORD_TYPING_MAX_LIFETIME: Duration = Duration::from_secs(300);
 /// Bound the threads and provider traffic created by active destinations.
 const DISCORD_TYPING_MAX_WORKERS: usize = 64;
+/// Consecutive refresh failures tolerated before activity ends. One transient
+/// provider answer must not end the indicator for the rest of a long turn.
+const DISCORD_TYPING_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 const DISCORD_GATEWAY_VERSION: u8 = 10;
 const DISCORD_GATEWAY_BASE_INTENTS: u64 = 1 | (1 << 9) | (1 << 12);
@@ -1337,6 +1341,7 @@ struct DiscordTypingLimits {
     refresh_interval: Duration,
     max_lifetime: Duration,
     max_workers: usize,
+    max_consecutive_failures: u32,
 }
 
 impl Default for DiscordTypingLimits {
@@ -1345,6 +1350,7 @@ impl Default for DiscordTypingLimits {
             refresh_interval: DISCORD_TYPING_REFRESH_INTERVAL,
             max_lifetime: DISCORD_TYPING_MAX_LIFETIME,
             max_workers: DISCORD_TYPING_MAX_WORKERS,
+            max_consecutive_failures: DISCORD_TYPING_MAX_CONSECUTIVE_FAILURES,
         }
     }
 }
@@ -1363,6 +1369,7 @@ struct DiscordTypingMetrics {
     refreshes: u64,
     stops: u64,
     failures: u64,
+    capacity_refusals: u64,
     last_typing_at: Option<String>,
     last_failure_at: Option<String>,
 }
@@ -1387,6 +1394,11 @@ impl DiscordTypingMetrics {
         self.last_failure_at = Some(now_timestamp());
     }
 
+    /// Capacity is a local outcome, so keep it separate from provider failures.
+    fn record_capacity_refusal(&mut self) {
+        self.capacity_refusals = self.capacity_refusals.saturating_add(1);
+    }
+
     fn write_metadata(&self, metadata: &mut BTreeMap<String, String>, active: usize) {
         metadata.insert(META_TYPING_ACTIVE.to_string(), active.to_string());
         metadata.insert(META_TYPING_STARTS.to_string(), self.starts.to_string());
@@ -1396,6 +1408,10 @@ impl DiscordTypingMetrics {
         );
         metadata.insert(META_TYPING_STOPS.to_string(), self.stops.to_string());
         metadata.insert(META_TYPING_FAILURES.to_string(), self.failures.to_string());
+        metadata.insert(
+            META_TYPING_CAPACITY_REFUSALS.to_string(),
+            self.capacity_refusals.to_string(),
+        );
         insert_optional(metadata, META_LAST_TYPING_AT, &self.last_typing_at);
         insert_optional(metadata, META_LAST_TYPING_FAILURE_AT, &self.last_failure_at);
     }
@@ -1442,6 +1458,7 @@ impl DiscordTypingManager {
         }
         if self.workers.len() >= self.limits.max_workers {
             // Do not start an indicator that cannot receive a refresh worker.
+            update_typing_metrics(&self.metrics, DiscordTypingMetrics::record_capacity_refusal);
             return Ok(DiscordTypingStart::AtCapacity);
         }
         let started_at = Instant::now();
@@ -1458,6 +1475,7 @@ impl DiscordTypingManager {
         let handle = thread::spawn(move || {
             let deadline = started_at + limits.max_lifetime;
             let mut next_refresh = started_at + limits.refresh_interval;
+            let mut consecutive_failures = 0;
             loop {
                 let now = Instant::now();
                 if now >= deadline {
@@ -1471,12 +1489,21 @@ impl DiscordTypingManager {
                             break;
                         }
                         let request_started_at = Instant::now();
-                        if client.trigger_typing(&worker_destination).is_err() {
-                            update_typing_metrics(&metrics, DiscordTypingMetrics::record_failure);
+                        let refreshed = client.trigger_typing(&worker_destination).is_ok();
+                        // Schedule from before the request so a slow answer
+                        // cannot push the next refresh past Discord's expiry,
+                        // and so a refused destination is not pressed harder.
+                        next_refresh = request_started_at + limits.refresh_interval;
+                        if refreshed {
+                            consecutive_failures = 0;
+                            update_typing_metrics(&metrics, DiscordTypingMetrics::record_refresh);
+                            continue;
+                        }
+                        update_typing_metrics(&metrics, DiscordTypingMetrics::record_failure);
+                        consecutive_failures += 1;
+                        if consecutive_failures >= limits.max_consecutive_failures {
                             break;
                         }
-                        update_typing_metrics(&metrics, DiscordTypingMetrics::record_refresh);
-                        next_refresh = request_started_at + limits.refresh_interval;
                     }
                 }
             }
@@ -4468,13 +4495,17 @@ mod tests {
         observed: Sender<()>,
         /// One-based request numbers answered with a failure.
         failing_calls: Vec<u64>,
+        /// One-based request number from which every request fails.
+        failing_from: Option<u64>,
     }
 
     impl DiscordTypingClient for CountingTypingClient {
         fn trigger_typing(&self, _destination: &str) -> Result<()> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             let _ = self.observed.send(());
-            if self.failing_calls.contains(&call) {
+            if self.failing_calls.contains(&call)
+                || self.failing_from.is_some_and(|from| call >= from)
+            {
                 Err(anyhow!("typing unavailable"))
             } else {
                 Ok(())
@@ -4515,16 +4546,25 @@ mod tests {
     }
 
     fn typing_probe_client() -> (Box<dyn DiscordTypingClient>, TypingProbe) {
-        build_typing_probe(Vec::new())
+        build_typing_probe(Vec::new(), None)
     }
 
     fn typing_probe_client_failing_calls(
         failing_calls: &[u64],
     ) -> (Box<dyn DiscordTypingClient>, TypingProbe) {
-        build_typing_probe(failing_calls.to_vec())
+        build_typing_probe(failing_calls.to_vec(), None)
     }
 
-    fn build_typing_probe(failing_calls: Vec<u64>) -> (Box<dyn DiscordTypingClient>, TypingProbe) {
+    fn typing_probe_client_failing_from(
+        failing_from: u64,
+    ) -> (Box<dyn DiscordTypingClient>, TypingProbe) {
+        build_typing_probe(Vec::new(), Some(failing_from))
+    }
+
+    fn build_typing_probe(
+        failing_calls: Vec<u64>,
+        failing_from: Option<u64>,
+    ) -> (Box<dyn DiscordTypingClient>, TypingProbe) {
         let calls = Arc::new(AtomicU64::new(0));
         let (observed, receiver) = mpsc::channel();
         (
@@ -4532,6 +4572,7 @@ mod tests {
                 calls: Arc::clone(&calls),
                 observed,
                 failing_calls,
+                failing_from,
             }),
             TypingProbe {
                 calls,
@@ -4556,20 +4597,32 @@ mod tests {
         })
     }
 
-    fn await_no_active_typing(manager: &mut DiscordTypingManager) -> BTreeMap<String, String> {
+    /// Wait, bounded, for the manager to report exactly `expected` live
+    /// lifecycles, then return that settled snapshot. A worker records its stop
+    /// before its thread finishes, so the active count is the one figure that
+    /// needs to settle before the rest of the snapshot can be trusted.
+    fn await_active_typing(
+        manager: &mut DiscordTypingManager,
+        expected: usize,
+    ) -> BTreeMap<String, String> {
+        let expected = expected.to_string();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let mut metadata = BTreeMap::new();
             manager.write_metadata(&mut metadata);
-            if metadata.get(META_TYPING_ACTIVE).map(String::as_str) == Some("0") {
+            if metadata.get(META_TYPING_ACTIVE) == Some(&expected) {
                 return metadata;
             }
             assert!(
                 Instant::now() < deadline,
-                "typing lifecycle did not end within the deadline"
+                "typing lifecycles did not settle within the deadline"
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn await_no_active_typing(manager: &mut DiscordTypingManager) -> BTreeMap<String, String> {
+        await_active_typing(manager, 0)
     }
 
     /// One guild, one channel, mention-or-reply activation, DMs denied.
@@ -7000,29 +7053,64 @@ mod tests {
     }
 
     #[test]
-    fn a_refresh_failure_ends_only_its_typing_lifecycle() {
+    fn a_single_refresh_failure_does_not_end_the_typing_lifecycle() {
         let (client, probe) = typing_probe_client_failing_calls(&[2]);
         let mut manager = short_typing_manager();
         manager
             .start(ALLOWED_CHANNEL.to_string(), client)
             .expect("start typing");
 
-        let metadata = await_no_active_typing(&mut manager);
+        // The initial request, one failed refresh, and one recovered refresh.
+        probe.await_calls(3);
 
-        assert_eq!(probe.total(), 2);
+        let mut metadata = BTreeMap::new();
+        manager.write_metadata(&mut metadata);
+        assert_eq!(
+            metadata.get(META_TYPING_ACTIVE).map(String::as_str),
+            Some("1")
+        );
         assert_eq!(
             metadata.get(META_TYPING_FAILURES).map(String::as_str),
             Some("1")
         );
         assert!(metadata.contains_key(META_LAST_TYPING_FAILURE_AT));
+        manager.stop_all();
+    }
+
+    #[test]
+    fn a_run_of_refresh_failures_ends_only_its_typing_lifecycle() {
+        let (client, probe) = typing_probe_client_failing_from(2);
+        let (other, other_probe) = typing_probe_client();
+        let mut manager = short_typing_manager();
+        manager
+            .start(ALLOWED_CHANNEL.to_string(), client)
+            .expect("start failing destination");
+        manager
+            .start(ALLOWED_THREAD.to_string(), other)
+            .expect("start healthy destination");
+
+        let tolerated = u64::from(DISCORD_TYPING_MAX_CONSECUTIVE_FAILURES);
+        // The initial success plus exactly the tolerated run of failures.
+        probe.await_calls(1 + tolerated as usize);
+        probe.drain();
+        probe.expect_quiet(Duration::from_millis(60));
+        assert_eq!(probe.total(), 1 + tolerated);
+
+        // The healthy destination is untouched by its neighbour's failures.
+        other_probe.await_calls(2);
+        let metadata = await_active_typing(&mut manager, 1);
+        let expected_failures = tolerated.to_string();
+        assert_eq!(metadata.get(META_TYPING_FAILURES), Some(&expected_failures));
+        assert!(metadata.contains_key(META_LAST_TYPING_FAILURE_AT));
         assert_eq!(
             metadata.get(META_TYPING_STARTS).map(String::as_str),
-            Some("1")
+            Some("2")
         );
         assert_eq!(
             metadata.get(META_TYPING_STOPS).map(String::as_str),
             Some("1")
         );
+        manager.stop_all();
     }
 
     #[test]
@@ -7079,6 +7167,7 @@ mod tests {
             refresh_interval: Duration::from_millis(10),
             max_lifetime: Duration::from_secs(30),
             max_workers: 1,
+            ..DiscordTypingLimits::default()
         });
         let (first, first_probe) = typing_probe_client();
         let (second, second_probe) = typing_probe_client();
@@ -7095,7 +7184,21 @@ mod tests {
                 .expect("second destination"),
             DiscordTypingStart::AtCapacity
         );
+        // A refusal makes no provider request and is counted as its own event,
+        // not as a typing failure.
         assert_eq!(second_probe.total(), 0);
+        let mut metadata = BTreeMap::new();
+        manager.write_metadata(&mut metadata);
+        assert_eq!(
+            metadata
+                .get(META_TYPING_CAPACITY_REFUSALS)
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            metadata.get(META_TYPING_FAILURES).map(String::as_str),
+            Some("0")
+        );
         first_probe.await_calls(1);
 
         assert!(manager.stop(ALLOWED_CHANNEL));
@@ -7108,6 +7211,119 @@ mod tests {
         );
         third_probe.await_calls(2);
         manager.stop_all();
+    }
+
+    #[test]
+    fn successful_delivery_stops_only_the_delivered_destination() {
+        let (delivered, delivered_probe) = typing_probe_client();
+        let (other, other_probe) = typing_probe_client();
+        let mut manager = short_typing_manager();
+        manager
+            .start(ALLOWED_CHANNEL.to_string(), delivered)
+            .expect("delivered destination");
+        manager
+            .start(ALLOWED_THREAD.to_string(), other)
+            .expect("other destination");
+
+        // The receipt names the destination this plugin resolved and
+        // authorized, not the channel the provider echoed back.
+        let receipt = DeliveryReceipt {
+            reference: MessageRef {
+                conversation_id: ALLOWED_CHANNEL.to_string(),
+                message_id: "msg-1".to_string(),
+                thread_id: None,
+            },
+            metadata: BTreeMap::from([(
+                META_RESOLVED_DESTINATION.to_string(),
+                ALLOWED_CHANNEL.to_string(),
+            )]),
+        };
+        stop_typing_for_delivery(&mut manager, &receipt);
+
+        let delivered_after_stop = delivered_probe.total();
+        delivered_probe.drain();
+        delivered_probe.expect_quiet(Duration::from_millis(50));
+        assert_eq!(delivered_probe.total(), delivered_after_stop);
+        other_probe.await_calls(2);
+
+        let metadata = await_active_typing(&mut manager, 1);
+        assert_eq!(
+            metadata.get(META_TYPING_STOPS).map(String::as_str),
+            Some("1")
+        );
+        manager.stop_all();
+    }
+
+    #[test]
+    fn a_receipt_without_a_resolved_destination_stops_nothing() {
+        let (client, probe) = typing_probe_client();
+        let mut manager = short_typing_manager();
+        manager
+            .start(ALLOWED_CHANNEL.to_string(), client)
+            .expect("start typing");
+        let receipt = DeliveryReceipt {
+            reference: MessageRef {
+                conversation_id: ALLOWED_CHANNEL.to_string(),
+                message_id: "msg-1".to_string(),
+                thread_id: None,
+            },
+            metadata: BTreeMap::new(),
+        };
+
+        stop_typing_for_delivery(&mut manager, &receipt);
+
+        probe.await_calls(2);
+        let mut metadata = BTreeMap::new();
+        manager.write_metadata(&mut metadata);
+        assert_eq!(
+            metadata.get(META_TYPING_ACTIVE).map(String::as_str),
+            Some("1")
+        );
+        manager.stop_all();
+    }
+
+    #[test]
+    fn lifecycle_ending_requests_stop_every_typing_worker() {
+        // Each of these arms ends activity before doing its own work, so the
+        // workers are gone whether or not the arm itself succeeds.
+        for request in [
+            PluginRequest::Configure {
+                config: scoped_config(),
+            },
+            PluginRequest::StopIngress {
+                config: scoped_config(),
+                state: None,
+            },
+            PluginRequest::Shutdown,
+        ] {
+            let (client, probe) = typing_probe_client();
+            let mut manager = short_typing_manager();
+            manager
+                .start(ALLOWED_CHANNEL.to_string(), client)
+                .expect("start typing");
+            probe.await_calls(1);
+
+            let _ = handle_request(
+                &PluginRequestEnvelope {
+                    protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+                    request,
+                },
+                &Arc::new(Mutex::new(())),
+                &mut None,
+                &mut manager,
+            );
+
+            let calls_after_stop = probe.total();
+            probe.drain();
+            probe.expect_quiet(Duration::from_millis(50));
+            assert_eq!(probe.total(), calls_after_stop);
+            let mut metadata = BTreeMap::new();
+            manager.write_metadata(&mut metadata);
+            assert_eq!(
+                metadata.get(META_TYPING_ACTIVE).map(String::as_str),
+                Some("0")
+            );
+        }
     }
 
     #[test]
