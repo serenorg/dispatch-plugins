@@ -101,11 +101,14 @@ jobs:
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
-      - name: Install native build tools (Windows)
+      - name: Install protoc (Windows)
         if: runner.os == 'Windows'
         run: |
           choco install protoc --yes --no-progress
-          choco install strawberryperl --yes --no-progress
+          protoc --version
+      - name: Install Perl (Windows)
+        if: runner.os == 'Windows'
+        run: choco install strawberryperl --yes --no-progress
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -164,11 +167,14 @@ jobs:
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
-      - name: Install native build tools (Windows)
+      - name: Install protoc (Windows)
         if: runner.os == 'Windows'
         run: |
           choco install protoc --yes --no-progress
-          choco install strawberryperl --yes --no-progress
+          protoc --version
+      - name: Install Perl (Windows)
+        if: runner.os == 'Windows'
+        run: choco install strawberryperl --yes --no-progress
       - name: Install musl-tools (Linux musl)
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
