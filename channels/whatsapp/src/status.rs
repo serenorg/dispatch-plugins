@@ -5,7 +5,7 @@ use whatsapp_rust::ChatStateType;
 use whatsapp_rust::Jid;
 use whatsapp_rust::TokioRuntime;
 use whatsapp_rust::bot::Bot;
-use whatsapp_rust::store::SqliteStore;
+use whatsapp_rust_sqlite_storage::SqliteStore;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
@@ -135,13 +135,11 @@ fn parse_recipient_jid(raw: &str) -> Result<Jid> {
 }
 
 async fn send_chat_state(sqlite_url: String, recipient: Jid, state: ChatStateType) -> Result<()> {
-    let backend = std::sync::Arc::new(
-        SqliteStore::new(&sqlite_url)
-            .await
-            .with_context(|| format!("failed to open WhatsApp session store at `{sqlite_url}`"))?,
-    );
+    let backend = SqliteStore::new(&sqlite_url)
+        .await
+        .with_context(|| format!("failed to open WhatsApp session store at `{sqlite_url}`"))?;
 
-    let mut bot = Bot::builder()
+    let bot = Bot::builder()
         .with_backend(backend)
         .with_transport_factory(TokioWebSocketTransportFactory::new())
         .with_http_client(UreqHttpClient::new())
@@ -151,20 +149,21 @@ async fn send_chat_state(sqlite_url: String, recipient: Jid, state: ChatStateTyp
         .context("failed to build WhatsApp bot for status handling")?;
 
     let client = bot.client();
-    let bot_handle = bot.run().await.context("failed to start WhatsApp bot")?;
-    client
-        .wait_for_socket(CONNECT_TIMEOUT)
-        .await
-        .context("timed out waiting for linked WhatsApp session socket")?;
-    client
-        .chatstate()
-        .send(&recipient, state)
-        .await
-        .context("failed to send WhatsApp chat-state indicator")?;
-
-    client.disconnect().await;
-    let _ = bot_handle.await;
-    Ok(())
+    let bot_handle = bot.spawn();
+    let result = async {
+        client
+            .wait_for_socket(CONNECT_TIMEOUT)
+            .await
+            .context("timed out waiting for linked WhatsApp session socket")?;
+        client
+            .chatstate()
+            .send(&recipient, state)
+            .await
+            .context("failed to send WhatsApp chat-state indicator")
+    }
+    .await;
+    bot_handle.shutdown().await;
+    result
 }
 
 #[cfg(test)]

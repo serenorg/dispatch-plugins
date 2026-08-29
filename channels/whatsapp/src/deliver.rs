@@ -8,9 +8,9 @@ use whatsapp_rust::Jid;
 use whatsapp_rust::TokioRuntime;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::download::MediaType;
-use whatsapp_rust::store::SqliteStore;
 use whatsapp_rust::upload::{UploadOptions, UploadResponse};
 use whatsapp_rust::waproto::whatsapp as wa;
+use whatsapp_rust_sqlite_storage::SqliteStore;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
@@ -214,13 +214,11 @@ async fn send_message_inner(
     recipient: Jid,
     prepared: PreparedSend,
 ) -> Result<String> {
-    let backend = std::sync::Arc::new(
-        SqliteStore::new(&sqlite_url)
-            .await
-            .with_context(|| format!("failed to open WhatsApp session store at `{sqlite_url}`"))?,
-    );
+    let backend = SqliteStore::new(&sqlite_url)
+        .await
+        .with_context(|| format!("failed to open WhatsApp session store at `{sqlite_url}`"))?;
 
-    let mut bot = Bot::builder()
+    let bot = Bot::builder()
         .with_backend(backend)
         .with_transport_factory(TokioWebSocketTransportFactory::new())
         .with_http_client(UreqHttpClient::new())
@@ -230,41 +228,44 @@ async fn send_message_inner(
         .context("failed to build WhatsApp bot for outbound delivery")?;
 
     let client = bot.client();
-    let bot_handle = bot.run().await.context("failed to start WhatsApp bot")?;
-    client
-        .wait_for_socket(CONNECT_TIMEOUT)
-        .await
-        .context("timed out waiting for linked WhatsApp session socket")?;
+    let bot_handle = bot.spawn();
+    let result = async {
+        client
+            .wait_for_socket(CONNECT_TIMEOUT)
+            .await
+            .context("timed out waiting for linked WhatsApp session socket")?;
 
-    let outbound = match prepared.attachment {
-        Some(attachment) => {
-            let PreparedAttachment {
-                name,
-                mime_type,
-                kind,
-                bytes,
-            } = attachment;
-            let upload = client
-                .upload(bytes, kind.media_type(), UploadOptions::default())
-                .await
-                .context("failed to upload WhatsApp attachment")?;
-            build_attachment_message(name, mime_type, kind, upload, &prepared.content)?
-        }
-        None => wa::Message {
-            conversation: Some(prepared.content),
-            ..Default::default()
-        },
-    };
+        let outbound = match prepared.attachment {
+            Some(attachment) => {
+                let PreparedAttachment {
+                    name,
+                    mime_type,
+                    kind,
+                    bytes,
+                } = attachment;
+                let upload = client
+                    .upload(bytes, kind.media_type(), UploadOptions::default())
+                    .await
+                    .context("failed to upload WhatsApp attachment")?;
+                build_attachment_message(name, mime_type, kind, upload, &prepared.content)?
+            }
+            None => wa::Message {
+                conversation: Some(prepared.content),
+                ..Default::default()
+            },
+        };
 
-    let message_id = client
-        .send_message(recipient, outbound)
-        .await
-        .context("failed to send WhatsApp message")?;
+        let message_id = client
+            .send_message(recipient, outbound)
+            .await
+            .context("failed to send WhatsApp message")?;
 
-    tokio::time::sleep(POST_SEND_FLUSH_DELAY).await;
-    client.disconnect().await;
-    let _ = bot_handle.await;
-    Ok(message_id.message_id)
+        tokio::time::sleep(POST_SEND_FLUSH_DELAY).await;
+        Ok(message_id.message_id)
+    }
+    .await;
+    bot_handle.shutdown().await;
+    result
 }
 
 fn build_attachment_message(
@@ -278,7 +279,7 @@ fn build_attachment_message(
 
     Ok(match kind {
         AttachmentKind::Image => wa::Message {
-            image_message: Some(Box::new(wa::message::ImageMessage {
+            image_message: wa::message::ImageMessage {
                 url: Some(upload.url),
                 direct_path: Some(upload.direct_path),
                 media_key: Some(upload.media_key.to_vec()),
@@ -288,11 +289,12 @@ fn build_attachment_message(
                 mimetype: Some(mime_type),
                 caption,
                 ..Default::default()
-            })),
+            }
+            .into(),
             ..Default::default()
         },
         AttachmentKind::Video => wa::Message {
-            video_message: Some(Box::new(wa::message::VideoMessage {
+            video_message: wa::message::VideoMessage {
                 url: Some(upload.url),
                 direct_path: Some(upload.direct_path),
                 media_key: Some(upload.media_key.to_vec()),
@@ -302,11 +304,12 @@ fn build_attachment_message(
                 mimetype: Some(mime_type),
                 caption,
                 ..Default::default()
-            })),
+            }
+            .into(),
             ..Default::default()
         },
         AttachmentKind::Audio => wa::Message {
-            audio_message: Some(Box::new(wa::message::AudioMessage {
+            audio_message: wa::message::AudioMessage {
                 url: Some(upload.url),
                 direct_path: Some(upload.direct_path),
                 media_key: Some(upload.media_key.to_vec()),
@@ -316,11 +319,12 @@ fn build_attachment_message(
                 mimetype: Some(mime_type),
                 ptt: Some(false),
                 ..Default::default()
-            })),
+            }
+            .into(),
             ..Default::default()
         },
         AttachmentKind::Document => wa::Message {
-            document_message: Some(Box::new(wa::message::DocumentMessage {
+            document_message: wa::message::DocumentMessage {
                 url: Some(upload.url),
                 direct_path: Some(upload.direct_path),
                 media_key: Some(upload.media_key.to_vec()),
@@ -332,7 +336,8 @@ fn build_attachment_message(
                 file_name: Some(name),
                 caption,
                 ..Default::default()
-            })),
+            }
+            .into(),
             ..Default::default()
         },
     })

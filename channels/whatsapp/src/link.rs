@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex};
 use wacore::store::DevicePropsOverride;
 use whatsapp_rust::TokioRuntime;
 use whatsapp_rust::bot::Bot;
-use whatsapp_rust::store::SqliteStore;
 use whatsapp_rust::types::events::Event;
 use whatsapp_rust::waproto::whatsapp::device_props::PlatformType;
+use whatsapp_rust_sqlite_storage::SqliteStore;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
@@ -102,16 +102,14 @@ pub fn run(options: LinkOptions) -> Result<()> {
 
     let runtime = tokio_runtime();
     let sqlite_url = to_sqlite_url(&store_path);
-    let backend = Arc::new(
-        runtime
-            .block_on(SqliteStore::new(&sqlite_url))
-            .with_context(|| {
-                format!(
-                    "failed to open WhatsApp session store at `{}`",
-                    store_path.display()
-                )
-            })?,
-    );
+    let backend = runtime
+        .block_on(SqliteStore::new(&sqlite_url))
+        .with_context(|| {
+            format!(
+                "failed to open WhatsApp session store at `{}`",
+                store_path.display()
+            )
+        })?;
 
     let device_name = options.device_name.clone();
     let link_result = runtime.block_on(async {
@@ -119,7 +117,7 @@ pub fn run(options: LinkOptions) -> Result<()> {
         let completion: SharedLinkCompletion = Arc::new(Mutex::new(Some(completion_tx)));
         let completion_events = Arc::clone(&completion);
 
-        let mut bot = Bot::builder()
+        let bot = Bot::builder()
             .with_backend(backend)
             .with_transport_factory(TokioWebSocketTransportFactory::new())
             .with_http_client(UreqHttpClient::new())
@@ -133,10 +131,10 @@ pub fn run(options: LinkOptions) -> Result<()> {
                 let completion = Arc::clone(&completion_events);
                 async move {
                     match &*event {
-                        Event::PairingQrCode { code, .. } => {
-                            if let Err(error) = render_qr_to_stderr(code) {
+                        Event::PairingQrCode(qr) => {
+                            if let Err(error) = render_qr_to_stderr(&qr.code) {
                                 eprintln!("warning: failed to render WhatsApp QR code: {error}");
-                                eprintln!("Pairing code payload: {code}");
+                                eprintln!("Pairing code payload: {}", qr.code);
                             }
                         }
                         Event::PairSuccess(_) => {
@@ -168,15 +166,14 @@ pub fn run(options: LinkOptions) -> Result<()> {
             .await
             .context("failed to build WhatsApp bot for linking")?;
 
-        let client = bot.client();
-        let bot_handle = bot.run().await.context("failed to start WhatsApp bot")?;
-        let completion = completion_rx
+        let bot_handle = bot.spawn();
+        let result = completion_rx
             .await
-            .map_err(|_| anyhow!("pairing flow ended before producing a result"))?;
+            .map_err(|_| anyhow!("pairing flow ended before producing a result"))
+            .and_then(|completion| completion.map_err(anyhow::Error::msg));
 
-        client.disconnect().await;
-        let _ = bot_handle.await;
-        completion.map_err(anyhow::Error::msg)
+        bot_handle.shutdown().await;
+        result
     });
     link_result?;
 

@@ -22,8 +22,3 @@ version = "0.6.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/serenorg/dispatch-plugins"
-
-# libsignal's zkgroup/poksho stack requires Signal Foundation's fork of
-# curve25519-dalek for the post-quantum ristretto primitives it relies on.
-[patch.crates-io]
-curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }

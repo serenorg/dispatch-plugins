@@ -25,8 +25,8 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1"
 url = "2"
-wacore = { version = "0.6", default-features = false }
-whatsapp-rust = { version = "0.6", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native", "signal"] }
-whatsapp-rust-sqlite-storage = "0.6"
-whatsapp-rust-tokio-transport = "0.6"
-whatsapp-rust-ureq-http-client = "0.6"
+wacore = { version = "0.7", default-features = false }
+whatsapp-rust = { version = "0.7", default-features = false, features = ["tokio-transport", "tokio-runtime", "ureq-client", "tokio-native", "signal"] }
+whatsapp-rust-sqlite-storage = { version = "0.7", default-features = false }
+whatsapp-rust-tokio-transport = "0.7"
+whatsapp-rust-ureq-http-client = "0.7"

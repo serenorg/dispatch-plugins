@@ -2,8 +2,8 @@ use anyhow::{Context, Result, anyhow};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use tokio::runtime::{Builder, Runtime};
-use whatsapp_rust::store::SqliteStore;
 use whatsapp_rust::store::traits::DeviceStore;
+use whatsapp_rust_sqlite_storage::SqliteStore;
 
 use crate::protocol::ChannelConfig;
 use crate::store::{resolve_store_path, to_sqlite_url};

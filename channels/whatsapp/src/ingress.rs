@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 use whatsapp_rust::TokioRuntime;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::proto_helpers::MessageExt;
-use whatsapp_rust::store::SqliteStore;
 use whatsapp_rust::types::events::Event;
 use whatsapp_rust::types::message::MessageInfo;
 use whatsapp_rust::waproto::whatsapp as wa;
+use whatsapp_rust_sqlite_storage::SqliteStore;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
@@ -375,29 +375,21 @@ async fn run_poll_receive_loop(
     stop_flag: &AtomicBool,
 ) -> Result<()> {
     let connection_status = Arc::new(AtomicU8::new(CONNECTION_CONNECTING));
-    let mut bot =
+    let bot =
         build_ingress_bot(&sqlite_url, policy, account_id, event_tx, connection_status).await?;
-    let client = bot.client();
-    let bot_handle = bot.run().await.context("failed to start WhatsApp bot")?;
-    tokio::pin!(bot_handle);
+    let mut bot_handle = bot.spawn();
 
     loop {
         if stop_flag.load(Ordering::Relaxed) {
-            client.disconnect().await;
-            break;
+            bot_handle.shutdown().await;
+            return Ok(());
         }
 
         tokio::select! {
-            result = &mut bot_handle => {
-                result.map_err(|_| anyhow!("WhatsApp ingress task ended unexpectedly"))?;
-                break;
-            }
+            _ = &mut bot_handle => return Err(anyhow!("WhatsApp ingress task ended unexpectedly")),
             _ = tokio::time::sleep(STOP_POLL_INTERVAL) => {}
         }
     }
-
-    let _ = bot_handle.await;
-    Ok(())
 }
 
 async fn build_ingress_bot(
@@ -407,11 +399,9 @@ async fn build_ingress_bot(
     event_tx: Sender<InboundEventEnvelope>,
     connection_status: Arc<AtomicU8>,
 ) -> Result<Bot> {
-    let backend = Arc::new(
-        SqliteStore::new(sqlite_url)
-            .await
-            .with_context(|| format!("failed to open WhatsApp session store at `{sqlite_url}`"))?,
-    );
+    let backend = SqliteStore::new(sqlite_url)
+        .await
+        .with_context(|| format!("failed to open WhatsApp session store at `{sqlite_url}`"))?;
 
     Bot::builder()
         .with_backend(backend)
@@ -434,14 +424,17 @@ async fn build_ingress_bot(
                     Event::LoggedOut(_) => {
                         connection_status.store(CONNECTION_LOGGED_OUT, Ordering::Relaxed);
                     }
-                    Event::Message(message, info) => {
-                        if let Some(inbound) =
-                            build_inbound_event_from_message(message, info, &policy, &account_id)
-                        {
-                            let _ = sender.send(inbound);
-                        }
-                    }
                     _ => {}
+                }
+                for message in event.messages() {
+                    if let Some(inbound) = build_inbound_event_from_message(
+                        &message.message,
+                        &message.info,
+                        &policy,
+                        &account_id,
+                    ) {
+                        let _ = sender.send(inbound);
+                    }
                 }
             }
         })
@@ -477,7 +470,7 @@ async fn run_receive_loop(
 ) -> Result<()> {
     let (event_tx, event_rx) = channel::<InboundEventEnvelope>();
     let connection_status = Arc::new(AtomicU8::new(CONNECTION_CONNECTING));
-    let mut bot = build_ingress_bot(
+    let bot = build_ingress_bot(
         &sqlite_url,
         policy,
         account_id,
@@ -487,13 +480,13 @@ async fn run_receive_loop(
     .await?;
 
     let client = bot.client();
-    let bot_handle = bot.run().await.context("failed to start WhatsApp bot")?;
+    let mut bot_handle = bot.spawn();
     let ready = client.wait_for_connected(CONNECTION_GRACE);
     tokio::pin!(ready);
     // Check stop requests during initial readiness so the worker stays within the join grace.
     let readiness = loop {
         tokio::select! {
-            result = &mut ready => break Some(result),
+            result = &mut ready => break Some(result.map_err(anyhow::Error::from)),
             _ = tokio::time::sleep(READINESS_POLL_INTERVAL) => {
                 if stop_flag.load(Ordering::Relaxed) {
                     break None;
@@ -518,8 +511,6 @@ async fn run_receive_loop(
             .context("WhatsApp did not become ready before the connection grace expired");
     }
     let initial_status = promote_connecting_to_ready(&connection_status);
-    tokio::pin!(bot_handle);
-
     let mut last_heartbeat = Instant::now();
     let mut disconnected_since = None;
     match connection_action(initial_status, None) {
@@ -534,7 +525,7 @@ async fn run_receive_loop(
         }
         ConnectionAction::LoggedOut => {
             client.disconnect().await;
-            bot_handle.as_ref().get_ref().abort();
+            bot_handle.abort();
             return Err(anyhow!(LOGGED_OUT_ERROR));
         }
         ConnectionAction::ReconnectGraceExpired => unreachable!(),
@@ -547,9 +538,8 @@ async fn run_receive_loop(
         }
 
         tokio::select! {
-            result = &mut bot_handle => {
+            _ = &mut bot_handle => {
                 drain_and_emit(stdout_lock, &event_rx)?;
-                result.map_err(|_| anyhow!("WhatsApp ingress task ended unexpectedly"))?;
                 return Err(anyhow!("WhatsApp ingress task stopped without an error"));
             }
             _ = tokio::time::sleep(STOP_POLL_INTERVAL) => {}
@@ -561,7 +551,7 @@ async fn run_receive_loop(
         match connection_action(connection_status.load(Ordering::Relaxed), disconnected_for) {
             ConnectionAction::LoggedOut => {
                 client.disconnect().await;
-                bot_handle.as_ref().get_ref().abort();
+                bot_handle.abort();
                 return Err(anyhow!(LOGGED_OUT_ERROR));
             }
             ConnectionAction::Ready => {
@@ -581,7 +571,7 @@ async fn run_receive_loop(
             }
             ConnectionAction::ReconnectGraceExpired => {
                 client.disconnect().await;
-                bot_handle.as_ref().get_ref().abort();
+                bot_handle.abort();
                 return Err(anyhow!(
                     "WhatsApp did not reconnect before the connection grace expired"
                 ));
@@ -595,7 +585,7 @@ async fn run_receive_loop(
         }
     }
 
-    let _ = bot_handle.await;
+    bot_handle.shutdown().await;
     Ok(())
 }
 
@@ -704,16 +694,16 @@ fn build_inbound_attachments(message: &wa::Message) -> Vec<InboundAttachment> {
     let base_message = message.get_base_message();
     let mut attachments = Vec::new();
 
-    if let Some(image) = &base_message.image_message {
+    if let Some(image) = base_message.image_message.as_option() {
         attachments.push(build_image_attachment(image));
     }
-    if let Some(video) = &base_message.video_message {
+    if let Some(video) = base_message.video_message.as_option() {
         attachments.push(build_video_attachment(video));
     }
-    if let Some(audio) = &base_message.audio_message {
+    if let Some(audio) = base_message.audio_message.as_option() {
         attachments.push(build_audio_attachment(audio));
     }
-    if let Some(document) = &base_message.document_message {
+    if let Some(document) = base_message.document_message.as_option() {
         attachments.push(build_document_attachment(document));
     }
 
@@ -1026,12 +1016,13 @@ mod tests {
     #[test]
     fn build_inbound_event_keeps_attachment_only_document_messages() {
         let message = wa::Message {
-            document_message: Some(Box::new(wa::message::DocumentMessage {
+            document_message: wa::message::DocumentMessage {
                 file_name: Some("report.pdf".to_string()),
                 mimetype: Some("application/pdf".to_string()),
                 file_length: Some(42),
                 ..Default::default()
-            })),
+            }
+            .into(),
             ..Default::default()
         };
 
@@ -1082,14 +1073,15 @@ mod tests {
     #[test]
     fn build_inbound_event_surfaces_image_attachment_metadata() {
         let message = wa::Message {
-            image_message: Some(Box::new(wa::message::ImageMessage {
+            image_message: wa::message::ImageMessage {
                 mimetype: Some("image/png".to_string()),
                 caption: Some("look".to_string()),
                 file_length: Some(128),
                 width: Some(640),
                 height: Some(480),
                 ..Default::default()
-            })),
+            }
+            .into(),
             ..Default::default()
         };
 
