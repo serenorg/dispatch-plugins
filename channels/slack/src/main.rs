@@ -6,7 +6,7 @@ use dispatch_channel_runtime::{
     restart_ingress_worker as restart_runtime_ingress_worker, stop_ingress_worker,
     write_stdout_line,
 };
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use jiff::Timestamp;
 use serde::Deserialize;
 use sha2::Sha256;
