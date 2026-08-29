@@ -22,8 +22,8 @@ dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", tag 
 futures = "0.3"
 jiff = "0.2"
 libsqlite3-sys = { version = "0.36", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
-presage = { git = "https://github.com/whisperfish/presage", rev = "600c4ede51865f7de6ca21507e738a7bd70cc7ae" }
-presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "600c4ede51865f7de6ca21507e738a7bd70cc7ae", default-features = false }
+presage = { git = "https://github.com/whisperfish/presage", rev = "f74b96e0fb9099ce8be2b28b7ca9d11f78a6faea" }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "f74b96e0fb9099ce8be2b28b7ca9d11f78a6faea", default-features = false }
 qrcode = { version = "0.14", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

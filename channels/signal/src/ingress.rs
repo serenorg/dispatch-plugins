@@ -330,6 +330,9 @@ async fn run_poll_once(
             }
             Ok(Some(Received::QueueEmpty)) => break,
             Ok(Some(Received::Contacts)) => {}
+            Ok(Some(Received::DecryptionError(_))) => {
+                eprintln!("channel-signal message skipped: reason=decryption_error");
+            }
             Ok(None) => break,
             Err(_) => break,
         }
@@ -380,8 +383,16 @@ async fn run_receive_loop(
         if stop_flag.load(Ordering::Relaxed) {
             return Ok(());
         }
+        let content = match received {
+            Some(Received::Content(content)) => Some(content),
+            Some(Received::DecryptionError(_)) => {
+                eprintln!("channel-signal message skipped: reason=decryption_error");
+                None
+            }
+            _ => None,
+        };
         let mut emitted = false;
-        if let Some(Received::Content(content)) = received
+        if let Some(content) = content
             && let Some(event) = build_inbound_event_from_content(&content, policy, account_id)
         {
             emit_events(stdout_lock, vec![event])?;
@@ -431,7 +442,7 @@ fn build_inbound_event_from_content(
         return None;
     }
 
-    let timestamp_ms = content.metadata.timestamp as i64;
+    let timestamp_ms = content.metadata.timestamp.timestamp_millis();
 
     inbound_event(
         content.metadata.sender.service_id_string(),
