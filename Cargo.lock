@@ -416,7 +416,7 @@ name = "channel-discord"
 version = "0.6.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "channel-schema",
  "dispatch-channel-protocol",
  "dispatch-channel-runtime",
@@ -446,7 +446,7 @@ name = "channel-email-core"
 version = "0.6.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "dispatch-channel-protocol",
  "dispatch-channel-runtime",
  "imap",
@@ -493,7 +493,7 @@ name = "channel-signal"
 version = "0.6.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "dispatch-channel-protocol",
  "futures",
  "jiff",
@@ -512,7 +512,7 @@ name = "channel-slack"
 version = "0.6.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "channel-schema",
  "dispatch-channel-protocol",
  "dispatch-channel-runtime",
@@ -531,7 +531,7 @@ name = "channel-telegram"
 version = "0.6.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "channel-schema",
  "dispatch-channel-protocol",
  "dispatch-channel-runtime",
@@ -546,7 +546,7 @@ name = "channel-twilio-sms"
 version = "0.6.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "channel-schema",
  "dispatch-channel-protocol",
  "hmac 0.12.1",
@@ -577,7 +577,7 @@ name = "channel-whatsapp"
 version = "0.6.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "dispatch-channel-protocol",
  "futures",
  "jiff",

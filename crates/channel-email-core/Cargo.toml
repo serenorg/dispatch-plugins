@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 dispatch-channel-runtime = { path = "../dispatch-channel-runtime" }
 dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", tag = "v0.7.0" }
 imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
