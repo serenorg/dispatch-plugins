@@ -16,11 +16,11 @@ path = "src/main.rs"
 anyhow = "1"
 base64 = "0.23"
 dispatch-channel-protocol = { git = "https://github.com/serenorg/dispatch", tag = "v0.7.0" }
-hmac = "0.12"
+hmac = "0.13"
 jiff = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha1 = "0.10"
+sha1 = "0.11"
 ureq = { version = "3", features = ["json"] }
 url = "2"
 urlencoding = "2"
