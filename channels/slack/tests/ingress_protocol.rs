@@ -52,6 +52,17 @@ fn run_request(request: Value) -> Value {
     run_request_with_env(request, BTreeMap::new())
 }
 
+fn authenticated_ingress_state() -> Value {
+    json!({
+        "mode": "events_webhook",
+        "status": "running",
+        "endpoint": null,
+        "metadata": {
+            "bot_user_id": "UBOT123"
+        }
+    })
+}
+
 fn run_request_with_env(request: Value, envs: BTreeMap<String, String>) -> Value {
     run_request_with_env_and_stderr(request, envs).0
 }
@@ -259,12 +270,39 @@ fn run_start_ingress_cycle(config: Value, envs: BTreeMap<String, String>) -> (Va
 }
 
 #[allow(clippy::result_large_err)]
-fn serve_slack_socket_mode_once(event_payload: Value, expected_app_token: &str) -> String {
+fn serve_slack_socket_mode_once(
+    event_payload: Value,
+    expected_app_token: &str,
+    expected_bot_token: &str,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind slack socket test listener");
     let addr = listener.local_addr().expect("listener addr");
     let expected_app_token = expected_app_token.to_string();
+    let expected_bot_token = expected_bot_token.to_string();
 
     thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept auth request");
+        let auth_request = read_api_request(&mut stream);
+        assert_eq!(auth_request.request_line, "POST /api/auth.test HTTP/1.1");
+        let expected_authorization = format!("Bearer {expected_bot_token}");
+        assert_eq!(
+            auth_request.authorization.as_deref(),
+            Some(expected_authorization.as_str())
+        );
+        let body = json!({
+            "ok": true,
+            "user_id": "UBOT123",
+            "team_id": "T123"
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write auth response");
+
         let (mut stream, _) = listener.accept().expect("accept open request");
         let mut buffer = Vec::new();
         let header_end;
@@ -365,7 +403,11 @@ fn ingress_event_round_trips_slack_message_event() {
         "protocol_version": 1,
         "request": {
             "kind": "ingress_event",
-            "config": {},
+            "config": {
+                "allowed_team_ids": ["T123"],
+                "allowed_channel_ids": ["C123"]
+            },
+            "state": authenticated_ingress_state(),
             "payload": {
                 "endpoint_id": "slack-events",
                 "method": "POST",
@@ -388,10 +430,13 @@ fn ingress_event_round_trips_slack_message_event() {
     assert_eq!(event["event_id"], "Ev123");
     assert_eq!(event["platform"], "slack");
     assert_eq!(event["event_type"], "app_mention");
+    assert_eq!(event["account_id"], "UBOT123");
     assert_eq!(event["conversation"]["id"], "C123");
     assert_eq!(event["conversation"]["thread_id"], "1712860000.000001");
     assert_eq!(event["actor"]["id"], "U123");
     assert_eq!(event["message"]["content"], "hello from slack");
+    assert_eq!(event["activation"]["reason"], "direct_mention");
+    assert_eq!(event["activation"]["agent_account_id"], "UBOT123");
     assert_eq!(event["metadata"]["transport"], "events_webhook");
     assert_eq!(event["metadata"]["endpoint_id"], "slack-events");
 }
@@ -440,7 +485,7 @@ fn accepted_ingress_reacts_after_policy_checks_with_slack_timestamp() {
         (bot_token_env.to_string(), bot_token.to_string()),
         ("SLACK_API_BASE_URL".to_string(), base_url),
     ]);
-    let event_body = |user: &str| {
+    let event_body = |channel: &str| {
         json!({
             "type": "event_callback",
             "team_id": "T123",
@@ -448,9 +493,9 @@ fn accepted_ingress_reacts_after_policy_checks_with_slack_timestamp() {
             "event_time": 1712860000,
             "event": {
                 "type": "app_mention",
-                "channel": "C123",
+                "channel": channel,
                 "channel_type": "channel",
-                "user": user,
+                "user": "U123",
                 "text": "hello from slack",
                 "client_msg_id": "client-generated-id",
                 "ts": "1712860000.100200",
@@ -466,9 +511,10 @@ fn accepted_ingress_reacts_after_policy_checks_with_slack_timestamp() {
                 "kind": "ingress_event",
                 "config": {
                     "bot_token_env": bot_token_env,
-                    "owner_id": "U123",
+                    "allowed_team_ids": ["T123"],
                     "allowed_channel_ids": ["C123"]
                 },
+                "state": authenticated_ingress_state(),
                 "payload": {
                     "endpoint_id": "slack-events",
                     "method": "POST",
@@ -483,7 +529,7 @@ fn accepted_ingress_reacts_after_policy_checks_with_slack_timestamp() {
         })
     };
 
-    let rejected = run_request_with_env(request(event_body("U999")), envs.clone());
+    let rejected = run_request_with_env(request(event_body("C999")), envs.clone());
     assert!(
         rejected["events"]
             .as_array()
@@ -494,7 +540,7 @@ fn accepted_ingress_reacts_after_policy_checks_with_slack_timestamp() {
 
     for _ in 0..2 {
         let (accepted, stderr) =
-            run_request_with_env_and_stderr(request(event_body("U123")), envs.clone());
+            run_request_with_env_and_stderr(request(event_body("C123")), envs.clone());
         let event = &accepted["events"][0];
         assert_eq!(event["message"]["id"], "client-generated-id");
         assert_eq!(event["metadata"]["message_ts"], "1712860000.100200");
@@ -546,8 +592,10 @@ fn reaction_failure_is_fail_open_and_diagnostic_is_content_free() {
                 "kind": "ingress_event",
                 "config": {
                     "bot_token_env": bot_token_env,
+                    "allowed_team_ids": ["T123"],
                     "allowed_channel_ids": ["C-sensitive-test"]
                 },
+                "state": authenticated_ingress_state(),
                 "payload": {
                     "endpoint_id": "slack-events",
                     "method": "POST",
@@ -589,6 +637,8 @@ fn reaction_failure_is_fail_open_and_diagnostic_is_content_free() {
 fn start_ingress_emits_slack_socket_mode_event() {
     let app_token_env = "SLACK_TEST_APP_TOKEN_SOCKET";
     let app_token = "xapp-test-token";
+    let bot_token_env = "SLACK_TEST_BOT_TOKEN_SOCKET";
+    let bot_token = "xoxb-test-token";
     let base_url = serve_slack_socket_mode_once(
         json!({
             "type": "event_callback",
@@ -608,20 +658,24 @@ fn start_ingress_emits_slack_socket_mode_event() {
             }
         }),
         app_token,
+        bot_token,
     );
 
     let (response, notification) = run_start_ingress_cycle(
         json!({
             "app_token_env": app_token_env,
+            "bot_token_env": bot_token_env,
+            "allowed_team_ids": ["T123"],
+            "allowed_channel_ids": ["C123"],
             "poll_timeout_secs": 5,
             "webhook_public_url": null,
             "default_channel_id": null,
-            "bot_token_env": null,
             "signing_secret_env": null,
             "incoming_webhook_url_env": null
         }),
         BTreeMap::from([
             (app_token_env.to_string(), app_token.to_string()),
+            (bot_token_env.to_string(), bot_token.to_string()),
             ("SLACK_API_BASE_URL".to_string(), base_url),
         ]),
     );
@@ -637,8 +691,11 @@ fn start_ingress_emits_slack_socket_mode_event() {
     assert_eq!(event["event_id"], "EvSocket123");
     assert_eq!(event["platform"], "slack");
     assert_eq!(event["event_type"], "app_mention");
+    assert_eq!(event["account_id"], "UBOT123");
     assert_eq!(event["conversation"]["id"], "C123");
     assert_eq!(event["actor"]["id"], "U123");
     assert_eq!(event["message"]["content"], "hello from slack socket mode");
+    assert_eq!(event["activation"]["reason"], "direct_mention");
+    assert_eq!(event["activation"]["agent_account_id"], "UBOT123");
     assert_eq!(event["metadata"]["transport"], "socket_mode");
 }

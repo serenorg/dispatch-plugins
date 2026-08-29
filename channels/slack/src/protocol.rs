@@ -5,11 +5,48 @@ use std::collections::BTreeMap;
 pub use proto::{
     AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities, ChannelPolicy,
     ConfiguredChannel, DeliveryReceipt, FetchedMessage, FetchedMessageAuthor, HealthReport,
-    InboundActor, InboundAttachment, InboundConversationRef, InboundEventEnvelope, InboundMessage,
-    IngressCallbackReply, IngressMode, IngressPayload, IngressState, MessagePermalink, MessageRef,
-    OutboundAttachment, PluginResponse, StatusAcceptance, StatusFrame, StatusKind, ThreadingModel,
-    parse_jsonrpc_request, plugin_error, response_to_jsonrpc,
+    InboundActivation, InboundActor, InboundAttachment, InboundConversationRef,
+    InboundEventEnvelope, InboundMessage, IngressCallbackReply, IngressMode, IngressPayload,
+    IngressState, MessagePermalink, MessageRef, OutboundAttachment, PluginResponse,
+    StatusAcceptance, StatusFrame, StatusKind, ThreadingModel, parse_jsonrpc_request, plugin_error,
+    response_to_jsonrpc,
 };
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SlackActivationPolicy {
+    #[default]
+    MentionOrReply,
+    AllMessages,
+}
+
+impl SlackActivationPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MentionOrReply => "mention_or_reply",
+            Self::AllMessages => "all_messages",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SlackDirectMessagePolicy {
+    #[default]
+    Deny,
+    Allowlist,
+    Open,
+}
+
+impl SlackDirectMessagePolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Allowlist => "allowlist",
+            Self::Open => "open",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ChannelConfig {
@@ -48,8 +85,10 @@ pub struct ChannelConfig {
     pub owner_id: Option<String>,
     #[serde(default)]
     pub allowed_sender_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dm_policy: Option<String>,
+    #[serde(default)]
+    pub activation: SlackActivationPolicy,
+    #[serde(default)]
+    pub dm_policy: SlackDirectMessagePolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_timeout_secs: Option<u16>,
 }

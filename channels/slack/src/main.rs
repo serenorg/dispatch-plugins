@@ -21,12 +21,12 @@ mod slack_api;
 
 use protocol::{
     CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ChannelPolicy, ConfiguredChannel,
-    DeliveryReceipt, FetchedMessage, FetchedMessageAuthor, HealthReport, InboundActor,
-    InboundAttachment, InboundConversationRef, InboundEventEnvelope, InboundMessage,
+    DeliveryReceipt, FetchedMessage, FetchedMessageAuthor, HealthReport, InboundActivation,
+    InboundActor, InboundAttachment, InboundConversationRef, InboundEventEnvelope, InboundMessage,
     IngressCallbackReply, IngressMode, IngressPayload, IngressState, MessagePermalink, MessageRef,
-    OutboundMessage, PluginRequest, PluginRequestEnvelope, PluginResponse, StatusAcceptance,
-    StatusFrame, StatusKind, capabilities, parse_jsonrpc_request, plugin_error,
-    response_to_jsonrpc,
+    OutboundMessage, PluginRequest, PluginRequestEnvelope, PluginResponse, SlackActivationPolicy,
+    SlackDirectMessagePolicy, StatusAcceptance, StatusFrame, StatusKind, capabilities,
+    parse_jsonrpc_request, plugin_error, response_to_jsonrpc,
 };
 use slack_api::{SlackClient, SlackUpload, send_incoming_webhook};
 use slack_api::{
@@ -323,12 +323,12 @@ fn channel_policy(config: &ChannelConfig) -> ChannelPolicy {
         allowed_conversation_ids: config.allowed_channel_ids.clone(),
         allowed_workspace_ids: config.allowed_team_ids.clone(),
         allowed_outbound_conversation_ids: config.allowed_channel_ids.clone(),
-        activation: None,
+        activation: Some(config.activation.as_str().to_string()),
         thread_policy: None,
         allowed_thread_ids: Vec::new(),
-        dm_policy: config.dm_policy.clone(),
+        dm_policy: Some(config.dm_policy.as_str().to_string()),
         allowed_dm_sender_ids: config.allowed_sender_ids.clone(),
-        reply_delivery: None,
+        reply_delivery: Some("tool_owned".to_string()),
         require_signature_validation: Some(true),
         allow_group_messages: None,
         max_attachment_bytes: None,
@@ -1000,10 +1000,21 @@ fn build_inbound_event(
     let Some(channel_id) = event.channel.as_ref() else {
         return Ok(None);
     };
+    let Some(bot_user_id) = ingress_state
+        .and_then(|state| state.metadata.get(META_BOT_USER_ID))
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
     let Some(actor) = inbound_actor(event) else {
         return Ok(None);
     };
     if !sender_is_allowed(config, &actor.id, event.channel_type.as_deref()) {
+        return Ok(None);
+    }
+    if !matches!(event.channel_type.as_deref(), Some("im"))
+        && authorize_channel_id(config, channel_id).is_err()
+    {
         return Ok(None);
     }
 
@@ -1023,6 +1034,9 @@ fn build_inbound_event(
     let parent_message_id = match (event.thread_ts.as_ref(), event.ts.as_ref()) {
         (Some(thread_ts), Some(ts)) if thread_ts != ts => Some(thread_ts.clone()),
         _ => None,
+    };
+    let Some(activation) = inbound_activation(config, event, bot_user_id) else {
+        return Ok(None);
     };
 
     let mut message_metadata = BTreeMap::new();
@@ -1056,8 +1070,7 @@ fn build_inbound_event(
         event_metadata.insert(META_MESSAGE_TS.to_string(), message_ts.clone());
     }
 
-    let account_id = envelope.team_id.clone();
-    if !team_is_allowed(config, account_id.as_deref()) {
+    if !team_is_allowed(config, envelope.team_id.as_deref()) {
         return Ok(None);
     }
 
@@ -1090,8 +1103,8 @@ fn build_inbound_event(
             attachments,
             metadata: message_metadata,
         },
-        account_id,
-        activation: None,
+        account_id: Some(bot_user_id.clone()),
+        activation: Some(activation),
         metadata: event_metadata,
     };
 
@@ -1340,8 +1353,8 @@ fn received_at(host_received_at: Option<&str>, event_time: Option<i64>) -> Resul
 }
 
 fn team_is_allowed(config: &ChannelConfig, team_id: Option<&str>) -> bool {
-    config.allowed_team_ids.is_empty()
-        || team_id
+    !config.allowed_team_ids.is_empty()
+        && team_id
             .map(|team_id| {
                 config
                     .allowed_team_ids
@@ -1352,39 +1365,62 @@ fn team_is_allowed(config: &ChannelConfig, team_id: Option<&str>) -> bool {
 }
 
 fn sender_is_allowed(config: &ChannelConfig, sender_id: &str, channel_type: Option<&str>) -> bool {
-    if let Some(owner_id) = config.owner_id.as_deref()
-        && owner_id != sender_id
-    {
-        return false;
-    }
-
     if !matches!(channel_type, Some("im")) {
         return true;
     }
 
-    match config.dm_policy.as_deref() {
-        Some("deny") => false,
-        Some("pairing") => id_matches_allowlist(&config.allowed_sender_ids, sender_id),
-        Some("open") | None => true,
-        Some(_) => true,
+    match config.dm_policy {
+        SlackDirectMessagePolicy::Deny => false,
+        SlackDirectMessagePolicy::Allowlist => {
+            id_matches_allowlist(&config.allowed_sender_ids, sender_id)
+        }
+        SlackDirectMessagePolicy::Open => true,
     }
 }
 
 fn id_matches_allowlist(allowlist: &[String], value: &str) -> bool {
-    allowlist
-        .iter()
-        .any(|allowed| allowed == "*" || allowed == value)
+    allowlist.iter().any(|allowed| allowed == value)
 }
 
 fn conversation_kind(channel_type: Option<&str>) -> String {
     match channel_type {
-        Some("im") => "direct_message".to_string(),
+        Some("im") => "dm".to_string(),
         Some("mpim") => "group_dm".to_string(),
         Some("group") => "private_channel".to_string(),
         Some("app_home") => "app_home".to_string(),
         Some(kind) => kind.to_string(),
         None => "channel".to_string(),
     }
+}
+
+fn inbound_activation(
+    config: &ChannelConfig,
+    event: &SlackEventPayload,
+    bot_user_id: &str,
+) -> Option<InboundActivation> {
+    let reason = match event.event_type.as_str() {
+        "app_mention" => InboundActivation::REASON_DIRECT_MENTION,
+        "message" if matches!(event.channel_type.as_deref(), Some("im")) => {
+            InboundActivation::REASON_DIRECT_MESSAGE
+        }
+        "message"
+            if event.parent_user_id.as_deref() == Some(bot_user_id)
+                && matches!(config.activation, SlackActivationPolicy::MentionOrReply) =>
+        {
+            InboundActivation::REASON_REPLY_TO_AGENT
+        }
+        "message" if matches!(config.activation, SlackActivationPolicy::AllMessages) => {
+            InboundActivation::REASON_ALL_MESSAGES
+        }
+        _ => return None,
+    };
+
+    Some(InboundActivation {
+        reason: reason.to_string(),
+        agent_account_id: Some(bot_user_id.to_string()),
+        referenced_message_author_id: (reason == InboundActivation::REASON_REPLY_TO_AGENT)
+            .then(|| bot_user_id.to_string()),
+    })
 }
 
 fn render_status_message(update: &StatusFrame) -> String {
@@ -1751,6 +1787,8 @@ struct SlackEventPayload {
     #[serde(default)]
     thread_ts: Option<String>,
     #[serde(default)]
+    parent_user_id: Option<String>,
+    #[serde(default)]
     client_msg_id: Option<String>,
     #[serde(default)]
     files: Vec<SlackFile>,
@@ -1802,14 +1840,33 @@ mod tests {
         }
     }
 
+    fn authorized_channel_config() -> ChannelConfig {
+        ChannelConfig {
+            allowed_team_ids: vec!["T123".to_string()],
+            allowed_channel_ids: vec!["C123".to_string()],
+            ..ChannelConfig::default()
+        }
+    }
+
+    fn authenticated_ingress_state() -> IngressState {
+        IngressState {
+            mode: IngressMode::Polling,
+            status: "running".to_string(),
+            endpoint: None,
+            metadata: BTreeMap::from([(META_BOT_USER_ID.to_string(), "UBOT123".to_string())]),
+        }
+    }
+
     #[test]
     fn url_verification_returns_challenge_reply() {
         let payload = base_payload(
             r#"{"type":"url_verification","challenge":"challenge-token","team_id":"T123"}"#,
         );
 
-        let response = handle_ingress_event(&ChannelConfig::default(), None, &payload)
-            .expect("handle ingress");
+        let config = authorized_channel_config();
+        let ingress_state = authenticated_ingress_state();
+        let response =
+            handle_ingress_event(&config, Some(&ingress_state), &payload).expect("handle ingress");
 
         match response {
             PluginResponse::IngressEventsReceived {
@@ -1879,8 +1936,10 @@ mod tests {
             }"#,
         );
 
-        let response = handle_ingress_event(&ChannelConfig::default(), None, &payload)
-            .expect("handle ingress");
+        let config = authorized_channel_config();
+        let ingress_state = authenticated_ingress_state();
+        let response =
+            handle_ingress_event(&config, Some(&ingress_state), &payload).expect("handle ingress");
 
         match response {
             PluginResponse::IngressEventsReceived {
@@ -1894,14 +1953,22 @@ mod tests {
                 assert_eq!(event.event_id, "Ev123");
                 assert_eq!(event.platform, "slack");
                 assert_eq!(event.event_type, "app_mention");
-                assert_eq!(event.account_id.as_deref(), Some("T123"));
+                assert_eq!(event.account_id.as_deref(), Some("UBOT123"));
                 assert_eq!(event.conversation.id, "C123");
+                assert_eq!(event.conversation.kind, "channel");
                 assert_eq!(
                     event.conversation.thread_id.as_deref(),
                     Some("1712860000.000001")
                 );
                 assert_eq!(event.actor.id, "U123");
                 assert_eq!(event.message.content, "hello from slack");
+                assert_eq!(
+                    event
+                        .activation
+                        .as_ref()
+                        .map(|activation| activation.reason.as_str()),
+                    Some(InboundActivation::REASON_DIRECT_MENTION)
+                );
                 assert_eq!(
                     event.metadata.get(META_TRANSPORT).map(String::as_str),
                     Some(TRANSPORT_EVENTS_WEBHOOK)
@@ -1932,8 +1999,10 @@ mod tests {
             }"#,
         );
 
-        let response = handle_ingress_event(&ChannelConfig::default(), None, &payload)
-            .expect("handle ingress");
+        let config = authorized_channel_config();
+        let ingress_state = authenticated_ingress_state();
+        let response =
+            handle_ingress_event(&config, Some(&ingress_state), &payload).expect("handle ingress");
 
         match response {
             PluginResponse::IngressEventsReceived { events, .. } => assert!(events.is_empty()),
@@ -1958,6 +2027,7 @@ mod tests {
                     "ts":"1712860001.100200",
                     "event_ts":"1712860001.100200",
                     "thread_ts":"1712860000.000001",
+                    "parent_user_id":"UBOT123",
                     "files":[
                         {
                             "id":"F123",
@@ -1975,8 +2045,10 @@ mod tests {
             }"#,
         );
 
-        let response = handle_ingress_event(&ChannelConfig::default(), None, &payload)
-            .expect("handle ingress");
+        let config = authorized_channel_config();
+        let ingress_state = authenticated_ingress_state();
+        let response =
+            handle_ingress_event(&config, Some(&ingress_state), &payload).expect("handle ingress");
 
         match response {
             PluginResponse::IngressEventsReceived { events, .. } => {
@@ -2096,7 +2168,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_message_is_dropped_when_pairing_policy_has_no_allowlist_match() {
+    fn direct_message_is_dropped_when_allowlist_has_no_sender_match() {
         let payload = base_payload(
             r#"{
                 "type":"event_callback",
@@ -2116,7 +2188,8 @@ mod tests {
 
         let response = handle_ingress_event(
             &ChannelConfig {
-                dm_policy: Some("pairing".to_string()),
+                allowed_team_ids: vec!["T123".to_string()],
+                dm_policy: SlackDirectMessagePolicy::Allowlist,
                 ..ChannelConfig::default()
             },
             None,
@@ -2128,6 +2201,28 @@ mod tests {
             PluginResponse::IngressEventsReceived { events, .. } => assert!(events.is_empty()),
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_operator_command_does_not_widen_channel_activation() {
+        let unmentioned: SlackEventPayload = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "text": "stop posting",
+            "channel_type": "channel"
+        }))
+        .expect("operator command event");
+        assert!(inbound_activation(&ChannelConfig::default(), &unmentioned, "UBOT123").is_none());
+
+        let mentioned: SlackEventPayload = serde_json::from_value(serde_json::json!({
+            "type": "app_mention",
+            "text": "<@UBOT123> stop posting",
+            "channel_type": "channel"
+        }))
+        .expect("mentioned operator command event");
+        let activation = inbound_activation(&ChannelConfig::default(), &mentioned, "UBOT123")
+            .expect("a mentioned command carries mention provenance");
+        assert_eq!(activation.reason, InboundActivation::REASON_DIRECT_MENTION);
+        assert_eq!(activation.agent_account_id.as_deref(), Some("UBOT123"));
     }
 
     #[test]
