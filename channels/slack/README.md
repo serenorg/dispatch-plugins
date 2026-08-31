@@ -198,12 +198,14 @@ The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Events API and Socket 
 - if `SLACK_APP_TOKEN` is configured and `webhook_public_url` is not set, `start_ingress` chooses Socket Mode background-session behavior
 - otherwise `start_ingress` chooses Events API webhook mode and reports the public route that the host should expose
 - Socket Mode keeps a background worker alive, acknowledges each `envelope_id`, and emits normalized inbound notifications to Dispatch
+- Socket Mode reports `reconnecting` while a transient connection response, disconnect, close frame, rate limit, or transport failure is within the supervised retry budget; it returns to `running` only after the next successful receive
 
 Common failure modes:
 
 - `polling_not_supported` means `SLACK_APP_TOKEN` was not available to the plugin process
 - `supervised_ingress_required` means the caller attempted one-shot Socket Mode polling; use `start_ingress` so the plugin can write each event before acknowledging its Slack envelope
-- `failed to connect Slack socket mode websocket` usually means the app-level token is invalid or the binary was built without websocket TLS support
+- repeated transient Socket Mode failures use bounded reconnect backoff; authentication and static connection rejections remain terminal
+- `failed to connect Slack socket mode websocket` is retried within the supervised receive budget; repeated failures then exit so the host can restart the plugin
 - repeated self-replies usually mean the app is receiving its own bot messages; the plugin filters bot-authored events, so verify the running binary is up to date if this appears again
 
 ## License

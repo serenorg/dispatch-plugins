@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
@@ -180,8 +180,12 @@ fn read_api_request(stream: &mut std::net::TcpStream) -> CapturedApiRequest {
         assert!(read > 0, "Slack API connection closed before request body");
         buffer.extend_from_slice(&chunk[..read]);
     }
-    let body = serde_json::from_slice(&buffer[body_start..body_start + content_length])
-        .expect("Slack API request JSON");
+    let body = if content_length == 0 {
+        Value::Null
+    } else {
+        serde_json::from_slice(&buffer[body_start..body_start + content_length])
+            .expect("Slack API request JSON")
+    };
 
     CapturedApiRequest {
         request_line,
@@ -375,6 +379,378 @@ fn serve_slack_socket_mode_once(
     });
 
     format!("http://{addr}/api")
+}
+
+fn write_api_json_response(stream: &mut std::net::TcpStream, body: Value) {
+    let body = body.to_string();
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .expect("write Slack API response");
+}
+
+fn open_test_socket(
+    listener: &TcpListener,
+    address: std::net::SocketAddr,
+    path: &str,
+    expected_app_token: &str,
+) {
+    let (mut stream, _) = listener.accept().expect("accept open request");
+    let request = read_api_request(&mut stream);
+    assert_eq!(
+        request.request_line,
+        "POST /api/apps.connections.open HTTP/1.1"
+    );
+    let expected_authorization = format!("Bearer {expected_app_token}");
+    assert_eq!(
+        request.authorization.as_deref(),
+        Some(expected_authorization.as_str())
+    );
+    write_api_json_response(
+        &mut stream,
+        json!({ "ok": true, "url": format!("ws://{address}{path}") }),
+    );
+}
+
+fn accept_test_socket(
+    listener: &TcpListener,
+    expected_path: &str,
+) -> tungstenite::WebSocket<std::net::TcpStream> {
+    let (stream, _) = listener.accept().expect("accept websocket request");
+    accept_hdr(stream, |request: &Request, response: Response| {
+        assert_eq!(request.uri().path(), expected_path);
+        Ok(response)
+    })
+    .expect("accept websocket")
+}
+
+fn accept_test_reaction(listener: &TcpListener, expected_bot_token: &str, response: Value) {
+    let (mut stream, _) = listener.accept().expect("accept reaction request");
+    let request = read_api_request(&mut stream);
+    assert_eq!(request.request_line, "POST /api/reactions.add HTTP/1.1");
+    let expected_authorization = format!("Bearer {expected_bot_token}");
+    assert_eq!(
+        request.authorization.as_deref(),
+        Some(expected_authorization.as_str())
+    );
+    assert_eq!(request.body["channel"], "C123");
+    assert_eq!(request.body["timestamp"], "1712860000.100200");
+    assert_eq!(request.body["name"], "eyes");
+    write_api_json_response(&mut stream, response);
+}
+
+fn serve_slack_socket_mode_recovery(
+    event_payload: Value,
+    expected_app_token: &str,
+    expected_bot_token: &str,
+) -> (String, Receiver<()>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind Slack socket test listener");
+    let address = listener.local_addr().expect("Slack socket test address");
+    let expected_app_token = expected_app_token.to_string();
+    let expected_bot_token = expected_bot_token.to_string();
+    let (recovered_tx, recovered_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept auth request");
+        let request = read_api_request(&mut stream);
+        assert_eq!(request.request_line, "POST /api/auth.test HTTP/1.1");
+        let expected_authorization = format!("Bearer {expected_bot_token}");
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some(expected_authorization.as_str())
+        );
+        write_api_json_response(
+            &mut stream,
+            json!({ "ok": true, "user_id": "UBOT123", "team_id": "T123" }),
+        );
+
+        let (mut stream, _) = listener.accept().expect("accept malformed open request");
+        let request = read_api_request(&mut stream);
+        assert_eq!(
+            request.request_line,
+            "POST /api/apps.connections.open HTTP/1.1"
+        );
+        let expected_authorization = format!("Bearer {expected_app_token}");
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some(expected_authorization.as_str())
+        );
+        write_api_json_response(&mut stream, json!({ "url": "missing-ok" }));
+
+        open_test_socket(&listener, address, "/disconnect", &expected_app_token);
+        let mut socket = accept_test_socket(&listener, "/disconnect");
+        socket
+            .send(Message::Text(
+                json!({ "type": "disconnect" }).to_string().into(),
+            ))
+            .expect("send disconnect envelope");
+
+        open_test_socket(&listener, address, "/close", &expected_app_token);
+        let mut socket = accept_test_socket(&listener, "/close");
+        socket.close(None).expect("send close frame");
+
+        open_test_socket(&listener, address, "/transport", &expected_app_token);
+        let (stream, _) = listener
+            .accept()
+            .expect("accept failed websocket handshake");
+        drop(stream);
+
+        open_test_socket(&listener, address, "/event", &expected_app_token);
+        let mut socket = accept_test_socket(&listener, "/event");
+        socket
+            .send(Message::Text(
+                json!({
+                    "type": "events_api",
+                    "envelope_id": "socket-env-first",
+                    "payload": event_payload,
+                    "accepts_response_payload": false
+                })
+                .to_string()
+                .into(),
+            ))
+            .expect("send recovered event");
+        accept_test_reaction(&listener, &expected_bot_token, json!({ "ok": true }));
+        let ack = socket.read().expect("read recovered event acknowledgement");
+        let Message::Text(ack) = ack else {
+            panic!("unexpected recovered event acknowledgement: {ack:?}");
+        };
+        let ack: Value = serde_json::from_str(ack.as_str()).expect("parse recovered event ack");
+        assert_eq!(ack["envelope_id"], "socket-env-first");
+
+        open_test_socket(&listener, address, "/redelivery", &expected_app_token);
+        let mut socket = accept_test_socket(&listener, "/redelivery");
+        socket
+            .send(Message::Text(
+                json!({
+                    "type": "events_api",
+                    "envelope_id": "socket-env-redelivery",
+                    "payload": event_payload,
+                    "accepts_response_payload": false
+                })
+                .to_string()
+                .into(),
+            ))
+            .expect("send redelivered event");
+        accept_test_reaction(
+            &listener,
+            &expected_bot_token,
+            json!({ "ok": false, "error": "already_reacted" }),
+        );
+        let ack = socket
+            .read()
+            .expect("read redelivered event acknowledgement");
+        let Message::Text(ack) = ack else {
+            panic!("unexpected redelivered event acknowledgement: {ack:?}");
+        };
+        let ack: Value = serde_json::from_str(ack.as_str()).expect("parse redelivered event ack");
+        assert_eq!(ack["envelope_id"], "socket-env-redelivery");
+        recovered_tx
+            .send(())
+            .expect("report recovered socket session");
+        let _ = socket.read();
+    });
+
+    (format!("http://{address}/api"), recovered_rx, server)
+}
+
+fn run_start_ingress_recovery_cycle(
+    config: Value,
+    envs: BTreeMap<String, String>,
+    recovered: Receiver<()>,
+) -> (Value, Vec<Value>, String) {
+    let binary = std::env::var("CARGO_BIN_EXE_channel-slack").expect("channel-slack binary path");
+    let mut child = Command::new(binary)
+        .env_remove("SLACK_BOT_TOKEN")
+        .env_remove("SLACK_API_BASE_URL")
+        .envs(envs)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn channel-slack");
+
+    let mut stdin = child.stdin.take().expect("child stdin");
+    writeln!(
+        stdin,
+        "{}",
+        wrap_request(json!({
+            "protocol_version": 1,
+            "request": {
+                "kind": "start_ingress",
+                "config": config,
+                "state": null
+            }
+        }))
+    )
+    .expect("write start_ingress request");
+
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut response = None;
+    let mut notifications = Vec::new();
+    while response.is_none()
+        || !notifications.iter().any(|notification: &Value| {
+            notification["events"]
+                .as_array()
+                .is_some_and(|events| !events.is_empty())
+        })
+    {
+        let message = read_message(&mut reader);
+        if let Some(result) = message.get("result") {
+            response = Some(result.clone());
+        } else if message["method"] == "channel.event" {
+            notifications.push(message["params"].clone());
+        }
+    }
+
+    recovered
+        .recv_timeout(Duration::from_secs(20))
+        .expect("Slack worker must process the redelivery without exiting");
+    writeln!(
+        stdin,
+        "{}",
+        wrap_request(json!({
+            "protocol_version": 1,
+            "request": { "kind": "shutdown" }
+        }))
+    )
+    .expect("write shutdown request");
+    drop(stdin);
+
+    let mut remaining_stdout = String::new();
+    reader
+        .read_to_string(&mut remaining_stdout)
+        .expect("read remaining child stdout");
+    for line in remaining_stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
+        let message: Value = serde_json::from_str(line).expect("parse remaining plugin json");
+        if message["method"] == "channel.event" {
+            notifications.push(message["params"].clone());
+        }
+    }
+
+    let status = child.wait().expect("wait for child");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("child stderr")
+        .read_to_string(&mut stderr)
+        .expect("read child stderr");
+    assert!(
+        status.success(),
+        "channel-slack exited unsuccessfully: {status}\nstderr:\n{stderr}"
+    );
+
+    (
+        response.expect("start_ingress response"),
+        notifications,
+        stderr,
+    )
+}
+
+fn serve_slack_socket_mode_open_error(
+    slack_error: &str,
+    expected_app_token: &str,
+    expected_bot_token: &str,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind Slack socket test listener");
+    let address = listener.local_addr().expect("Slack socket test address");
+    let expected_app_token = expected_app_token.to_string();
+    let expected_bot_token = expected_bot_token.to_string();
+    let slack_error = slack_error.to_string();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept auth request");
+        let request = read_api_request(&mut stream);
+        assert_eq!(request.request_line, "POST /api/auth.test HTTP/1.1");
+        let expected_authorization = format!("Bearer {expected_bot_token}");
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some(expected_authorization.as_str())
+        );
+        write_api_json_response(
+            &mut stream,
+            json!({ "ok": true, "user_id": "UBOT123", "team_id": "T123" }),
+        );
+
+        let (mut stream, _) = listener.accept().expect("accept open request");
+        let request = read_api_request(&mut stream);
+        assert_eq!(
+            request.request_line,
+            "POST /api/apps.connections.open HTTP/1.1"
+        );
+        let expected_authorization = format!("Bearer {expected_app_token}");
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some(expected_authorization.as_str())
+        );
+        write_api_json_response(&mut stream, json!({ "ok": false, "error": slack_error }));
+    });
+
+    (format!("http://{address}/api"), server)
+}
+
+fn run_start_ingress_expect_terminal(
+    config: Value,
+    envs: BTreeMap<String, String>,
+) -> (String, ExitStatus) {
+    let binary = std::env::var("CARGO_BIN_EXE_channel-slack").expect("channel-slack binary path");
+    let mut child = Command::new(binary)
+        .env_remove("SLACK_BOT_TOKEN")
+        .env_remove("SLACK_API_BASE_URL")
+        .envs(envs)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn channel-slack");
+
+    let mut stdin = child.stdin.take().expect("child stdin");
+    writeln!(
+        stdin,
+        "{}",
+        wrap_request(json!({
+            "protocol_version": 1,
+            "request": {
+                "kind": "start_ingress",
+                "config": config,
+                "state": null
+            }
+        }))
+    )
+    .expect("write start_ingress request");
+
+    let status = child.wait().expect("wait for child");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("child stderr")
+        .read_to_string(&mut stderr)
+        .expect("read child stderr");
+    drop(stdin);
+
+    (stderr, status)
+}
+
+fn socket_mode_config(app_token_env: &str, bot_token_env: &str) -> Value {
+    json!({
+        "app_token_env": app_token_env,
+        "bot_token_env": bot_token_env,
+        "allowed_team_ids": ["T123"],
+        "allowed_channel_ids": ["C123"],
+        "poll_timeout_secs": 2,
+        "webhook_public_url": null,
+        "default_channel_id": null,
+        "signing_secret_env": null,
+        "incoming_webhook_url_env": null
+    })
 }
 
 #[test]
@@ -698,4 +1074,130 @@ fn start_ingress_emits_slack_socket_mode_event() {
     assert_eq!(event["activation"]["reason"], "direct_mention");
     assert_eq!(event["activation"]["agent_account_id"], "UBOT123");
     assert_eq!(event["metadata"]["transport"], "socket_mode");
+}
+
+#[test]
+fn supervised_socket_mode_recovers_without_duplicate_delivery() {
+    let app_token_env = "SLACK_TEST_APP_TOKEN_RECOVERY";
+    let app_token = "xapp-recovery-token";
+    let bot_token_env = "SLACK_TEST_BOT_TOKEN_RECOVERY";
+    let bot_token = "xoxb-recovery-token";
+    let event = json!({
+        "type": "event_callback",
+        "team_id": "T123",
+        "api_app_id": "A123",
+        "event_id": "EvSocketRecovery",
+        "event_time": 1712860000,
+        "event": {
+            "type": "app_mention",
+            "channel": "C123",
+            "channel_type": "channel",
+            "user": "U123",
+            "text": "hello after reconnect",
+            "ts": "1712860000.100200",
+            "event_ts": "1712860000.100200"
+        }
+    });
+    let (base_url, recovered, server) =
+        serve_slack_socket_mode_recovery(event, app_token, bot_token);
+
+    let (response, notifications, stderr) = run_start_ingress_recovery_cycle(
+        socket_mode_config(app_token_env, bot_token_env),
+        BTreeMap::from([
+            (app_token_env.to_string(), app_token.to_string()),
+            (bot_token_env.to_string(), bot_token.to_string()),
+            ("SLACK_API_BASE_URL".to_string(), base_url),
+        ]),
+        recovered,
+    );
+
+    assert_eq!(response["kind"], "ingress_started");
+    let reconnecting = notifications
+        .iter()
+        .filter(|notification| notification["state"]["status"] == "reconnecting")
+        .count();
+    assert_eq!(reconnecting, 4);
+    let delivered: Vec<&Value> = notifications
+        .iter()
+        .flat_map(|notification| notification["events"].as_array().into_iter().flatten())
+        .collect();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0]["event_id"], "EvSocketRecovery");
+    let delivery = notifications
+        .iter()
+        .find(|notification| {
+            notification["events"]
+                .as_array()
+                .is_some_and(|events| !events.is_empty())
+        })
+        .expect("recovered delivery notification");
+    assert_eq!(delivery["state"]["status"], "running");
+    assert!(stderr.contains("missing_ok"));
+    assert!(stderr.contains("retryable=true"));
+    for sensitive in [app_token, bot_token, "hello after reconnect"] {
+        assert!(!stderr.contains(sensitive));
+    }
+    server.join().expect("Slack recovery server");
+}
+
+#[test]
+fn supervised_socket_mode_invalid_auth_remains_terminal() {
+    let app_token_env = "SLACK_TEST_APP_TOKEN_AUTH";
+    let app_token = "xapp-auth-token";
+    let bot_token_env = "SLACK_TEST_BOT_TOKEN_AUTH";
+    let bot_token = "xoxb-auth-token";
+    let (base_url, server) =
+        serve_slack_socket_mode_open_error("invalid_auth", app_token, bot_token);
+
+    let (stderr, status) = run_start_ingress_expect_terminal(
+        socket_mode_config(app_token_env, bot_token_env),
+        BTreeMap::from([
+            (app_token_env.to_string(), app_token.to_string()),
+            (bot_token_env.to_string(), bot_token.to_string()),
+            ("SLACK_API_BASE_URL".to_string(), base_url),
+        ]),
+    );
+
+    assert!(
+        !status.success(),
+        "invalid credentials must exit the plugin process\nstderr:\n{stderr}"
+    );
+    assert!(stderr.contains("slack_authentication_failed"));
+    assert!(stderr.contains("invalid_auth"));
+    assert!(stderr.contains("retryable=false"));
+    for sensitive in [app_token, bot_token] {
+        assert!(!stderr.contains(sensitive));
+    }
+    server.join().expect("Slack auth server");
+}
+
+#[test]
+fn supervised_socket_mode_static_configuration_remains_terminal() {
+    let app_token_env = "SLACK_TEST_APP_TOKEN_CONFIG";
+    let app_token = "xapp-config-token";
+    let bot_token_env = "SLACK_TEST_BOT_TOKEN_CONFIG";
+    let bot_token = "xoxb-config-token";
+    let (base_url, server) =
+        serve_slack_socket_mode_open_error("no_permission", app_token, bot_token);
+
+    let (stderr, status) = run_start_ingress_expect_terminal(
+        socket_mode_config(app_token_env, bot_token_env),
+        BTreeMap::from([
+            (app_token_env.to_string(), app_token.to_string()),
+            (bot_token_env.to_string(), bot_token.to_string()),
+            ("SLACK_API_BASE_URL".to_string(), base_url),
+        ]),
+    );
+
+    assert!(
+        !status.success(),
+        "static configuration errors must exit the plugin process\nstderr:\n{stderr}"
+    );
+    assert!(stderr.contains("slack_socket_protocol_error"));
+    assert!(stderr.contains("no_permission"));
+    assert!(stderr.contains("retryable=false"));
+    for sensitive in [app_token, bot_token] {
+        assert!(!stderr.contains(sensitive));
+    }
+    server.join().expect("Slack configuration server");
 }

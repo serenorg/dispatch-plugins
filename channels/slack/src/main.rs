@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use dispatch_channel_runtime::{
-    IngressPollContext, IngressWorker, no_after_cycle,
+    IngressPollContext, IngressWorker, RuntimeError, no_after_cycle,
     restart_ingress_worker as restart_runtime_ingress_worker, stop_ingress_worker,
     write_stdout_line,
 };
@@ -829,42 +829,34 @@ fn handle_poll_ingress(
             bail!("Slack Socket Mode polling stopped")
         }
         Ok(SlackSocketReceiveOutcome::Disconnected) => {
+            if publish_socket_reconnecting(context, &next_state).is_err() {
+                return Ok(socket_notification_delivery_error());
+            }
             bail!("Slack Socket Mode disconnected before the poll deadline")
         }
-        Err(SlackSocketModeError::Authentication { .. }) => {
+        Err(SlackSocketModeError::Authentication { code }) => {
             return Ok(plugin_error(
                 "slack_authentication_failed",
-                "Slack rejected the configured Socket Mode credentials",
+                format!("Slack rejected the configured Socket Mode credentials: {code}"),
             ));
         }
-        Err(SlackSocketModeError::Protocol { .. }) => {
+        Err(SlackSocketModeError::Configuration { code }) => {
             return Ok(plugin_error(
                 "slack_socket_protocol_error",
-                "Slack returned an invalid Socket Mode connection response",
+                format!("Slack rejected the configured Socket Mode connection: {code}"),
             ));
         }
+        Err(SlackSocketModeError::ConnectionResponse { code }) => {
+            if publish_socket_reconnecting(context, &next_state).is_err() {
+                return Ok(socket_notification_delivery_error());
+            }
+            bail!("Slack Socket Mode connection response failed: {code}")
+        }
         Err(SlackSocketModeError::RateLimited { retry_after }) => {
-            // Publish recovery liveness on both sides of a provider-directed wait.
-            if context
-                .deliver(Vec::new(), next_state.clone(), Some(1000))
-                .is_err()
-            {
-                return Ok(plugin_error(
-                    "notification_delivery_failed",
-                    "Slack could not flush the recovery notification",
-                ));
+            if publish_socket_reconnecting(context, &next_state).is_err() {
+                return Ok(socket_notification_delivery_error());
             }
             context.sleep_until_stopped(retry_after);
-            if !context.is_stopped()
-                && context
-                    .deliver(Vec::new(), next_state.clone(), Some(1000))
-                    .is_err()
-            {
-                return Ok(plugin_error(
-                    "notification_delivery_failed",
-                    "Slack could not flush the recovery notification",
-                ));
-            }
             bail!("Slack rate limited the Socket Mode connection request")
         }
         Err(SlackSocketModeError::NotificationDelivery { .. }) => {
@@ -873,7 +865,12 @@ fn handle_poll_ingress(
                 "Slack could not flush the inbound event notification",
             ));
         }
-        Err(SlackSocketModeError::Transport(error)) => return Err(error),
+        Err(SlackSocketModeError::Transport(error)) => {
+            if publish_socket_reconnecting(context, &next_state).is_err() {
+                return Ok(socket_notification_delivery_error());
+            }
+            return Err(error);
+        }
     };
 
     let Some(socket_envelope) = socket_envelope else {
@@ -900,6 +897,24 @@ fn handle_poll_ingress(
         state: next_state,
         poll_after_ms: Some(1000),
     })
+}
+
+fn publish_socket_reconnecting(
+    context: &IngressPollContext<'_>,
+    running_state: &Option<IngressState>,
+) -> std::result::Result<(), RuntimeError> {
+    let mut reconnecting_state = running_state.clone();
+    if let Some(state) = reconnecting_state.as_mut() {
+        state.status = "reconnecting".to_string();
+    }
+    context.deliver(Vec::new(), reconnecting_state, Some(1000))
+}
+
+fn socket_notification_delivery_error() -> PluginResponse {
+    plugin_error(
+        "notification_delivery_failed",
+        "Slack could not flush the recovery notification",
+    )
 }
 
 type DeliveredEventHistory = (
