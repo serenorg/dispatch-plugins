@@ -27,6 +27,7 @@ Behavior:
 - Socket Mode ingress requires a supervised background `start_ingress` session
 - Socket Mode opens Slack's websocket via `apps.connections.open` and emits normalized inbound events back to Dispatch
 - accepted inbound messages receive an immediate `:eyes:` reaction when bot-token delivery is configured
+- accepted inbound events use the Slack message timestamp as `message.id` and always emit a reply-thread target: root events use `ts`, and in-thread replies keep the original `thread_ts`
 - challenge and acknowledgement replies are returned through `callback_reply`
 - status frames render visible status messages into Slack conversations
 

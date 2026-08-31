@@ -754,7 +754,7 @@ fn socket_mode_config(app_token_env: &str, bot_token_env: &str) -> Value {
 }
 
 #[test]
-fn ingress_event_round_trips_slack_message_event() {
+fn root_app_mention_round_trips_to_threaded_push() {
     let body = json!({
         "type": "event_callback",
         "team_id": "T123",
@@ -768,9 +768,9 @@ fn ingress_event_round_trips_slack_message_event() {
             "channel_type": "channel",
             "user": "U123",
             "text": "hello from slack",
+            "client_msg_id": "client-generated-id",
             "ts": "1712860000.100200",
-            "event_ts": "1712860000.100200",
-            "thread_ts": "1712860000.000001"
+            "event_ts": "1712860000.100200"
         }
     })
     .to_string();
@@ -808,13 +808,73 @@ fn ingress_event_round_trips_slack_message_event() {
     assert_eq!(event["event_type"], "app_mention");
     assert_eq!(event["account_id"], "UBOT123");
     assert_eq!(event["conversation"]["id"], "C123");
-    assert_eq!(event["conversation"]["thread_id"], "1712860000.000001");
+    assert_eq!(event["conversation"]["thread_id"], "1712860000.100200");
+    assert!(event["conversation"]["parent_message_id"].is_null());
     assert_eq!(event["actor"]["id"], "U123");
+    assert_eq!(event["message"]["id"], "1712860000.100200");
     assert_eq!(event["message"]["content"], "hello from slack");
+    assert!(event["message"]["reply_to_message_id"].is_null());
     assert_eq!(event["activation"]["reason"], "direct_mention");
     assert_eq!(event["activation"]["agent_account_id"], "UBOT123");
     assert_eq!(event["metadata"]["transport"], "events_webhook");
     assert_eq!(event["metadata"]["endpoint_id"], "slack-events");
+    assert_eq!(event["metadata"]["client_msg_id"], "client-generated-id");
+    let conversation_id = event["conversation"]["id"]
+        .as_str()
+        .expect("conversation id");
+    let thread_id = event["conversation"]["thread_id"]
+        .as_str()
+        .expect("thread id");
+
+    let bot_token_env = "SLACK_TEST_BOT_TOKEN_THREADED_PUSH";
+    let bot_token = "xoxb-test-threaded-push";
+    let (base_url, request_rx, server) = serve_slack_api(vec![json!({
+        "ok": true,
+        "channel": "C123",
+        "ts": "1712860001.100200"
+    })]);
+    let push = run_request_with_env(
+        json!({
+            "protocol_version": 1,
+            "request": {
+                "kind": "push",
+                "config": {
+                    "bot_token_env": bot_token_env,
+                    "allowed_channel_ids": ["C123"]
+                },
+                "message": {
+                    "content": "hello from the agent",
+                    "metadata": {
+                        "conversation_id": conversation_id,
+                        "thread_id": thread_id
+                    }
+                }
+            }
+        }),
+        BTreeMap::from([
+            (bot_token_env.to_string(), bot_token.to_string()),
+            ("SLACK_API_BASE_URL".to_string(), base_url),
+        ]),
+    );
+
+    assert_eq!(push["kind"], "pushed");
+    assert_eq!(push["delivery"]["conversation_id"], "C123");
+    assert_eq!(push["delivery"]["message_id"], "1712860001.100200");
+    assert_eq!(push["delivery"]["thread_id"], "1712860000.100200");
+    let api_request = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("chat.postMessage request");
+    assert_eq!(
+        api_request.request_line,
+        "POST /api/chat.postMessage HTTP/1.1"
+    );
+    assert_eq!(
+        api_request.authorization.as_deref(),
+        Some("Bearer xoxb-test-threaded-push")
+    );
+    assert_eq!(api_request.body["channel"], "C123");
+    assert_eq!(api_request.body["thread_ts"], "1712860000.100200");
+    server.join().expect("Slack API server");
 }
 
 #[test]
@@ -918,8 +978,12 @@ fn accepted_ingress_reacts_after_policy_checks_with_slack_timestamp() {
         let (accepted, stderr) =
             run_request_with_env_and_stderr(request(event_body("C123")), envs.clone());
         let event = &accepted["events"][0];
-        assert_eq!(event["message"]["id"], "client-generated-id");
+        assert_eq!(event["message"]["id"], "1712860000.100200");
+        assert_eq!(event["conversation"]["thread_id"], "1712860000.100200");
+        assert!(event["conversation"]["parent_message_id"].is_null());
+        assert!(event["message"]["reply_to_message_id"].is_null());
         assert_eq!(event["metadata"]["message_ts"], "1712860000.100200");
+        assert_eq!(event["metadata"]["client_msg_id"], "client-generated-id");
         assert!(!stderr.contains("slack inbound acknowledgement failed"));
     }
 
@@ -1029,6 +1093,7 @@ fn start_ingress_emits_slack_socket_mode_event() {
                 "channel_type": "channel",
                 "user": "U123",
                 "text": "hello from slack socket mode",
+                "client_msg_id": "socket-client-generated-id",
                 "ts": "1712860000.100200",
                 "event_ts": "1712860000.100200"
             }
@@ -1069,11 +1134,19 @@ fn start_ingress_emits_slack_socket_mode_event() {
     assert_eq!(event["event_type"], "app_mention");
     assert_eq!(event["account_id"], "UBOT123");
     assert_eq!(event["conversation"]["id"], "C123");
+    assert_eq!(event["conversation"]["thread_id"], "1712860000.100200");
+    assert!(event["conversation"]["parent_message_id"].is_null());
     assert_eq!(event["actor"]["id"], "U123");
+    assert_eq!(event["message"]["id"], "1712860000.100200");
     assert_eq!(event["message"]["content"], "hello from slack socket mode");
+    assert!(event["message"]["reply_to_message_id"].is_null());
     assert_eq!(event["activation"]["reason"], "direct_mention");
     assert_eq!(event["activation"]["agent_account_id"], "UBOT123");
     assert_eq!(event["metadata"]["transport"], "socket_mode");
+    assert_eq!(
+        event["metadata"]["client_msg_id"],
+        "socket-client-generated-id"
+    );
 }
 
 #[test]
@@ -1094,6 +1167,7 @@ fn supervised_socket_mode_recovers_without_duplicate_delivery() {
             "channel_type": "channel",
             "user": "U123",
             "text": "hello after reconnect",
+            "client_msg_id": "recovery-client-generated-id",
             "ts": "1712860000.100200",
             "event_ts": "1712860000.100200"
         }
@@ -1123,6 +1197,15 @@ fn supervised_socket_mode_recovers_without_duplicate_delivery() {
         .collect();
     assert_eq!(delivered.len(), 1);
     assert_eq!(delivered[0]["event_id"], "EvSocketRecovery");
+    assert_eq!(delivered[0]["message"]["id"], "1712860000.100200");
+    assert_eq!(
+        delivered[0]["conversation"]["thread_id"],
+        "1712860000.100200"
+    );
+    assert_eq!(
+        delivered[0]["metadata"]["client_msg_id"],
+        "recovery-client-generated-id"
+    );
     let delivery = notifications
         .iter()
         .find(|notification| {

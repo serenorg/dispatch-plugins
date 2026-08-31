@@ -66,6 +66,7 @@ const META_API_APP_ID: &str = "api_app_id";
 const META_EVENT_CONTEXT: &str = "event_context";
 const META_CHANNEL_TYPE: &str = "channel_type";
 const META_MESSAGE_TS: &str = "message_ts";
+const META_CLIENT_MSG_ID: &str = "client_msg_id";
 const META_STATUS_KIND: &str = "status_kind";
 const META_REASON_CODE: &str = "reason_code";
 const REJECT_CHANNEL_TARGET_DENIED: &str = "channel_target_denied";
@@ -1033,23 +1034,24 @@ fn build_inbound_event(
         return Ok(None);
     }
 
-    let message_id = event
-        .client_msg_id
-        .clone()
-        .or_else(|| event.ts.clone())
-        .or_else(|| event.event_ts.clone())
-        .unwrap_or_else(|| {
-            envelope
-                .event_id
-                .clone()
-                .unwrap_or_else(|| "slack-event".to_string())
-        });
-    let received_at = received_at(payload.received_at.as_deref(), envelope.event_time)?;
-    let thread_id = event.thread_ts.clone();
-    let parent_message_id = match (event.thread_ts.as_ref(), event.ts.as_ref()) {
-        (Some(thread_ts), Some(ts)) if thread_ts != ts => Some(thread_ts.clone()),
-        _ => None,
+    let Some(message_ts) = event.ts.as_deref().and_then(unpadded_provider_ts) else {
+        return Ok(None);
     };
+    let message_id = message_ts.to_string();
+    let received_at = received_at(payload.received_at.as_deref(), envelope.event_time)?;
+    let thread_ts = match event.thread_ts.as_deref() {
+        None => None,
+        Some(thread_ts) => {
+            let Some(thread_ts) = unpadded_provider_ts(thread_ts) else {
+                return Ok(None);
+            };
+            Some(thread_ts)
+        }
+    };
+    let thread_id = Some(thread_ts.unwrap_or(message_ts).to_string());
+    let parent_message_id = thread_ts
+        .filter(|thread_ts| *thread_ts != message_ts)
+        .map(ToOwned::to_owned);
     let Some(activation) = inbound_activation(config, event, bot_user_id) else {
         return Ok(None);
     };
@@ -1081,8 +1083,13 @@ fn build_inbound_event(
     if let Some(event_context) = &envelope.event_context {
         event_metadata.insert(META_EVENT_CONTEXT.to_string(), event_context.clone());
     }
-    if let Some(message_ts) = &event.ts {
-        event_metadata.insert(META_MESSAGE_TS.to_string(), message_ts.clone());
+    event_metadata.insert(META_MESSAGE_TS.to_string(), message_id.clone());
+    if let Some(client_msg_id) = event
+        .client_msg_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
+        event_metadata.insert(META_CLIENT_MSG_ID.to_string(), client_msg_id.to_string());
     }
 
     if !team_is_allowed(config, envelope.team_id.as_deref()) {
@@ -1123,9 +1130,13 @@ fn build_inbound_event(
         metadata: event_metadata,
     };
 
-    acknowledge_inbound_event(config, channel_id, event.ts.as_deref());
+    acknowledge_inbound_event(config, channel_id, Some(message_ts));
 
     Ok(Some(inbound_event))
+}
+
+fn unpadded_provider_ts(value: &str) -> Option<&str> {
+    (!value.is_empty() && value.trim() == value).then_some(value)
 }
 
 fn acknowledge_inbound_event(config: &ChannelConfig, channel_id: &str, message_ts: Option<&str>) {
@@ -1944,6 +1955,7 @@ mod tests {
                     "channel_type":"channel",
                     "user":"U123",
                     "text":"hello from slack",
+                    "client_msg_id":"client-generated-id",
                     "ts":"1712860000.100200",
                     "event_ts":"1712860000.100200",
                     "thread_ts":"1712860000.000001"
@@ -1975,8 +1987,17 @@ mod tests {
                     event.conversation.thread_id.as_deref(),
                     Some("1712860000.000001")
                 );
+                assert_eq!(
+                    event.conversation.parent_message_id.as_deref(),
+                    Some("1712860000.000001")
+                );
                 assert_eq!(event.actor.id, "U123");
+                assert_eq!(event.message.id, "1712860000.100200");
                 assert_eq!(event.message.content, "hello from slack");
+                assert_eq!(
+                    event.message.reply_to_message_id.as_deref(),
+                    Some("1712860000.000001")
+                );
                 assert_eq!(
                     event
                         .activation
@@ -1992,8 +2013,287 @@ mod tests {
                     event.metadata.get(META_ENDPOINT_ID).map(String::as_str),
                     Some("slack-events")
                 );
+                assert_eq!(
+                    event.metadata.get(META_CLIENT_MSG_ID).map(String::as_str),
+                    Some("client-generated-id")
+                );
             }
             other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn root_app_mention_uses_ts_as_message_id_and_thread_target() {
+        let payload = base_payload(
+            r#"{
+                "type":"event_callback",
+                "team_id":"T123",
+                "api_app_id":"A123",
+                "event_time":1712860000,
+                "event":{
+                    "type":"app_mention",
+                    "channel":"C123",
+                    "channel_type":"channel",
+                    "user":"U123",
+                    "text":"hello from slack",
+                    "client_msg_id":"client-generated-id",
+                    "ts":"1712860000.100200",
+                    "event_ts":"1712860000.100201"
+                }
+            }"#,
+        );
+
+        let config = authorized_channel_config();
+        let ingress_state = authenticated_ingress_state();
+        let response =
+            handle_ingress_event(&config, Some(&ingress_state), &payload).expect("handle ingress");
+
+        match response {
+            PluginResponse::IngressEventsReceived { events, .. } => {
+                assert_eq!(events.len(), 1);
+                let event = &events[0];
+                assert_eq!(event.event_id, "slack:C123:1712860000.100201");
+                assert_eq!(event.message.id, "1712860000.100200");
+                assert_eq!(
+                    event.conversation.thread_id.as_deref(),
+                    Some("1712860000.100200")
+                );
+                assert!(event.conversation.parent_message_id.is_none());
+                assert!(event.message.reply_to_message_id.is_none());
+                assert_eq!(
+                    event.metadata.get(META_CLIENT_MSG_ID).map(String::as_str),
+                    Some("client-generated-id")
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    fn socket_mode_event_envelope(payload: serde_json::Value) -> SlackSocketEnvelope {
+        SlackSocketEnvelope {
+            envelope_type: "events_api".to_string(),
+            envelope_id: Some("socket-env".to_string()),
+            payload: Some(payload),
+        }
+    }
+
+    #[test]
+    fn socket_mode_uses_the_same_inbound_mapping_as_webhook() {
+        let config = authorized_channel_config();
+        let ingress_state = authenticated_ingress_state();
+
+        let root = build_socket_mode_event(
+            &config,
+            Some(&ingress_state),
+            &socket_mode_event_envelope(serde_json::json!({
+                "type": "event_callback",
+                "team_id": "T123",
+                "event": {
+                    "type": "app_mention",
+                    "channel": "C123",
+                    "channel_type": "channel",
+                    "user": "U123",
+                    "text": "hello from slack",
+                    "client_msg_id": "socket-client-generated-id",
+                    "ts": "1712860000.100200",
+                    "event_ts": "1712860000.100201"
+                }
+            })),
+        )
+        .expect("root socket event")
+        .expect("accepted root socket event");
+        assert_eq!(root.event_id, "slack:C123:1712860000.100201");
+        assert_eq!(root.message.id, "1712860000.100200");
+        assert_eq!(
+            root.conversation.thread_id.as_deref(),
+            Some("1712860000.100200")
+        );
+        assert!(root.conversation.parent_message_id.is_none());
+        assert!(root.message.reply_to_message_id.is_none());
+        assert_eq!(
+            root.metadata.get(META_CLIENT_MSG_ID).map(String::as_str),
+            Some("socket-client-generated-id")
+        );
+
+        let reply = build_socket_mode_event(
+            &config,
+            Some(&ingress_state),
+            &socket_mode_event_envelope(serde_json::json!({
+                "type": "event_callback",
+                "team_id": "T123",
+                "event_id": "EvSocketThread",
+                "event": {
+                    "type": "app_mention",
+                    "channel": "C123",
+                    "channel_type": "channel",
+                    "user": "U123",
+                    "text": "hello in thread",
+                    "client_msg_id": "socket-thread-client-id",
+                    "ts": "1712860000.100300",
+                    "event_ts": "1712860000.100300",
+                    "thread_ts": "1712860000.000001"
+                }
+            })),
+        )
+        .expect("thread socket event")
+        .expect("accepted thread socket event");
+        assert_eq!(reply.event_id, "EvSocketThread");
+        assert_eq!(reply.message.id, "1712860000.100300");
+        assert_eq!(
+            reply.conversation.thread_id.as_deref(),
+            Some("1712860000.000001")
+        );
+        assert_eq!(
+            reply.conversation.parent_message_id.as_deref(),
+            Some("1712860000.000001")
+        );
+        assert_eq!(
+            reply.message.reply_to_message_id.as_deref(),
+            Some("1712860000.000001")
+        );
+        assert_eq!(
+            reply.metadata.get(META_CLIENT_MSG_ID).map(String::as_str),
+            Some("socket-thread-client-id")
+        );
+
+        let padded = build_socket_mode_event(
+            &config,
+            Some(&ingress_state),
+            &socket_mode_event_envelope(serde_json::json!({
+                "type": "event_callback",
+                "team_id": "T123",
+                "event_id": "EvSocketPadded",
+                "event": {
+                    "type": "app_mention",
+                    "channel": "C123",
+                    "channel_type": "channel",
+                    "user": "U123",
+                    "text": "hello from slack",
+                    "ts": "1712860000.100200 "
+                }
+            })),
+        )
+        .expect("padded socket event");
+        assert!(padded.is_none());
+    }
+
+    #[test]
+    fn inbound_event_requires_provider_message_coordinates() {
+        let config = authorized_channel_config();
+        let ingress_state = authenticated_ingress_state();
+        let cases = [
+            (
+                "missing message timestamp",
+                r#"{
+                    "type":"event_callback",
+                    "team_id":"T123",
+                    "event_id":"EvMissingTs",
+                    "event":{
+                        "type":"app_mention",
+                        "channel":"C123",
+                        "channel_type":"channel",
+                        "user":"U123",
+                        "text":"hello from slack",
+                        "client_msg_id":"client-generated-id"
+                    }
+                }"#,
+            ),
+            (
+                "empty message timestamp",
+                r#"{
+                    "type":"event_callback",
+                    "team_id":"T123",
+                    "event_id":"EvEmptyTs",
+                    "event":{
+                        "type":"app_mention",
+                        "channel":"C123",
+                        "channel_type":"channel",
+                        "user":"U123",
+                        "text":"hello from slack",
+                        "ts":""
+                    }
+                }"#,
+            ),
+            (
+                "blank message timestamp",
+                r#"{
+                    "type":"event_callback",
+                    "team_id":"T123",
+                    "event_id":"EvBlankTs",
+                    "event":{
+                        "type":"app_mention",
+                        "channel":"C123",
+                        "channel_type":"channel",
+                        "user":"U123",
+                        "text":"hello from slack",
+                        "client_msg_id":"client-generated-id",
+                        "ts":"   "
+                    }
+                }"#,
+            ),
+            (
+                "padded message timestamp",
+                r#"{
+                    "type":"event_callback",
+                    "team_id":"T123",
+                    "event_id":"EvPaddedTs",
+                    "event":{
+                        "type":"app_mention",
+                        "channel":"C123",
+                        "channel_type":"channel",
+                        "user":"U123",
+                        "text":"hello from slack",
+                        "ts":" 1712860000.100200"
+                    }
+                }"#,
+            ),
+            (
+                "blank thread timestamp",
+                r#"{
+                    "type":"event_callback",
+                    "team_id":"T123",
+                    "event_id":"EvBlankThreadTs",
+                    "event":{
+                        "type":"app_mention",
+                        "channel":"C123",
+                        "channel_type":"channel",
+                        "user":"U123",
+                        "text":"hello from slack",
+                        "ts":"1712860000.100200",
+                        "thread_ts":"   "
+                    }
+                }"#,
+            ),
+            (
+                "padded thread timestamp",
+                r#"{
+                    "type":"event_callback",
+                    "team_id":"T123",
+                    "event_id":"EvPaddedThreadTs",
+                    "event":{
+                        "type":"app_mention",
+                        "channel":"C123",
+                        "channel_type":"channel",
+                        "user":"U123",
+                        "text":"hello from slack",
+                        "ts":"1712860000.100200",
+                        "thread_ts":"1712860000.000001 "
+                    }
+                }"#,
+            ),
+        ];
+
+        for (case, body) in cases {
+            let payload = base_payload(body);
+            let response = handle_ingress_event(&config, Some(&ingress_state), &payload)
+                .expect("handle ingress");
+
+            match response {
+                PluginResponse::IngressEventsReceived { events, .. } => {
+                    assert!(events.is_empty(), "{case}")
+                }
+                other => panic!("unexpected response for {case}: {other:?}"),
+            }
         }
     }
 
@@ -2071,6 +2371,10 @@ mod tests {
                 let event = &events[0];
                 assert_eq!(
                     event.message.reply_to_message_id.as_deref(),
+                    Some("1712860000.000001")
+                );
+                assert_eq!(
+                    event.conversation.thread_id.as_deref(),
                     Some("1712860000.000001")
                 );
                 assert_eq!(event.message.attachments.len(), 1);
