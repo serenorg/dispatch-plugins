@@ -753,6 +753,81 @@ fn socket_mode_config(app_token_env: &str, bot_token_env: &str) -> Value {
     })
 }
 
+fn assert_event_push_route(
+    event: &Value,
+    expected_thread_ts: Option<&str>,
+    bot_token_env: &str,
+    bot_token: &str,
+) {
+    let conversation_id = event["conversation"]["id"]
+        .as_str()
+        .expect("conversation id");
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "conversation_id".to_string(),
+        Value::String(conversation_id.to_string()),
+    );
+    if let Some(thread_ts) = event["conversation"]["thread_id"].as_str() {
+        metadata.insert(
+            "thread_id".to_string(),
+            Value::String(thread_ts.to_string()),
+        );
+    }
+
+    let (base_url, request_rx, server) = serve_slack_api(vec![json!({
+        "ok": true,
+        "channel": conversation_id,
+        "ts": "1712860001.100200"
+    })]);
+    let push = run_request_with_env(
+        json!({
+            "protocol_version": 1,
+            "request": {
+                "kind": "push",
+                "config": {
+                    "bot_token_env": bot_token_env,
+                    "allowed_channel_ids": [conversation_id]
+                },
+                "message": {
+                    "content": "hello from the agent",
+                    "metadata": metadata
+                }
+            }
+        }),
+        BTreeMap::from([
+            (bot_token_env.to_string(), bot_token.to_string()),
+            ("SLACK_API_BASE_URL".to_string(), base_url),
+        ]),
+    );
+
+    assert_eq!(push["kind"], "pushed");
+    assert_eq!(push["delivery"]["conversation_id"], conversation_id);
+    assert_eq!(push["delivery"]["message_id"], "1712860001.100200");
+    match expected_thread_ts {
+        Some(thread_ts) => assert_eq!(push["delivery"]["thread_id"], thread_ts),
+        None => assert!(push["delivery"]["thread_id"].is_null()),
+    }
+
+    let api_request = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("chat.postMessage request");
+    assert_eq!(
+        api_request.request_line,
+        "POST /api/chat.postMessage HTTP/1.1"
+    );
+    let expected_authorization = format!("Bearer {bot_token}");
+    assert_eq!(
+        api_request.authorization.as_deref(),
+        Some(expected_authorization.as_str())
+    );
+    assert_eq!(api_request.body["channel"], conversation_id);
+    match expected_thread_ts {
+        Some(thread_ts) => assert_eq!(api_request.body["thread_ts"], thread_ts),
+        None => assert!(api_request.body.get("thread_ts").is_none()),
+    }
+    server.join().expect("Slack API server");
+}
+
 #[test]
 fn root_app_mention_round_trips_to_threaded_push() {
     let body = json!({
@@ -875,6 +950,142 @@ fn root_app_mention_round_trips_to_threaded_push() {
     assert_eq!(api_request.body["channel"], "C123");
     assert_eq!(api_request.body["thread_ts"], "1712860000.100200");
     server.join().expect("Slack API server");
+}
+
+#[test]
+fn root_direct_message_round_trips_to_top_level_push() {
+    let body = json!({
+        "type": "event_callback",
+        "team_id": "T123",
+        "api_app_id": "A123",
+        "event_id": "EvRootDm",
+        "event_time": 1712860000,
+        "event": {
+            "type": "message",
+            "channel": "D123",
+            "channel_type": "im",
+            "user": "U123",
+            "text": "hello in a direct message",
+            "client_msg_id": "dm-client-generated-id",
+            "ts": "1712860000.100300",
+            "event_ts": "1712860000.100300"
+        }
+    })
+    .to_string();
+
+    let response = run_request(json!({
+        "protocol_version": 1,
+        "request": {
+            "kind": "ingress_event",
+            "config": {
+                "allowed_team_ids": ["T123"],
+                "dm_policy": "open"
+            },
+            "state": authenticated_ingress_state(),
+            "payload": {
+                "endpoint_id": "slack-events",
+                "method": "POST",
+                "path": "/slack/events",
+                "headers": {},
+                "query": {},
+                "body": body,
+                "trust_verified": true,
+                "received_at": "2026-04-11T18:00:00Z"
+            }
+        }
+    }));
+
+    assert_eq!(response["kind"], "ingress_events_received");
+    let events = response["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event["event_id"], "EvRootDm");
+    assert_eq!(event["event_type"], "message");
+    assert_eq!(event["conversation"]["id"], "D123");
+    assert_eq!(event["conversation"]["kind"], "dm");
+    assert!(event["conversation"]["thread_id"].is_null());
+    assert!(event["conversation"]["parent_message_id"].is_null());
+    assert_eq!(event["message"]["id"], "1712860000.100300");
+    assert!(event["message"]["reply_to_message_id"].is_null());
+    assert_eq!(event["activation"]["reason"], "direct_message");
+    assert_eq!(event["metadata"]["transport"], "events_webhook");
+
+    assert_event_push_route(
+        event,
+        None,
+        "SLACK_TEST_BOT_TOKEN_ROOT_DM_PUSH",
+        "xoxb-test-root-dm-push",
+    );
+}
+
+#[test]
+fn threaded_direct_message_round_trips_to_threaded_push() {
+    let body = json!({
+        "type": "event_callback",
+        "team_id": "T123",
+        "api_app_id": "A123",
+        "event_id": "EvThreadedDm",
+        "event_time": 1712860000,
+        "event": {
+            "type": "message",
+            "channel": "D123",
+            "channel_type": "im",
+            "user": "U123",
+            "text": "hello in a direct-message thread",
+            "client_msg_id": "threaded-dm-client-id",
+            "ts": "1712860000.100400",
+            "event_ts": "1712860000.100400",
+            "thread_ts": "1712860000.100300"
+        }
+    })
+    .to_string();
+
+    let response = run_request(json!({
+        "protocol_version": 1,
+        "request": {
+            "kind": "ingress_event",
+            "config": {
+                "allowed_team_ids": ["T123"],
+                "dm_policy": "open"
+            },
+            "state": authenticated_ingress_state(),
+            "payload": {
+                "endpoint_id": "slack-events",
+                "method": "POST",
+                "path": "/slack/events",
+                "headers": {},
+                "query": {},
+                "body": body,
+                "trust_verified": true,
+                "received_at": "2026-04-11T18:00:00Z"
+            }
+        }
+    }));
+
+    assert_eq!(response["kind"], "ingress_events_received");
+    let events = response["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event["event_id"], "EvThreadedDm");
+    assert_eq!(event["event_type"], "message");
+    assert_eq!(event["conversation"]["id"], "D123");
+    assert_eq!(event["conversation"]["kind"], "dm");
+    assert_eq!(event["conversation"]["thread_id"], "1712860000.100300");
+    assert_eq!(
+        event["conversation"]["parent_message_id"],
+        "1712860000.100300"
+    );
+    assert_eq!(event["message"]["id"], "1712860000.100400");
+    assert_eq!(event["message"]["reply_to_message_id"], "1712860000.100300");
+    assert_eq!(event["activation"]["reason"], "direct_message");
+    assert_eq!(event["metadata"]["transport"], "events_webhook");
+
+    assert_event_push_route(
+        event,
+        Some("1712860000.100300"),
+        "SLACK_TEST_BOT_TOKEN_THREADED_DM_PUSH",
+        "xoxb-test-threaded-dm-push",
+    );
 }
 
 #[test]
@@ -1074,7 +1285,7 @@ fn reaction_failure_is_fail_open_and_diagnostic_is_content_free() {
 }
 
 #[test]
-fn start_ingress_emits_slack_socket_mode_event() {
+fn root_app_mention_socket_mode_round_trips_to_threaded_push() {
     let app_token_env = "SLACK_TEST_APP_TOKEN_SOCKET";
     let app_token = "xapp-test-token";
     let bot_token_env = "SLACK_TEST_BOT_TOKEN_SOCKET";
@@ -1146,6 +1357,141 @@ fn start_ingress_emits_slack_socket_mode_event() {
     assert_eq!(
         event["metadata"]["client_msg_id"],
         "socket-client-generated-id"
+    );
+
+    assert_event_push_route(
+        event,
+        Some("1712860000.100200"),
+        "SLACK_TEST_BOT_TOKEN_SOCKET_MENTION_PUSH",
+        "xoxb-test-socket-mention-push",
+    );
+}
+
+#[test]
+fn root_direct_message_socket_mode_round_trips_to_top_level_push() {
+    let app_token_env = "SLACK_TEST_APP_TOKEN_SOCKET_ROOT_DM";
+    let app_token = "xapp-test-root-dm-token";
+    let bot_token_env = "SLACK_TEST_BOT_TOKEN_SOCKET_ROOT_DM";
+    let bot_token = "xoxb-test-root-dm-token";
+    let base_url = serve_slack_socket_mode_once(
+        json!({
+            "type": "event_callback",
+            "team_id": "T123",
+            "api_app_id": "A123",
+            "event_id": "EvSocketRootDm",
+            "event_time": 1712860000,
+            "event": {
+                "type": "message",
+                "channel": "D123",
+                "channel_type": "im",
+                "user": "U123",
+                "text": "hello in a socket direct message",
+                "client_msg_id": "socket-dm-client-id",
+                "ts": "1712860000.100300",
+                "event_ts": "1712860000.100300"
+            }
+        }),
+        app_token,
+        bot_token,
+    );
+    let mut config = socket_mode_config(app_token_env, bot_token_env);
+    config["dm_policy"] = json!("open");
+
+    let (response, notification) = run_start_ingress_cycle(
+        config,
+        BTreeMap::from([
+            (app_token_env.to_string(), app_token.to_string()),
+            (bot_token_env.to_string(), bot_token.to_string()),
+            ("SLACK_API_BASE_URL".to_string(), base_url),
+        ]),
+    );
+
+    assert_eq!(response["kind"], "ingress_started");
+    let events = notification["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event["event_id"], "EvSocketRootDm");
+    assert_eq!(event["event_type"], "message");
+    assert_eq!(event["conversation"]["id"], "D123");
+    assert_eq!(event["conversation"]["kind"], "dm");
+    assert!(event["conversation"]["thread_id"].is_null());
+    assert!(event["conversation"]["parent_message_id"].is_null());
+    assert_eq!(event["message"]["id"], "1712860000.100300");
+    assert!(event["message"]["reply_to_message_id"].is_null());
+    assert_eq!(event["activation"]["reason"], "direct_message");
+    assert_eq!(event["metadata"]["transport"], "socket_mode");
+
+    assert_event_push_route(
+        event,
+        None,
+        "SLACK_TEST_BOT_TOKEN_SOCKET_ROOT_DM_PUSH",
+        "xoxb-test-socket-root-dm-push",
+    );
+}
+
+#[test]
+fn threaded_direct_message_socket_mode_round_trips_to_threaded_push() {
+    let app_token_env = "SLACK_TEST_APP_TOKEN_SOCKET_THREADED_DM";
+    let app_token = "xapp-test-threaded-dm-token";
+    let bot_token_env = "SLACK_TEST_BOT_TOKEN_SOCKET_THREADED_DM";
+    let bot_token = "xoxb-test-threaded-dm-token";
+    let base_url = serve_slack_socket_mode_once(
+        json!({
+            "type": "event_callback",
+            "team_id": "T123",
+            "api_app_id": "A123",
+            "event_id": "EvSocketThreadedDm",
+            "event_time": 1712860000,
+            "event": {
+                "type": "message",
+                "channel": "D123",
+                "channel_type": "im",
+                "user": "U123",
+                "text": "hello in a socket direct-message thread",
+                "client_msg_id": "socket-threaded-dm-client-id",
+                "ts": "1712860000.100400",
+                "event_ts": "1712860000.100400",
+                "thread_ts": "1712860000.100300"
+            }
+        }),
+        app_token,
+        bot_token,
+    );
+    let mut config = socket_mode_config(app_token_env, bot_token_env);
+    config["dm_policy"] = json!("open");
+
+    let (response, notification) = run_start_ingress_cycle(
+        config,
+        BTreeMap::from([
+            (app_token_env.to_string(), app_token.to_string()),
+            (bot_token_env.to_string(), bot_token.to_string()),
+            ("SLACK_API_BASE_URL".to_string(), base_url),
+        ]),
+    );
+
+    assert_eq!(response["kind"], "ingress_started");
+    let events = notification["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event["event_id"], "EvSocketThreadedDm");
+    assert_eq!(event["event_type"], "message");
+    assert_eq!(event["conversation"]["id"], "D123");
+    assert_eq!(event["conversation"]["kind"], "dm");
+    assert_eq!(event["conversation"]["thread_id"], "1712860000.100300");
+    assert_eq!(
+        event["conversation"]["parent_message_id"],
+        "1712860000.100300"
+    );
+    assert_eq!(event["message"]["id"], "1712860000.100400");
+    assert_eq!(event["message"]["reply_to_message_id"], "1712860000.100300");
+    assert_eq!(event["activation"]["reason"], "direct_message");
+    assert_eq!(event["metadata"]["transport"], "socket_mode");
+
+    assert_event_push_route(
+        event,
+        Some("1712860000.100300"),
+        "SLACK_TEST_BOT_TOKEN_SOCKET_THREADED_DM_PUSH",
+        "xoxb-test-socket-threaded-dm-push",
     );
 }
 

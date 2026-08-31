@@ -1048,7 +1048,10 @@ fn build_inbound_event(
             Some(thread_ts)
         }
     };
-    let thread_id = Some(thread_ts.unwrap_or(message_ts).to_string());
+    // Only root app mentions start threads; existing threads keep their provider target.
+    let thread_id = thread_ts
+        .or_else(|| (event.event_type == "app_mention").then_some(message_ts))
+        .map(ToOwned::to_owned);
     let parent_message_id = thread_ts
         .filter(|thread_ts| *thread_ts != message_ts)
         .map(ToOwned::to_owned);
@@ -2069,6 +2072,116 @@ mod tests {
         }
     }
 
+    #[test]
+    fn root_direct_message_has_no_thread_target() {
+        let payload = base_payload(
+            r#"{
+                "type":"event_callback",
+                "team_id":"T123",
+                "event_id":"EvRootDm",
+                "event_time":1712860000,
+                "event":{
+                    "type":"message",
+                    "channel":"D123",
+                    "channel_type":"im",
+                    "user":"U123",
+                    "text":"hello in a direct message",
+                    "client_msg_id":"dm-client-generated-id",
+                    "ts":"1712860000.100300",
+                    "event_ts":"1712860000.100300"
+                }
+            }"#,
+        );
+
+        let config = ChannelConfig {
+            dm_policy: SlackDirectMessagePolicy::Open,
+            ..authorized_channel_config()
+        };
+        let ingress_state = authenticated_ingress_state();
+        let response =
+            handle_ingress_event(&config, Some(&ingress_state), &payload).expect("handle ingress");
+
+        match response {
+            PluginResponse::IngressEventsReceived { events, .. } => {
+                assert_eq!(events.len(), 1);
+                let event = &events[0];
+                assert_eq!(event.message.id, "1712860000.100300");
+                assert_eq!(event.conversation.kind, "dm");
+                assert!(event.conversation.thread_id.is_none());
+                assert!(event.conversation.parent_message_id.is_none());
+                assert!(event.message.reply_to_message_id.is_none());
+                assert_eq!(
+                    event
+                        .activation
+                        .as_ref()
+                        .map(|activation| activation.reason.as_str()),
+                    Some(InboundActivation::REASON_DIRECT_MESSAGE)
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn threaded_direct_message_preserves_root_thread_target() {
+        let payload = base_payload(
+            r#"{
+                "type":"event_callback",
+                "team_id":"T123",
+                "event_id":"EvThreadedDm",
+                "event_time":1712860000,
+                "event":{
+                    "type":"message",
+                    "channel":"D123",
+                    "channel_type":"im",
+                    "user":"U123",
+                    "text":"hello in a direct-message thread",
+                    "client_msg_id":"threaded-dm-client-id",
+                    "ts":"1712860000.100400",
+                    "event_ts":"1712860000.100400",
+                    "thread_ts":"1712860000.100300"
+                }
+            }"#,
+        );
+
+        let config = ChannelConfig {
+            dm_policy: SlackDirectMessagePolicy::Open,
+            ..authorized_channel_config()
+        };
+        let ingress_state = authenticated_ingress_state();
+        let response =
+            handle_ingress_event(&config, Some(&ingress_state), &payload).expect("handle ingress");
+
+        match response {
+            PluginResponse::IngressEventsReceived { events, .. } => {
+                assert_eq!(events.len(), 1);
+                let event = &events[0];
+                assert_eq!(event.message.id, "1712860000.100400");
+                assert_eq!(event.conversation.kind, "dm");
+                assert_eq!(
+                    event.conversation.thread_id.as_deref(),
+                    Some("1712860000.100300")
+                );
+                assert_eq!(
+                    event.conversation.parent_message_id.as_deref(),
+                    Some("1712860000.100300")
+                );
+                assert_eq!(
+                    event.message.reply_to_message_id.as_deref(),
+                    Some("1712860000.100300")
+                );
+                assert_eq!(
+                    event
+                        .activation
+                        .as_ref()
+                        .map(|activation| activation.reason.as_str()),
+                    Some(InboundActivation::REASON_DIRECT_MESSAGE)
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
     fn socket_mode_event_envelope(payload: serde_json::Value) -> SlackSocketEnvelope {
         SlackSocketEnvelope {
             envelope_type: "events_api".to_string(),
@@ -2154,6 +2267,86 @@ mod tests {
         assert_eq!(
             reply.metadata.get(META_CLIENT_MSG_ID).map(String::as_str),
             Some("socket-thread-client-id")
+        );
+
+        let dm_config = ChannelConfig {
+            dm_policy: SlackDirectMessagePolicy::Open,
+            ..authorized_channel_config()
+        };
+        let root_dm = build_socket_mode_event(
+            &dm_config,
+            Some(&ingress_state),
+            &socket_mode_event_envelope(serde_json::json!({
+                "type": "event_callback",
+                "team_id": "T123",
+                "event_id": "EvSocketRootDm",
+                "event": {
+                    "type": "message",
+                    "channel": "D123",
+                    "channel_type": "im",
+                    "user": "U123",
+                    "text": "hello in a direct message",
+                    "ts": "1712860000.100400",
+                    "event_ts": "1712860000.100400"
+                }
+            })),
+        )
+        .expect("root direct-message socket event")
+        .expect("accepted root direct-message socket event");
+        assert_eq!(root_dm.message.id, "1712860000.100400");
+        assert_eq!(root_dm.conversation.kind, "dm");
+        assert!(root_dm.conversation.thread_id.is_none());
+        assert!(root_dm.conversation.parent_message_id.is_none());
+        assert!(root_dm.message.reply_to_message_id.is_none());
+        assert_eq!(
+            root_dm
+                .activation
+                .as_ref()
+                .map(|activation| activation.reason.as_str()),
+            Some(InboundActivation::REASON_DIRECT_MESSAGE)
+        );
+
+        let threaded_dm = build_socket_mode_event(
+            &dm_config,
+            Some(&ingress_state),
+            &socket_mode_event_envelope(serde_json::json!({
+                "type": "event_callback",
+                "team_id": "T123",
+                "event_id": "EvSocketThreadedDm",
+                "event": {
+                    "type": "message",
+                    "channel": "D123",
+                    "channel_type": "im",
+                    "user": "U123",
+                    "text": "hello in a direct-message thread",
+                    "ts": "1712860000.100500",
+                    "event_ts": "1712860000.100500",
+                    "thread_ts": "1712860000.100400"
+                }
+            })),
+        )
+        .expect("threaded direct-message socket event")
+        .expect("accepted threaded direct-message socket event");
+        assert_eq!(threaded_dm.message.id, "1712860000.100500");
+        assert_eq!(threaded_dm.conversation.kind, "dm");
+        assert_eq!(
+            threaded_dm.conversation.thread_id.as_deref(),
+            Some("1712860000.100400")
+        );
+        assert_eq!(
+            threaded_dm.conversation.parent_message_id.as_deref(),
+            Some("1712860000.100400")
+        );
+        assert_eq!(
+            threaded_dm.message.reply_to_message_id.as_deref(),
+            Some("1712860000.100400")
+        );
+        assert_eq!(
+            threaded_dm
+                .activation
+                .as_ref()
+                .map(|activation| activation.reason.as_str()),
+            Some(InboundActivation::REASON_DIRECT_MESSAGE)
         );
 
         let padded = build_socket_mode_event(
