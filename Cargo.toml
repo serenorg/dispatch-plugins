@@ -6,6 +6,7 @@ members = [
   "channels/discord",
   "channels/email",
   "channels/gmail",
+  "channels/imessage",
   "channels/outlook",
   "channels/schema",
   "channels/signal",

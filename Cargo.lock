@@ -533,6 +533,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "channel-imessage"
+version = "0.6.0"
+dependencies = [
+ "channel-schema",
+ "dispatch-channel-protocol",
+ "hmac",
+ "jiff",
+ "serde",
+ "serde_json",
+ "sha1 0.11.0",
+ "ureq",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "channel-outlook"
 version = "0.6.0"
 dependencies = [

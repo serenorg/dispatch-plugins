@@ -1,0 +1,41 @@
+{
+  "schema": "https://serenorg.github.io/dispatch/schemas/extension.v1.json",
+  "kind": "channel",
+  "name": "channel-imessage",
+  "version": "0.6.0",
+  "protocol": "jsonl",
+  "protocol_version": 1,
+  "description": "iMessage channel plugin for Dispatch through BlueBubbles.",
+  "entrypoint": {
+    "command": "../../target/release/channel-imessage",
+    "args": []
+  },
+  "auth": {
+    "mode": "manual",
+    "provider": "BlueBubbles",
+    "setup_url": "https://bluebubbles.app/install"
+  },
+  "capabilities": {
+    "channel": {
+      "platform": "imessage",
+      "ingress_modes": ["webhook"],
+      "outbound_message_types": ["text"],
+      "threading_model": "chat_or_thread",
+      "attachment_support": true,
+      "reply_verification_support": false,
+      "account_scoped_config": true,
+      "allow_polling": false,
+      "webhook_secret_support": false,
+      "allowed_paths": ["/imessage"],
+      "delivery": {
+        "push": true,
+        "status_frames": false,
+        "attachment_sources": []
+      }
+    }
+  },
+  "requirements": {
+    "secrets": ["BLUEBUBBLES_URL", "BLUEBUBBLES_PASSWORD"],
+    "network_domains": ["*"]
+  }
+}
