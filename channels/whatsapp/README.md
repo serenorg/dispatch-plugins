@@ -68,6 +68,7 @@ On success the plugin prints a JSON summary containing the linked JIDs, device i
 
 | Field | Purpose |
 | --- | --- |
+| `self_chat_only` | `false` (default) preserves ordinary DM behavior. `true` accepts only the linked account's Message yourself chat from its other devices and restricts replies to that account. |
 | `sqlite_store_path` | Absolute path to the SQLite store. Overrides `account`. |
 | `account` | Logical account name selecting the per-account subdirectory when `sqlite_store_path` is unset. Defaults to `default`. |
 | `default_recipient` | Fallback JID for operator-driven `push`, `deliver`, and `status` frames with no routing metadata. |
@@ -97,6 +98,10 @@ Bare phone numbers are rejected. Group JIDs (`@g.us`) are not supported.
 ## Authorization policy
 
 WhatsApp persistent ingress is direct-message-only. The plugin rejects group messages before emitting a channel event and evaluates the same normalized policy for configuration, inbound messages, `deliver`, `push`, and typing-status frames. An `allowlist` requires one or more exact direct WhatsApp JIDs; `open` is an explicit unbounded direct-message surface; `deny` has no ingress or outbound surface. The plugin records its authenticated linked-account JID and direct-message activation evidence on each accepted event so the host can re-authorize it.
+
+With `self_chat_only: true`, a linked companion session and an explicit `dm_policy` of `open` or a nonempty `allowlist` are required. Omitted/`deny` policies fail validation. Existing policy consistency rules still apply; every configured sender, outbound recipient, and `default_recipient` must belong to the linked account (PN or LID). The effective policy projected to the host is always `allowlist`, containing both available non-device account JIDs for inbound conversations, senders, and outbound destinations. Even `open` is restricted to self. Messages from the phone, desktop, and web count; groups, other chats, and this plugin's own device are excluded. Replies use the event's non-device conversation JID. No sent-ID table is needed because whatsapp-rust excludes the sending companion device from DM delivery.
+
+For browser-linked employees, set `self_chat_only: true` and `dm_policy: "open"` with empty sender/outbound lists; the plugin derives the account-only allowlist from the linked session.
 
 The intended operator flow is to receive an inbound event first, then reuse `conversation.id` as the outbound `message.metadata.conversation_id`.
 

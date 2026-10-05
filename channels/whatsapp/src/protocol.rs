@@ -21,6 +21,9 @@ pub use proto::{
 /// or `$HOME/.config/...`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ChannelConfig {
+    /// Accept only messages in the linked account's own chat.
+    #[serde(default)]
+    pub self_chat_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sqlite_store_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

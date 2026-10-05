@@ -615,11 +615,23 @@ fn build_inbound_event_from_message(
     policy: &WhatsAppPolicy,
     account_id: &str,
 ) -> Option<InboundEventEnvelope> {
-    if info.source.is_from_me || info.source.is_group {
+    if info.source.is_group {
         return None;
     }
-    let sender_id = info.source.sender.to_string();
-    let conversation_id = info.source.chat.to_string();
+    let (sender_id, conversation_id) = if policy.self_chat_account_id().is_some() {
+        if !info.source.is_from_me
+            || !policy.accepts_self_chat(&info.source.chat, &info.source.sender)
+        {
+            return None;
+        }
+        let chat_id = info.source.chat.to_non_ad().to_string();
+        (chat_id.clone(), chat_id)
+    } else {
+        if info.source.is_from_me {
+            return None;
+        }
+        (info.source.sender.to_string(), info.source.chat.to_string())
+    };
     if !policy.allows_inbound_sender(&sender_id)
         || crate::policy::normalize_direct_jid(&sender_id, "inbound sender").is_err()
         || crate::policy::normalize_direct_jid(&conversation_id, "inbound conversation").is_err()
@@ -1010,6 +1022,63 @@ mod tests {
             push_name: "Tester".to_string(),
             r#type: "chat".to_string(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn self_chat_accepts_other_devices_in_pn_and_lid_form_only() {
+        let summary = crate::session::RegistrationSummary {
+            phone_jid: Some("15551234567:7@s.whatsapp.net".to_string()),
+            lid_jid: Some("987654321:7@lid".to_string()),
+            // This is the SQLite row selector, deliberately different from 7.
+            device_id: 1,
+            push_name: None,
+        };
+        let policy = WhatsAppPolicy::for_self_chat(
+            &ChannelConfig {
+                self_chat_only: true,
+                dm_policy: Some("open".to_string()),
+                ..ChannelConfig::default()
+            },
+            &summary,
+        )
+        .unwrap();
+        let message = wa::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
+        };
+        for chat in [ACCOUNT_ID, "987654321@lid"] {
+            let mut info = inbound_info();
+            info.source.chat = chat.parse().unwrap();
+            info.source.is_from_me = true;
+            for device in [0, 1, 3] {
+                info.source.sender = info.source.chat.with_device(device);
+                let event =
+                    build_inbound_event_from_message(&message, &info, &policy, ACCOUNT_ID).unwrap();
+                assert_eq!(event.conversation.id, chat);
+                assert_eq!(event.actor.id, chat);
+            }
+            info.source.sender = info.source.chat.with_device(7);
+            assert!(
+                build_inbound_event_from_message(&message, &info, &policy, ACCOUNT_ID).is_none()
+            );
+            info.source.sender = info.source.chat.with_device(0);
+            info.source.chat = SENDER_ID.parse().unwrap();
+            assert!(
+                build_inbound_event_from_message(&message, &info, &policy, ACCOUNT_ID).is_none()
+            );
+            info.source.chat = chat.parse().unwrap();
+            info.source.sender = SENDER_ID.parse().unwrap();
+            info.source.is_from_me = false;
+            assert!(
+                build_inbound_event_from_message(&message, &info, &policy, ACCOUNT_ID).is_none()
+            );
+            info.source.sender = info.source.chat.clone();
+            info.source.is_from_me = true;
+            info.source.is_group = true;
+            assert!(
+                build_inbound_event_from_message(&message, &info, &policy, ACCOUNT_ID).is_none()
+            );
         }
     }
 
