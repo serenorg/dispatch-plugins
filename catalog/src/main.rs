@@ -780,6 +780,94 @@ mod tests {
     }
 
     #[test]
+    fn catalog_includes_every_channel_manifest() {
+        let catalog = load_repo_catalog();
+        let channels = repo_root().join("channels");
+
+        for directory in fs::read_dir(channels).expect("read channels") {
+            let directory = directory.expect("channel directory");
+            if directory.file_name() == ".agent-shell" {
+                continue;
+            }
+            let manifest_path = directory.path().join("channel-plugin.json");
+            if !manifest_path.is_file() {
+                continue;
+            }
+            let manifest: ExtensionManifest = serde_json::from_str(
+                &fs::read_to_string(&manifest_path).expect("read channel manifest"),
+            )
+            .expect("parse channel manifest");
+            assert_eq!(
+                catalog
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.name == manifest.name)
+                    .count(),
+                1,
+                "missing or duplicate catalog entry for {}",
+                manifest.name
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_release_sources_match_entry_versions() {
+        let catalog = load_repo_catalog();
+
+        for entry in &catalog.entries {
+            let CatalogInstallSource::GithubRelease { repo, tag, .. } =
+                entry.source.as_ref().expect("release source");
+            assert_eq!(repo, "serenorg/dispatch-plugins");
+            assert_eq!(tag, &format!("v{}", entry.version));
+            assert_eq!(
+                entry.manifest_url.as_deref(),
+                Some(
+                    format!(
+                        "https://raw.githubusercontent.com/{repo}/{tag}/{}",
+                        entry.manifest_path
+                    )
+                    .as_str()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn imessage_release_assets_cover_every_target() {
+        let catalog = load_repo_catalog();
+
+        for target in [
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-unknown-linux-musl",
+            "x86_64-unknown-linux-gnu",
+            "x86_64-unknown-linux-musl",
+            "x86_64-pc-windows-msvc",
+        ] {
+            let assets = release_assets(
+                &catalog,
+                &ReleaseAssetsConfig {
+                    target: target.to_string(),
+                    extras: Vec::new(),
+                },
+            )
+            .expect("release assets");
+            let imessage = assets
+                .iter()
+                .find(|asset| asset.name == "channel-imessage")
+                .expect("iMessage release asset");
+            let suffix = if target == "x86_64-pc-windows-msvc" {
+                ".exe"
+            } else {
+                ""
+            };
+            assert_eq!(imessage.binary_name, format!("channel-imessage{suffix}"));
+            assert_eq!(imessage.asset, format!("channel-imessage-{target}{suffix}"));
+        }
+    }
+
+    #[test]
     fn release_assets_emit_catalog_binaries_for_linux_and_extras() {
         let catalog = ExtensionCatalog {
             schema: None,

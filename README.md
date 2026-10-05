@@ -9,6 +9,7 @@ Dispatch channel extensions built and released together from one workspace.
 - `channels/discord` - Discord interaction-webhook and websocket plugin
 - `channels/email` - IMAP + SMTP email plugin
 - `channels/gmail` - Gmail-focused IMAP + SMTP email plugin
+- `channels/imessage` - iMessage webhook and delivery plugin through BlueBubbles
 - `channels/outlook` - Outlook / Microsoft 365 IMAP + SMTP email plugin
 - `channels/signal` - native Signal plugin based on presage
 - `channels/slack` - Slack Events API / Socket Mode plugin
@@ -25,6 +26,7 @@ Dispatch channel extensions built and released together from one workspace.
 | `channel-discord` | Interaction webhook or websocket session | Host-managed HTTPS callback or Discord Gateway websocket | Discord REST bot messages |
 | `channel-email` | One-shot poll or background ingress session | IMAP polling worker inside the plugin | SMTP delivery |
 | `channel-gmail` | One-shot poll or background ingress session | Gmail IMAP polling worker inside the plugin | Gmail SMTP delivery |
+| `channel-imessage` | BlueBubbles webhook only | Host-managed HTTPS callback from a BlueBubbles server on a Mac | BlueBubbles text delivery to an existing iMessage direct chat |
 | `channel-outlook` | One-shot poll or background ingress session | Outlook / Microsoft 365 IMAP polling worker inside the plugin | Outlook / Microsoft 365 SMTP delivery |
 | `channel-signal` | One-shot poll or background ingress session | Native Signal websocket through presage | Native Signal messages and attachments |
 | `channel-slack` | Events API webhook or background Socket Mode session | Host-managed HTTPS callback or Slack Socket Mode websocket | `chat.postMessage` or incoming webhook |

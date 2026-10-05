@@ -47,11 +47,11 @@
         ],
         "platforms": []
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.4.0/channels/discord/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.6.0/channels/discord/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.4.0",
+        "tag": "v0.6.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -134,11 +134,11 @@
           "smtp"
         ]
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.4.0/channels/email/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.6.0/channels/email/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.4.0",
+        "tag": "v0.6.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -224,11 +224,11 @@
           "smtp"
         ]
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.4.0/channels/gmail/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.6.0/channels/gmail/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.4.0",
+        "tag": "v0.6.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -265,6 +265,92 @@
             "target": "x86_64-pc-windows-msvc",
             "asset": "channel-gmail-x86_64-pc-windows-msvc.exe",
             "binary_name": "channel-gmail.exe"
+          }
+        ]
+      }
+    },
+    {
+      "id": "seren.channel.imessage",
+      "name": "channel-imessage",
+      "display_name": "iMessage Channel",
+      "kind": "channel",
+      "version": "0.6.0",
+      "description": "iMessage channel plugin for Dispatch through BlueBubbles.",
+      "protocol": "jsonl",
+      "protocol_version": 1,
+      "source_dir": "channels/imessage",
+      "manifest_path": "channels/imessage/channel-plugin.json",
+      "keywords": [
+        "dispatch",
+        "channel",
+        "imessage",
+        "bluebubbles",
+        "messaging"
+      ],
+      "tags": [
+        "messaging",
+        "imessage",
+        "bluebubbles",
+        "webhook"
+      ],
+      "install_hint": "dispatch extension install channel-imessage",
+      "auth": {
+        "method": "manual",
+        "provider": "BlueBubbles",
+        "setup_url": "https://bluebubbles.app/install"
+      },
+      "requirements": {
+        "secrets": [
+          "BLUEBUBBLES_URL",
+          "BLUEBUBBLES_PASSWORD"
+        ],
+        "optional_secrets": [],
+        "network_domains": [
+          "*"
+        ],
+        "platforms": []
+      },
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.6.0/channels/imessage/channel-plugin.json",
+      "source": {
+        "type": "github_release",
+        "repo": "serenorg/dispatch-plugins",
+        "tag": "v0.6.0",
+        "checksum_asset": "SHA256SUMS.txt",
+        "binaries": [
+          {
+            "target": "aarch64-apple-darwin",
+            "asset": "channel-imessage-aarch64-apple-darwin",
+            "binary_name": "channel-imessage"
+          },
+          {
+            "target": "x86_64-apple-darwin",
+            "asset": "channel-imessage-x86_64-apple-darwin",
+            "binary_name": "channel-imessage"
+          },
+          {
+            "target": "aarch64-unknown-linux-gnu",
+            "asset": "channel-imessage-aarch64-unknown-linux-gnu",
+            "binary_name": "channel-imessage"
+          },
+          {
+            "target": "aarch64-unknown-linux-musl",
+            "asset": "channel-imessage-aarch64-unknown-linux-musl",
+            "binary_name": "channel-imessage"
+          },
+          {
+            "target": "x86_64-unknown-linux-gnu",
+            "asset": "channel-imessage-x86_64-unknown-linux-gnu",
+            "binary_name": "channel-imessage"
+          },
+          {
+            "target": "x86_64-unknown-linux-musl",
+            "asset": "channel-imessage-x86_64-unknown-linux-musl",
+            "binary_name": "channel-imessage"
+          },
+          {
+            "target": "x86_64-pc-windows-msvc",
+            "asset": "channel-imessage-x86_64-pc-windows-msvc.exe",
+            "binary_name": "channel-imessage.exe"
           }
         ]
       }
@@ -315,11 +401,11 @@
           "outlook"
         ]
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.4.0/channels/outlook/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.6.0/channels/outlook/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.4.0",
+        "tag": "v0.6.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -411,11 +497,11 @@
           "presage"
         ]
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.4.0/channels/signal/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.6.0/channels/signal/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.4.0",
+        "tag": "v0.6.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -503,11 +589,11 @@
           "slack-incoming-webhook"
         ]
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.4.0/channels/slack/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.6.0/channels/slack/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.4.0",
+        "tag": "v0.6.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -589,11 +675,11 @@
         ],
         "platforms": []
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.4.0/channels/telegram/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.6.0/channels/telegram/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.4.0",
+        "tag": "v0.6.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -679,11 +765,11 @@
         ],
         "platforms": []
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.4.0/channels/twilio-sms/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.6.0/channels/twilio-sms/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.4.0",
+        "tag": "v0.6.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -763,11 +849,11 @@
         ],
         "platforms": []
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.4.0/channels/webhook/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.6.0/channels/webhook/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.4.0",
+        "tag": "v0.6.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -851,11 +937,11 @@
           "whatsapp-rust"
         ]
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.4.0/channels/whatsapp/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.6.0/channels/whatsapp/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.4.0",
+        "tag": "v0.6.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
