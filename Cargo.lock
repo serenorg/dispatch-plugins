@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "channel-discord"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "channel-email"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "channel-email-core",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "channel-email-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "channel-gmail"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "channel-email-core",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "channel-imessage"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "channel-schema",
  "dispatch-channel-protocol",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "channel-outlook"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "channel-email-core",
@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "channel-schema"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "channel-signal"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "channel-slack"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "channel-telegram"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "channel-twilio-sms"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -640,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "channel-webhook"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "channel-schema",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "channel-whatsapp"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1270,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "dispatch-channel-runtime"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "dispatch-channel-protocol",
  "thiserror 2.0.20",
@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "dispatch-extension-catalog"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "channel-schema",

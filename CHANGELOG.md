@@ -2,6 +2,35 @@
 
 All notable changes to Dispatch Plugins are documented in this file.
 
+## [0.7.0] - 2026-10-05
+
+### Added
+
+- The iMessage plugin now supports authenticated BlueBubbles webhooks, text replies to existing direct chats, health checks, and catalog installation.
+- Signal and WhatsApp now support account-only self-chat, with replies restricted to the linked account and unrelated conversations excluded from host events.
+- Signal and WhatsApp linking commands now support `--json` for pairing events and linked-account summaries on stdout.
+- Discord now offers `line_mode` for shared bots receiving DMs, mentions, replies, and application interactions across reachable servers. The host owns customer routing and authorization.
+
+### Changed
+
+- Signal self-chat mode stores cryptographic session state and expiration settings without persisting message contents, contacts, profiles, groups, avatars, or sticker packs.
+- Use a dedicated Signal store when enabling self-chat after ordinary messaging. Enabling self-chat does not erase previously stored content.
+- WhatsApp linking and self-chat sessions now skip history synchronization.
+- **Breaking:** Slack now requires an allowed team and defaults to denied DMs and mention-or-reply activation. Configure `allowed_team_ids`, `dm_policy`, and `activation` explicitly.
+- **Breaking:** Slack's `pairing` DM policy is now `allowlist`; use `allowed_sender_ids` instead of `owner_id` for DM restrictions.
+- Workspace dependencies are updated, including WhatsApp 0.7, the pinned Signal library, and cryptography and websocket crates.
+
+### Fixed
+
+- Slack root direct-message replies now remain unthreaded, while root mentions and existing thread replies use the correct thread timestamp.
+- Slack Socket Mode now retries transient connection and connection-response failures while keeping authentication and configuration failures terminal. Connection errors no longer expose websocket tickets.
+- Catalog manifest URLs and binary sources now use the matching release tag for every channel.
+
+### Security
+
+- Slack now validates team, channel, sender, and activation policy before emitting inbound events.
+- Discord now rejects inconsistent provider channel, guild, thread, and DM coordinates before accepting events or accessing messages.
+
 ## [0.6.0] - 2026-08-28
 
 ### Added
