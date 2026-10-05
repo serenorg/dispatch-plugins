@@ -76,6 +76,7 @@ All configuration fields are optional. Defaults match what `--link` wrote to dis
 
 | Field | Purpose |
 | --- | --- |
+| `self_chat_only` | `false` (default) preserves ordinary DM behavior. `true` accepts only Note to Self transcripts from the linked account's other devices, with replies restricted to its ACI. |
 | `sqlite_store_path` | Absolute path to the SQLite store. Overrides `account`. |
 | `account` | Logical account name selecting the per-account subdirectory when `sqlite_store_path` is unset. Defaults to `default`. |
 | `passphrase_env` | Env var name holding a passphrase used to encrypt the store at rest (SQLCipher `PRAGMA key`). Leave unset for an unencrypted store. |
@@ -85,6 +86,14 @@ All configuration fields are optional. Defaults match what `--link` wrote to dis
 | `allowed_dm_sender_ids` | Exact Signal ServiceIds permitted to start direct-message turns when `dm_policy` is `allowlist`. |
 | `outbound_recipient_ids` | Exact Signal ServiceIds permitted for delivery. Empty falls back to `allowed_dm_sender_ids`; it cannot widen an allowlist. |
 | `reply_delivery` | `runtime_owned` (default) or `tool_owned`, selecting the runtime path that presents a turn's visible reply. |
+
+With `self_chat_only: true`, use a linked session and set `dm_policy` to `open` or a nonempty `allowlist`. Omitted and `deny` policies fail validation. Sender IDs, outbound recipients, and `default_recipient` must name the linked account's ACI (bare UUID or `ACI:` form). The host receives an account-only allowlist even with `dm_policy: "open"`. Only Note to Self text and attachment transcripts from the account's other devices become events. Replies go to the same ACI. The plugin excludes its own device, groups, and other conversations.
+
+For account-only linking, set `self_chat_only: true` and `dm_policy: "open"` with empty sender and outbound lists. The plugin derives the allowlist from the linked session.
+
+Self-chat mode passes the intended Note to Self messages to the host without saving local copies of message text or attachments. It saves only validated self-chat expiration settings, registration, and cryptographic protocol state needed to keep the device connected. It does not save contacts, profiles, groups, avatars, or sticker packs. Signal still sends account traffic to linked devices, and the library decrypts and processes it before the plugin filters host events. The plugin preserves the self-chat's disappearing-message timer when replying.
+
+Enabling self-chat mode does not erase content saved by earlier sessions. Existing unrelated records remain hidden from the plugin's content operations. Use a dedicated session store for self-chat mode if the account previously ran with ordinary message storage.
 
 Default store layout:
 
@@ -139,7 +148,7 @@ The plugin always owns the upstream receive loop. There is no webhook or polling
 
 Inbound delivery is best effort. Messages can be lost or processed more than once. Do not rely on this plugin for messages that must never be lost or duplicated.
 
-`presage` processes and stores a message before yielding it to the plugin, and the plugin then writes a `channel.event` notification to stdout. The plugin has no local outbox and the protocol has no host-acceptance acknowledgement, so a crash or a failed stdout write between those two steps drops that message with no replay path. A write failure ends the receive session, which the supervisor reports, but the message itself is already gone.
+`presage` processes each message before yielding it to the plugin. Ordinary mode stores messages; self-chat mode stores only expiration settings. The plugin then writes a `channel.event` notification to stdout. It has no local outbox and the protocol has no host-acceptance acknowledgement, so a crash or a failed stdout write between those two steps drops that message with no replay path. A write failure ends the receive session, which the supervisor reports, but the upstream message has already been consumed.
 
 Redelivery is equally unprotected in the other direction: the host allocates a new execution identifier for every notification and does not claim the provider event id, so a message that did arrive twice would produce two runs and two replies.
 
@@ -189,6 +198,8 @@ Dispatch emits `status` frames to mark turn-taking. The plugin maps the subset t
 | `processing`, `delivering`, `operation_started` | typing started |
 | `completed`, `cancelled`, `operation_finished` | typing stopped |
 | `info`, `approval_needed`, `auth_required`, others | accepted, no upstream traffic |
+
+Typing to the linked account's own ACI is accepted without sending a frame, because Signal cannot send typing indicators to Note to Self.
 
 The status frame's `conversation_id` is required and is treated the same way as an outbound recipient.
 

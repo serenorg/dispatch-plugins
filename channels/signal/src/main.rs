@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 use std::sync::{Arc, Mutex};
 
+mod content_store;
 mod deliver;
 mod ingress;
 mod link;

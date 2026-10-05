@@ -29,6 +29,9 @@ pub use proto::{
 /// and sending all happen inside this plugin process.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ChannelConfig {
+    /// Accept only Note to Self transcripts from the linked account.
+    #[serde(default)]
+    pub self_chat_only: bool,
     /// Absolute (or `~`-expanded) path to the SQLite store backing the
     /// Signal session. When unset, the plugin uses
     /// `$XDG_CONFIG_HOME/dispatch/channels/signal/<account>/store.db`
@@ -102,6 +105,7 @@ impl ReplyDelivery {
 /// A validated, canonical Signal authorization policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignalChannelPolicy {
+    self_chat_account: Option<(String, u32)>,
     dm_policy: DmPolicy,
     allowed_dm_sender_ids: BTreeSet<String>,
     outbound_recipient_ids: BTreeSet<String>,
@@ -110,6 +114,14 @@ pub struct SignalChannelPolicy {
 
 impl SignalChannelPolicy {
     pub fn from_config(config: &ChannelConfig) -> Result<Self> {
+        if config.self_chat_only {
+            let crate::session::SessionState::Registered { summary, .. } =
+                crate::session::load_session(config)?
+            else {
+                return Err(anyhow!("Signal self-chat mode requires a linked session"));
+            };
+            return Self::for_self_chat(config, &summary.aci, summary.device_id);
+        }
         let allowed_dm_sender_ids =
             normalize_service_ids("allowed_dm_sender_ids", &config.allowed_dm_sender_ids)?;
         let outbound_recipient_ids =
@@ -161,11 +173,56 @@ impl SignalChannelPolicy {
         }
 
         Ok(Self {
+            self_chat_account: None,
             dm_policy: config.dm_policy,
             allowed_dm_sender_ids,
             outbound_recipient_ids,
             reply_delivery: config.reply_delivery,
         })
+    }
+
+    pub(crate) fn for_self_chat(
+        config: &ChannelConfig,
+        account_id: &str,
+        device_id: u32,
+    ) -> Result<Self> {
+        let mut regular_config = config.clone();
+        regular_config.self_chat_only = false;
+        let mut policy = Self::from_config(&regular_config)?;
+        policy.require_persistent_ingress()?;
+        let account_id = normalize_service_id(account_id)?;
+        if !matches!(
+            ServiceId::parse_from_service_id_string(&account_id),
+            Some(ServiceId::Aci(_))
+        ) || device_id == 0
+        {
+            return Err(anyhow!(
+                "Signal self-chat mode requires a linked ACI and device identity"
+            ));
+        }
+        for value in policy
+            .allowed_dm_sender_ids
+            .iter()
+            .chain(policy.outbound_recipient_ids.iter())
+            .chain(config.default_recipient.iter())
+        {
+            if normalize_service_id(value)? != account_id {
+                return Err(anyhow!(
+                    "Signal self-chat mode permits only the linked ACI in sender, outbound, and default recipient fields"
+                ));
+            }
+        }
+        policy.dm_policy = DmPolicy::Allowlist;
+        policy.allowed_dm_sender_ids = BTreeSet::from([account_id.clone()]);
+        policy.outbound_recipient_ids = policy.allowed_dm_sender_ids.clone();
+        policy.self_chat_account = Some((account_id, device_id));
+        Ok(policy)
+    }
+
+    pub fn self_chat_account(&self) -> Option<(&str, u32)> {
+        self.self_chat_account
+            .as_ref()
+            .map(|(account, device)| (account.as_str(), *device))
     }
 
     pub fn require_persistent_ingress(&self) -> Result<()> {
@@ -307,6 +364,82 @@ mod tests {
             outbound_recipient_ids: outbound,
             ..ChannelConfig::default()
         }
+    }
+
+    #[test]
+    fn self_chat_policy_is_aci_only_and_rejects_conflicting_configuration() {
+        let own = "00000000-0000-0000-0000-000000000009";
+        let other = "00000000-0000-0000-0000-000000000001";
+        let config = ChannelConfig {
+            self_chat_only: true,
+            dm_policy: DmPolicy::Open,
+            ..ChannelConfig::default()
+        };
+        let policy = SignalChannelPolicy::for_self_chat(&config, own, 7).unwrap();
+        assert!(policy.allows_inbound_sender(own));
+        assert_eq!(
+            policy
+                .authorize_outbound_recipient(&format!("ACI:{own}"))
+                .unwrap(),
+            own
+        );
+        for other in [other.to_string(), format!("PNI:{own}")] {
+            assert!(!policy.allows_inbound_sender(&other));
+            assert!(policy.authorize_outbound_recipient(&other).is_err());
+        }
+        let projected = policy.project(Some(own.to_string()));
+        assert_eq!(projected.dm_policy.as_deref(), Some("allowlist"));
+        assert_eq!(projected.allowed_dm_sender_ids, vec![own]);
+        assert_eq!(projected.allowed_sender_ids, vec![own]);
+        assert_eq!(projected.allowed_conversation_ids, vec![own]);
+        assert_eq!(projected.allowed_outbound_conversation_ids, vec![own]);
+        for conflict in [
+            ChannelConfig {
+                dm_policy: DmPolicy::Deny,
+                ..config.clone()
+            },
+            ChannelConfig {
+                dm_policy: DmPolicy::Allowlist,
+                ..config.clone()
+            },
+            ChannelConfig {
+                dm_policy: DmPolicy::Allowlist,
+                allowed_dm_sender_ids: vec![other.to_string()],
+                ..config.clone()
+            },
+            ChannelConfig {
+                outbound_recipient_ids: vec![other.to_string()],
+                reply_delivery: ReplyDelivery::ToolOwned,
+                ..config.clone()
+            },
+            ChannelConfig {
+                default_recipient: Some(other.to_string()),
+                ..config.clone()
+            },
+            ChannelConfig {
+                default_recipient: Some(format!("PNI:{own}")),
+                ..config.clone()
+            },
+        ] {
+            assert!(SignalChannelPolicy::for_self_chat(&conflict, own, 7).is_err());
+        }
+        assert!(
+            SignalChannelPolicy::for_self_chat(
+                &ChannelConfig {
+                    dm_policy: DmPolicy::Allowlist,
+                    allowed_dm_sender_ids: vec![format!("ACI:{own}")],
+                    ..config
+                },
+                own,
+                7
+            )
+            .is_ok()
+        );
+        assert!(
+            !serde_json::from_str::<ChannelConfig>("{}")
+                .unwrap()
+                .self_chat_only
+        );
     }
 
     #[test]

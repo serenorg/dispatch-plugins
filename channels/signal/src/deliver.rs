@@ -18,17 +18,16 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use dispatch_channel_protocol::MessageRef;
 use jiff::Timestamp;
-use presage::Manager;
 use presage::libsignal_service::content::DataMessage;
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::libsignal_service::sender::AttachmentSpec;
-use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
 use presage_store_sqlite::SqliteStore;
 use std::collections::BTreeMap;
 use tokio::runtime::Builder;
 
+use crate::content_store::SignalStore;
 use crate::protocol::{
     ChannelConfig, DeliveryReceipt, OutboundAttachment, OutboundMessage, SignalChannelPolicy,
 };
@@ -72,6 +71,7 @@ pub fn deliver_text_message(
     let url = to_sqlite_url(&store_path);
     let passphrase = resolve_passphrase(config)?;
     let attachment_count = prepared_attachments.len();
+    let policy = policy.clone();
 
     let handle = std::thread::Builder::new()
         .name("channel-signal-deliver".to_string())
@@ -87,6 +87,7 @@ pub fn deliver_text_message(
                 recipient,
                 content,
                 prepared_attachments,
+                policy,
             ))
         })
         .context("failed to spawn channel-signal send thread")?;
@@ -151,14 +152,13 @@ async fn send_message_inner(
     recipient: ServiceId,
     content: String,
     attachments: Vec<(AttachmentSpec, Vec<u8>)>,
+    policy: SignalChannelPolicy,
 ) -> Result<u64> {
     let store =
         SqliteStore::open_with_passphrase(&url, passphrase.as_deref(), OnNewIdentity::Trust)
             .await
             .with_context(|| format!("failed to open Signal session store at `{url}`"))?;
-    let mut manager = Manager::<SqliteStore, Registered>::load_registered(store)
-        .await
-        .map_err(|error| anyhow!("failed to load Signal session: {error}"))?;
+    let mut manager = SignalStore::load_registered(store, &policy).await?;
 
     let uploaded = if attachments.is_empty() {
         Vec::new()
