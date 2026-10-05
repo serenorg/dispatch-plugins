@@ -20,18 +20,20 @@ use crate::store::{resolve_store_path, to_sqlite_url};
 
 #[derive(Debug)]
 pub enum ParsedLinkCommand {
-    Run(LinkOptions),
+    Run(Box<LinkOptions>),
     Help,
 }
 
 #[derive(Debug)]
 pub struct LinkOptions {
+    pub json: bool,
     pub device_name: String,
     pub config: ChannelConfig,
 }
 
 impl LinkOptions {
     pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParsedLinkCommand> {
+        let mut json = false;
         let mut device_name: Option<String> = None;
         let mut sqlite_store_path: Option<String> = None;
         let mut account: Option<String> = None;
@@ -39,6 +41,7 @@ impl LinkOptions {
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
+                "--json" => json = true,
                 "--device-name" | "-n" => {
                     device_name = Some(iter.next().context("--device-name requires a value")?);
                 }
@@ -56,14 +59,15 @@ impl LinkOptions {
             }
         }
 
-        Ok(ParsedLinkCommand::Run(Self {
+        Ok(ParsedLinkCommand::Run(Box::new(Self {
+            json,
             device_name: device_name.unwrap_or_else(|| "Dispatch".to_string()),
             config: ChannelConfig {
                 sqlite_store_path,
                 account,
                 ..ChannelConfig::default()
             },
-        }))
+        })))
     }
 }
 
@@ -75,6 +79,8 @@ to run this once per account; subsequent plugin invocations reuse the stored
 session.
 
 Options:
+--json
+    Stream pairing codes as JSON lines on stdout; QR instructions stay on stderr.
 -n, --device-name <NAME>
     Device label to advertise during pairing. Defaults to `Dispatch`.
 --account <NAME>
@@ -86,7 +92,30 @@ Options:
     Print this help.
 ";
 
-type LinkCompletionTx = oneshot::Sender<Result<(), String>>;
+#[derive(Debug)]
+enum LinkFailure {
+    PairingExpired,
+    PairingFailed,
+    LoggedOut,
+    ClientOutdated,
+    OutputFailed,
+}
+
+impl std::fmt::Display for LinkFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::PairingExpired => "pairing_expired",
+            Self::PairingFailed => "WhatsApp pairing failed",
+            Self::LoggedOut => "logged out during WhatsApp pairing",
+            Self::ClientOutdated => "WhatsApp rejected this client as outdated",
+            Self::OutputFailed => "failed to write pairing event",
+        })
+    }
+}
+
+impl std::error::Error for LinkFailure {}
+
+type LinkCompletionTx = oneshot::Sender<Result<(), LinkFailure>>;
 type SharedLinkCompletion = Arc<Mutex<Option<LinkCompletionTx>>>;
 
 pub fn run(options: LinkOptions) -> Result<()> {
@@ -112,12 +141,14 @@ pub fn run(options: LinkOptions) -> Result<()> {
         })?;
 
     let device_name = options.device_name.clone();
+    let json_output = options.json;
     let link_result = runtime.block_on(async {
-        let (completion_tx, completion_rx) = oneshot::channel::<Result<(), String>>();
+        let (completion_tx, completion_rx) = oneshot::channel::<Result<(), LinkFailure>>();
         let completion: SharedLinkCompletion = Arc::new(Mutex::new(Some(completion_tx)));
         let completion_events = Arc::clone(&completion);
 
         let bot = Bot::builder()
+            .skip_history_sync()
             .with_backend(backend)
             .with_transport_factory(TokioWebSocketTransportFactory::new())
             .with_http_client(UreqHttpClient::new())
@@ -132,31 +163,29 @@ pub fn run(options: LinkOptions) -> Result<()> {
                 async move {
                     match &*event {
                         Event::PairingQrCode(qr) => {
+                            if json_output && write_json_line(&pairing_json(&qr.code)).is_err() {
+                                complete_link(&completion, Err(LinkFailure::OutputFailed));
+                                return;
+                            }
                             if let Err(error) = render_qr_to_stderr(&qr.code) {
                                 eprintln!("warning: failed to render WhatsApp QR code: {error}");
                                 eprintln!("Pairing code payload: {}", qr.code);
                             }
                         }
+                        Event::PairingQrCodesExhausted(_) => {
+                            complete_link(&completion, Err(LinkFailure::PairingExpired));
+                        }
                         Event::PairSuccess(_) => {
                             complete_link(&completion, Ok(()));
                         }
-                        Event::PairError(error) => {
-                            complete_link(
-                                &completion,
-                                Err(format!("pairing failed: {}", error.error)),
-                            );
+                        Event::PairError(_) => {
+                            complete_link(&completion, Err(LinkFailure::PairingFailed));
                         }
-                        Event::LoggedOut(error) => {
-                            complete_link(
-                                &completion,
-                                Err(format!("logged out during pairing: {:?}", error.reason)),
-                            );
+                        Event::LoggedOut(_) => {
+                            complete_link(&completion, Err(LinkFailure::LoggedOut));
                         }
                         Event::ClientOutdated(_) => {
-                            complete_link(
-                                &completion,
-                                Err("WhatsApp rejected this client as outdated".to_string()),
-                            );
+                            complete_link(&completion, Err(LinkFailure::ClientOutdated));
                         }
                         _ => {}
                     }
@@ -169,13 +198,17 @@ pub fn run(options: LinkOptions) -> Result<()> {
         let bot_handle = bot.spawn();
         let result = completion_rx
             .await
-            .map_err(|_| anyhow!("pairing flow ended before producing a result"))
-            .and_then(|completion| completion.map_err(anyhow::Error::msg));
+            .map_err(|_| anyhow!("pairing flow ended before producing a result"));
 
         bot_handle.shutdown().await;
         result
-    });
-    link_result?;
+    })?;
+    if let Err(error) = link_result {
+        if matches!(error, LinkFailure::PairingExpired) {
+            write_json_line(&pairing_expired_json())?;
+        }
+        return Err(error.into());
+    }
 
     match load_session(&options.config)? {
         SessionState::Registered {
@@ -183,7 +216,7 @@ pub fn run(options: LinkOptions) -> Result<()> {
             summary,
         } => {
             let summary = linked_summary_json(&store_path, &options.device_name, &summary);
-            println!("{summary}");
+            write_json_line(&summary)?;
             Ok(())
         }
         SessionState::NotYetLinked { store_path } | SessionState::StoreEmpty { store_path } => {
@@ -195,6 +228,23 @@ pub fn run(options: LinkOptions) -> Result<()> {
     }
 }
 
+fn pairing_expired_json() -> serde_json::Value {
+    json!({"error": "pairing_expired"})
+}
+
+fn pairing_json(code: &str) -> serde_json::Value {
+    json!({"pairing": code})
+}
+
+fn write_json_line(value: &serde_json::Value) -> Result<()> {
+    write_json_line_to(value, &mut std::io::stdout().lock())
+}
+
+fn write_json_line_to(value: &serde_json::Value, output: &mut impl Write) -> Result<()> {
+    writeln!(output, "{value}").context("failed to write linking event")?;
+    output.flush().context("failed to flush linking event")
+}
+
 fn linked_summary_json(
     store_path: &std::path::Path,
     device_name: &str,
@@ -202,6 +252,7 @@ fn linked_summary_json(
 ) -> serde_json::Value {
     json!({
         "status": "linked",
+        "linked": true,
         "phone_jid": summary.phone_jid,
         "lid_jid": summary.lid_jid,
         "device_id": summary.device_id,
@@ -211,7 +262,7 @@ fn linked_summary_json(
     })
 }
 
-fn complete_link(completion: &SharedLinkCompletion, result: Result<(), String>) {
+fn complete_link(completion: &SharedLinkCompletion, result: Result<(), LinkFailure>) {
     if let Ok(mut guard) = completion.lock()
         && let Some(sender) = guard.take()
     {
@@ -244,6 +295,56 @@ fn render_qr_text(code: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairing_lines_are_flushed_before_returning() {
+        let mut output = std::io::BufWriter::new(Vec::new());
+        write_json_line_to(&pairing_json("code\nnext"), &mut output).unwrap();
+        assert_eq!(output.get_ref(), b"{\"pairing\":\"code\\nnext\"}\n");
+        assert!(write_json_line_to(&pairing_json("code"), &mut std::io::Cursor::new([])).is_err());
+    }
+
+    #[test]
+    fn pairing_expiry_cannot_be_replaced_by_a_later_success() {
+        let (sender, receiver) = oneshot::channel();
+        let completion = Arc::new(Mutex::new(Some(sender)));
+        complete_link(&completion, Err(LinkFailure::PairingExpired));
+        complete_link(&completion, Ok(()));
+        assert!(matches!(
+            futures::executor::block_on(receiver).unwrap(),
+            Err(LinkFailure::PairingExpired)
+        ));
+    }
+
+    #[test]
+    fn json_linking_flags_and_lines_match_the_stream_contract() {
+        let ParsedLinkCommand::Run(options) =
+            LinkOptions::parse(vec!["--json".to_string()]).unwrap()
+        else {
+            panic!("expected link options");
+        };
+        assert!(options.json);
+        assert_eq!(
+            pairing_json("rotating,code\nnext").to_string(),
+            r#"{"pairing":"rotating,code\nnext"}"#
+        );
+        assert_eq!(
+            pairing_expired_json().to_string(),
+            r#"{"error":"pairing_expired"}"#
+        );
+        let summary = RegistrationSummary {
+            phone_jid: Some("15551234567:7@s.whatsapp.net".to_string()),
+            lid_jid: Some("987654321:7@lid".to_string()),
+            device_id: 1,
+            push_name: Some("Owner".to_string()),
+        };
+        let linked = linked_summary_json(std::path::Path::new("store.db"), "Dispatch", &summary);
+        assert_eq!(
+            linked,
+            json!({"status":"linked", "linked":true, "phone_jid":"15551234567:7@s.whatsapp.net", "lid_jid":"987654321:7@lid", "device_id":1, "push_name":"Owner", "device_name":"Dispatch", "sqlite_store_path":"store.db"})
+        );
+        assert!(!linked.to_string().contains('\n'));
+    }
 
     #[test]
     fn parse_defaults_when_no_flags() {

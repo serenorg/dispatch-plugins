@@ -29,7 +29,7 @@ fn main() -> Result<()> {
     if let Some(first) = args.next() {
         if first == "--link" {
             return match link::LinkOptions::parse(args.collect::<Vec<_>>())? {
-                link::ParsedLinkCommand::Run(options) => link::run(options),
+                link::ParsedLinkCommand::Run(options) => link::run(*options),
                 link::ParsedLinkCommand::Help => {
                     print!("{}", link::HELP_TEXT);
                     Ok(())

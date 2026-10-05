@@ -50,6 +50,7 @@ channel-whatsapp --link --device-name "Dispatch"
 Flags:
 
 ```
+    --json                     Stream pairing events as JSON lines on stdout.
 -n, --device-name <NAME>        Device name shown in WhatsApp's linked
                                 devices list. Defaults to `Dispatch`.
     --account <NAME>            Logical account name; selects the
@@ -63,6 +64,8 @@ Flags:
 ```
 
 On success the plugin prints a JSON summary containing the linked JIDs, device id, push name, and store path. Subsequent runs with no arguments reuse the stored session.
+
+For browser/gateway linking, run `channel-whatsapp --link --json`. Stdout contains one JSON object per line: `{"pairing":"<raw PairingQrCode.code>"}` for each QR code (codes rotate; use the newest), then the existing success summary with `"status":"linked"` and `"linked":true`, preserving `phone_jid`, `lid_jid`, `device_id`, `push_name`, `device_name`, and `sqlite_store_path`. When QR codes run out, the command prints `{"error":"pairing_expired"}` and exits nonzero, with or without `--json`. QR art and scan instructions stay on stderr. Each stdout line is flushed immediately.
 
 ## Configuration
 
