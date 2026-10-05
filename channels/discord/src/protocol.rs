@@ -13,12 +13,16 @@ pub use proto::{
 
 /// Discord binding configuration.
 ///
-/// Every scope field is an allowlist that is empty by default, and an empty
+/// Outside line mode, scope allowlists are empty by default and an empty
 /// allowlist denies. Provider permission to read or post in a channel is the
 /// outer ceiling of what the bot account can reach; it is not authorization for
-/// this binding, so the binding states its own surface explicitly.
+/// this binding, so the binding states its own surface explicitly. Shared bots
+/// can opt into `line_mode`, delegating customer routing and ownership to the host.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ChannelConfig {
+    /// Shared bot: any reachable guild, channel, thread, or DM. The host owns routing.
+    #[serde(default)]
+    pub line_mode: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bot_token_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -30,7 +34,7 @@ pub struct ChannelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_path: Option<String>,
     /// Outbound fallback destination. Never grants ingress on its own, and is
-    /// still checked against the outbound allowlist before delivery.
+    /// still checked against the outbound scope before delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_channel_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -42,8 +46,8 @@ pub struct ChannelConfig {
     /// wildcard, and it widens channel scope only inside `allowed_guild_ids`.
     #[serde(default)]
     pub allowed_channel_ids: Vec<String>,
-    /// `deny`, `inherit_parent`, or `allowlist`. Absent means `deny`, because a
-    /// Discord thread is a separate conversation from the channel that holds it.
+    /// `deny`, `inherit_parent`, or `allowlist`. Absent means `deny` outside line
+    /// mode; line mode includes every thread beneath a reachable guild channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_policy: Option<String>,
     /// Threads this binding may receive from under the `allowlist` thread policy.
@@ -58,8 +62,8 @@ pub struct ChannelConfig {
     /// policy. Must stay empty under `deny` and `open`.
     #[serde(default)]
     pub allowed_dm_sender_ids: Vec<String>,
-    /// Destinations this binding may publish to. Empty falls back to
-    /// `allowed_channel_ids`, so outbound scope is never wider than inbound.
+    /// Destinations this binding may publish to. Outside line mode, an empty list
+    /// falls back to `allowed_channel_ids`; line mode grants every reachable destination.
     #[serde(default)]
     pub outbound_channel_ids: Vec<String>,
     /// `runtime_owned` or `tool_owned`. Absent means `runtime_owned`, so exactly
@@ -73,8 +77,8 @@ pub struct ChannelConfig {
     /// boundary; it does not widen channel scope.
     #[serde(default)]
     pub allowed_sender_ids: Vec<String>,
-    /// `deny`, `allowlist`, or `open`. Absent means `deny`. An unrecognized
-    /// value is a configuration error, never a fallback to allow. `open`
+    /// `deny`, `allowlist`, or `open`. Absent means `deny` outside line mode and
+    /// `open` in line mode. An unrecognized value fails configuration. `open`
     /// authorizes any sender and requires an empty `allowed_dm_sender_ids`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dm_policy: Option<String>,

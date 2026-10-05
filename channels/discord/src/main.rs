@@ -32,8 +32,9 @@ mod discord_api;
 mod protocol;
 
 use discord_api::{
-    DiscordChannelInfo, DiscordClient, DiscordFetchedMessage, DiscordUpload, MESSAGE_CONTENT_LIMIT,
-    delivery_error_code, message_reference_is_absent,
+    DiscordChannelInfo, DiscordChannelLookupFailure, DiscordClient, DiscordFetchedMessage,
+    DiscordUpload, MESSAGE_CONTENT_LIMIT, channel_lookup_failure, delivery_error_code,
+    message_reference_is_absent,
 };
 use protocol::{
     CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ChannelPolicy, ConfiguredChannel,
@@ -203,12 +204,6 @@ const REJECT_UNAUTHORIZED_DESTINATION: &str = "unauthorized_destination";
 const REJECT_CHANNEL_TARGET_DENIED: &str = "channel_target_denied";
 /// A channel event notification could not be written to the host.
 const REJECT_NOTIFICATION_WRITE: &str = "notification_write_error";
-
-// Discord channel type discriminants used to separate channels from threads.
-const CHANNEL_TYPE_ANNOUNCEMENT_THREAD: u8 = 10;
-const CHANNEL_TYPE_PUBLIC_THREAD: u8 = 11;
-const CHANNEL_TYPE_PRIVATE_THREAD: u8 = 12;
-const CHANNEL_TYPE_DM: u8 = 1;
 
 // Discord message type discriminants. Only ordinary and reply messages carry a
 // user request; the rest are provider system notices about the channel itself.
@@ -444,8 +439,8 @@ enum DmPolicy {
     Allowlist,
     /// Any sender may direct-message this binding. A direct message is
     /// addressed to the bot account by construction, so the sender is the only
-    /// open question, but the mode is still unbounded ingress: it is never
-    /// inferred from an absent field and carries no sender allowlist.
+    /// open question. Unbounded ingress requires an explicit open policy or
+    /// shared-line mode and carries no sender allowlist.
     Open,
 }
 
@@ -459,6 +454,7 @@ enum ReplyDelivery {
 /// ingress and egress path decides from the same values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DiscordPolicy {
+    line_mode: bool,
     allowed_guild_ids: Vec<String>,
     allowed_channel_ids: Vec<String>,
     channel_wildcard: bool,
@@ -498,7 +494,14 @@ impl DiscordPolicy {
                 "unknown discord thread_policy `{other}`; expected `{THREAD_POLICY_DENY}`, `{THREAD_POLICY_INHERIT_PARENT}`, or `{THREAD_POLICY_ALLOWLIST}`"
             ),
         };
+        if config.line_mode
+            && config.thread_policy.is_some()
+            && thread_policy != ThreadPolicy::InheritParent
+        {
+            bail!("discord line_mode requires thread_policy to be unset or `inherit_parent`");
+        }
         let dm_policy = match config.dm_policy.as_deref() {
+            None if config.line_mode => DmPolicy::Open,
             None | Some(DM_POLICY_DENY) => DmPolicy::Deny,
             Some(DM_POLICY_ALLOWLIST) => DmPolicy::Allowlist,
             Some(DM_POLICY_OPEN) => DmPolicy::Open,
@@ -546,10 +549,17 @@ impl DiscordPolicy {
         };
 
         Ok(Self {
+            line_mode: config.line_mode,
             allowed_guild_ids: config.allowed_guild_ids.clone(),
             allowed_channel_ids,
             channel_wildcard,
-            thread_policy,
+            // Every parent channel is in scope for a shared line. Still parse
+            // the configured mode above so unknown values remain errors.
+            thread_policy: if config.line_mode {
+                ThreadPolicy::InheritParent
+            } else {
+                thread_policy
+            },
             allowed_thread_ids: config.allowed_thread_ids.clone(),
             activation,
             owner_id: config.owner_id.clone(),
@@ -569,6 +579,34 @@ impl DiscordPolicy {
     /// can see, so a binding without guild and channel scope would inherit the
     /// bot account's whole visibility as its routing policy.
     fn validate_for_ingress(&self, interaction_webhook: bool) -> Result<()> {
+        if self.line_mode {
+            if self.owner_id.is_some() {
+                bail!(
+                    "discord line_mode cannot be combined with owner_id; the host decides ownership"
+                );
+            }
+            if !self.allowed_guild_ids.is_empty()
+                || !self.allowed_channel_ids.is_empty()
+                || self.channel_wildcard
+                || !self.allowed_thread_ids.is_empty()
+                || !self.allowed_sender_ids.is_empty()
+                || !self.allowed_dm_sender_ids.is_empty()
+                || !self.outbound_channel_ids.is_empty()
+                || self.outbound_wildcard
+            {
+                bail!(
+                    "discord line_mode requires every allowed_* list and outbound_channel_ids to be empty"
+                );
+            }
+            if self.activation != ActivationMode::MentionOrReply {
+                bail!("discord line_mode requires activation `mention_or_reply`");
+            }
+            if self.dm_policy != DmPolicy::Open {
+                bail!("discord line_mode requires dm_policy to be unset or `open`");
+            }
+            // The shared line explicitly grants guild, thread, and DM surfaces.
+            return Ok(());
+        }
         let has_guild_ids = !self.allowed_guild_ids.is_empty();
         let has_channel_ids = self.channel_wildcard || !self.allowed_channel_ids.is_empty();
         if has_guild_ids != has_channel_ids {
@@ -680,13 +718,16 @@ impl DiscordPolicy {
     }
 
     fn guild_is_allowed(&self, guild_id: &str) -> bool {
-        self.allowed_guild_ids
-            .iter()
-            .any(|allowed| allowed == guild_id)
+        self.line_mode
+            || self
+                .allowed_guild_ids
+                .iter()
+                .any(|allowed| allowed == guild_id)
     }
 
     fn channel_is_allowed(&self, channel_id: &str) -> bool {
-        self.channel_wildcard
+        self.line_mode
+            || self.channel_wildcard
             || self
                 .allowed_channel_ids
                 .iter()
@@ -707,7 +748,8 @@ impl DiscordPolicy {
     }
 
     fn outbound_channel_is_allowed(&self, channel_id: &str) -> bool {
-        self.outbound_wildcard
+        self.line_mode
+            || self.outbound_wildcard
             || self
                 .outbound_channel_ids
                 .iter()
@@ -729,7 +771,7 @@ impl DiscordPolicy {
     /// Redacted effective policy for `configure` and health diagnostics. Counts
     /// and modes only: raw IDs stay out of host telemetry.
     fn diagnostics(&self) -> BTreeMap<String, String> {
-        BTreeMap::from([
+        let mut metadata = BTreeMap::from([
             (
                 META_ALLOWED_GUILD_COUNT.to_string(),
                 self.allowed_guild_ids.len().to_string(),
@@ -774,7 +816,11 @@ impl DiscordPolicy {
                 META_REPLY_DELIVERY.to_string(),
                 self.reply_delivery_name().to_string(),
             ),
-        ])
+        ]);
+        if self.line_mode {
+            metadata.insert("line_mode".to_string(), "true".to_string());
+        }
+        metadata
     }
 
     fn activation_name(&self) -> &'static str {
@@ -814,6 +860,8 @@ impl DiscordPolicy {
     /// to `allowed_workspace_ids`. Placing them in `allowed_conversation_ids`
     /// would leave the host with no conversation allowlist to enforce.
     fn to_channel_policy(&self, config: &ChannelConfig) -> ChannelPolicy {
+        // Line mode delegates customer routing and authorization to the host.
+        // Empty projected ID lists do not configure any additional host scope.
         let mut allowed_conversation_ids = config.allowed_channel_ids.clone();
         // Under an explicit thread allowlist each listed thread is its own
         // authorized conversation, so the host sees it alongside the channels.
@@ -889,17 +937,99 @@ struct ChannelHint {
     parent_id: Option<String>,
 }
 
-impl ChannelHint {
-    fn is_thread(&self) -> Option<bool> {
-        self.kind.map(is_thread_channel_type)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum DiscordChannelKind {
+    GuildText = 0,
+    Dm = 1,
+    GuildVoice = 2,
+    GroupDm = 3,
+    GuildCategory = 4,
+    GuildAnnouncement = 5,
+    AnnouncementThread = 10,
+    PublicThread = 11,
+    PrivateThread = 12,
+    GuildStageVoice = 13,
+    GuildDirectory = 14,
+    GuildForum = 15,
+    GuildMedia = 16,
+}
+
+impl TryFrom<u8> for DiscordChannelKind {
+    type Error = ();
+
+    fn try_from(kind: u8) -> Result<Self, Self::Error> {
+        match kind {
+            0 => Ok(Self::GuildText),
+            1 => Ok(Self::Dm),
+            2 => Ok(Self::GuildVoice),
+            3 => Ok(Self::GroupDm),
+            4 => Ok(Self::GuildCategory),
+            5 => Ok(Self::GuildAnnouncement),
+            10 => Ok(Self::AnnouncementThread),
+            11 => Ok(Self::PublicThread),
+            12 => Ok(Self::PrivateThread),
+            13 => Ok(Self::GuildStageVoice),
+            14 => Ok(Self::GuildDirectory),
+            15 => Ok(Self::GuildForum),
+            16 => Ok(Self::GuildMedia),
+            _ => Err(()),
+        }
     }
 }
 
-fn is_thread_channel_type(kind: u8) -> bool {
-    matches!(
+/// Classify provider shape before applying any binding policy.
+fn classify_conversation_scope(
+    channel_id: &str,
+    guild_id: Option<&str>,
+    kind: u8,
+    parent_id: Option<&str>,
+) -> Result<ConversationScope, &'static str> {
+    if channel_id.is_empty()
+        || guild_id.is_some_and(str::is_empty)
+        || parent_id.is_some_and(str::is_empty)
+    {
+        return Err(REJECT_UNRESOLVED_CONVERSATION);
+    }
+    let kind = DiscordChannelKind::try_from(kind).map_err(|_| REJECT_UNRESOLVED_CONVERSATION)?;
+    let (kind, parent_conversation_id) = match kind {
+        DiscordChannelKind::Dm => {
+            if guild_id.is_some() || parent_id.is_some() {
+                return Err(REJECT_UNRESOLVED_CONVERSATION);
+            }
+            (ConversationKind::Dm, None)
+        }
+        DiscordChannelKind::GroupDm => return Err(REJECT_UNRESOLVED_CONVERSATION),
+        DiscordChannelKind::AnnouncementThread
+        | DiscordChannelKind::PublicThread
+        | DiscordChannelKind::PrivateThread => {
+            let parent_id = parent_id.ok_or(REJECT_UNRESOLVED_CONVERSATION)?;
+            if guild_id.is_none() || parent_id == channel_id {
+                return Err(REJECT_UNRESOLVED_CONVERSATION);
+            }
+            (ConversationKind::Thread, Some(parent_id.to_string()))
+        }
+        DiscordChannelKind::GuildText
+        | DiscordChannelKind::GuildVoice
+        | DiscordChannelKind::GuildCategory
+        | DiscordChannelKind::GuildAnnouncement
+        | DiscordChannelKind::GuildStageVoice
+        | DiscordChannelKind::GuildDirectory
+        | DiscordChannelKind::GuildForum
+        | DiscordChannelKind::GuildMedia => {
+            if guild_id.is_none() {
+                return Err(REJECT_UNRESOLVED_CONVERSATION);
+            }
+            // A guild channel's category is not a thread-routing parent.
+            (ConversationKind::Channel, None)
+        }
+    };
+    Ok(ConversationScope {
+        id: channel_id.to_string(),
         kind,
-        CHANNEL_TYPE_ANNOUNCEMENT_THREAD | CHANNEL_TYPE_PUBLIC_THREAD | CHANNEL_TYPE_PRIVATE_THREAD
-    )
+        workspace_id: guild_id.map(str::to_owned),
+        parent_conversation_id,
+    })
 }
 
 /// Reads channel shape for conversations the event payload did not describe.
@@ -913,10 +1043,8 @@ trait DiscordChannelLookup {
 struct NoChannelLookup;
 
 impl DiscordChannelLookup for NoChannelLookup {
-    fn channel(&self, channel_id: &str) -> Result<DiscordChannelInfo> {
-        Err(anyhow!(
-            "discord channel {channel_id} has no provider-supplied shape and no lookup is available"
-        ))
+    fn channel(&self, _: &str) -> Result<DiscordChannelInfo> {
+        Err(anyhow!(DiscordChannelLookupFailure::Unavailable))
     }
 }
 
@@ -1005,12 +1133,12 @@ fn resolve_candidate_scope(
                 && policy.channel_is_explicitly_allowed(candidate.channel_id)
                 && let Some(guild_id) = candidate.guild_id
             {
-                Ok(ConversationScope {
-                    id: candidate.channel_id.to_string(),
-                    kind: ConversationKind::Channel,
-                    workspace_id: Some(guild_id.to_string()),
-                    parent_conversation_id: None,
-                })
+                classify_conversation_scope(
+                    candidate.channel_id,
+                    Some(guild_id),
+                    DiscordChannelKind::GuildText as u8,
+                    None,
+                )
             } else {
                 Err(REJECT_UNRESOLVED_CONVERSATION)
             }
@@ -1028,54 +1156,32 @@ fn resolve_conversation_scope(
     hint: &ChannelHint,
     lookup: &dyn DiscordChannelLookup,
 ) -> Result<ConversationScope, ScopeError> {
-    let Some(guild_id) = guild_id else {
-        return Ok(ConversationScope {
-            id: channel_id.to_string(),
-            kind: ConversationKind::Dm,
-            workspace_id: None,
-            parent_conversation_id: None,
-        });
-    };
-
-    let channel_scope = |parent: Option<String>, kind: ConversationKind| ConversationScope {
-        id: channel_id.to_string(),
-        kind,
-        workspace_id: Some(guild_id.to_string()),
-        parent_conversation_id: parent,
-    };
-
     if hint.kind.is_none() && hint.parent_id.is_some() {
         return Err(ScopeError::Rejected(REJECT_UNRESOLVED_CONVERSATION));
     }
-
-    if let Some(is_thread) = hint.is_thread() {
-        if !is_thread {
-            return Ok(channel_scope(None, ConversationKind::Channel));
-        }
-        let Some(parent_id) = hint.parent_id.clone() else {
-            return Err(ScopeError::Rejected(REJECT_UNRESOLVED_CONVERSATION));
-        };
-        return Ok(channel_scope(Some(parent_id), ConversationKind::Thread));
+    if let Some(kind) = hint.kind {
+        return classify_conversation_scope(channel_id, guild_id, kind, hint.parent_id.as_deref())
+            .map_err(ScopeError::Rejected);
     }
-
-    // No provider-supplied shape. Resolve it before applying either channel or
-    // thread policy; the wildcard names channels only and cannot erase a deny
-    // or allowlist decision for child threads.
-    let Ok(info) = lookup.channel(channel_id) else {
-        return Err(ScopeError::LookupUnavailable);
-    };
-    if info.guild_id.as_deref() != Some(guild_id) {
+    // Gateway direct messages have no guild or channel object.
+    if guild_id.is_none() {
+        return classify_conversation_scope(channel_id, None, DiscordChannelKind::Dm as u8, None)
+            .map_err(ScopeError::Rejected);
+    }
+    let info =
+        lookup
+            .channel(channel_id)
+            .map_err(|error| match channel_lookup_failure(&error) {
+                DiscordChannelLookupFailure::Unavailable => ScopeError::LookupUnavailable,
+                DiscordChannelLookupFailure::InvalidResponse => {
+                    ScopeError::Rejected(REJECT_UNRESOLVED_CONVERSATION)
+                }
+            })?;
+    if info.guild_id.as_deref() != guild_id {
         return Err(ScopeError::Rejected(REJECT_UNAUTHORIZED_WORKSPACE));
     }
-    if !is_thread_channel_type(info.kind) {
-        return Ok(channel_scope(None, ConversationKind::Channel));
-    }
-    // A resolved thread with no reported parent is still a thread; it must not
-    // fall back to a channel placement.
-    let Some(parent_id) = info.parent_id else {
-        return Err(ScopeError::Rejected(REJECT_UNRESOLVED_CONVERSATION));
-    };
-    Ok(channel_scope(Some(parent_id), ConversationKind::Thread))
+    classify_conversation_scope(channel_id, guild_id, info.kind, info.parent_id.as_deref())
+        .map_err(ScopeError::Rejected)
 }
 
 // -----------------------------------------------------------------------------
@@ -1133,7 +1239,7 @@ struct AuthorizedEvent {
 ///
 /// Gateway messages, interaction webhooks, DMs, and threads all decide here so
 /// one surface cannot be authorized by rules another surface never applied.
-/// Order is fixed: loop source, workspace, conversation, sender, activation.
+/// Shared lines check addressing before lookup; scoped bindings check scope first.
 fn evaluate_inbound(
     policy: &DiscordPolicy,
     identity: &DiscordBotIdentity,
@@ -1160,6 +1266,19 @@ fn evaluate_inbound(
             }
         }
     }
+
+    // Shared lines see every guild. Reject unaddressed or unreadable messages
+    // before the channel API; activation treats channels and threads alike.
+    let early_activation = if policy.line_mode {
+        let kind = if candidate.guild_id.is_some() {
+            ConversationKind::Channel
+        } else {
+            ConversationKind::Dm
+        };
+        Some(candidate_activation(policy, identity, candidate, kind)?)
+    } else {
+        None
+    };
 
     // 3. Conversation scope, including which allowlist a thread answers to.
     let scope = resolve_candidate_scope(policy, candidate, lookup)?;
@@ -1232,9 +1351,23 @@ fn evaluate_inbound(
         }
     }
 
-    // 5. Activation. Being visible in an allowed conversation is not a request.
-    let activation = match &candidate.surface {
-        CandidateSurface::Interaction => InboundActivation {
+    // Scoped bindings keep the existing rejection order; shared lines already
+    // checked activation before spending a channel lookup.
+    let activation = match early_activation {
+        Some(activation) => activation,
+        None => candidate_activation(policy, identity, candidate, scope.kind)?,
+    };
+    Ok(AuthorizedEvent { scope, activation })
+}
+
+fn candidate_activation(
+    policy: &DiscordPolicy,
+    identity: &DiscordBotIdentity,
+    candidate: &InboundCandidate<'_>,
+    kind: ConversationKind,
+) -> Result<InboundActivation, &'static str> {
+    match &candidate.surface {
+        CandidateSurface::Interaction => Ok(InboundActivation {
             // TODO: The protocol has no distinct activation reason for message
             // components or modal submits. All three interaction kinds report
             // `slash_command` because the provider routed each of them to this
@@ -1242,7 +1375,7 @@ fn evaluate_inbound(
             reason: InboundActivation::REASON_SLASH_COMMAND.to_string(),
             agent_account_id: Some(identity.account_id.clone()),
             referenced_message_author_id: None,
-        },
+        }),
         CandidateSurface::Message {
             mentions_account,
             referenced_message_author_id,
@@ -1251,7 +1384,7 @@ fn evaluate_inbound(
             let activation = message_activation(
                 policy,
                 identity,
-                scope.kind,
+                kind,
                 *mentions_account,
                 *referenced_message_author_id,
             )?;
@@ -1262,11 +1395,9 @@ fn evaluate_inbound(
             if !has_content {
                 return Err(REJECT_EMPTY_MESSAGE);
             }
-            activation
+            Ok(activation)
         }
-    };
-
-    Ok(AuthorizedEvent { scope, activation })
+    }
 }
 
 /// Decide why, if at all, a plain message addressed this binding.
@@ -3510,9 +3641,49 @@ fn build_inbound_event(
     let Some(actor) = inbound_actor(interaction) else {
         return InteractionOutcome::Rejected(REJECT_SENDER_DENIED);
     };
-    let Some(conversation_id) = interaction.channel_id.clone() else {
+    let Some(channel) = interaction.channel.as_ref() else {
         return InteractionOutcome::Rejected(REJECT_UNRESOLVED_CONVERSATION);
     };
+    let conversation_id = channel.id.clone();
+    if interaction
+        .channel_id
+        .as_deref()
+        .is_some_and(|id| id != conversation_id)
+        || channel.channel_type.is_none()
+        || channel
+            .guild_id
+            .as_deref()
+            .is_some_and(|guild_id| interaction.guild_id.as_deref() != Some(guild_id))
+    {
+        return InteractionOutcome::Rejected(REJECT_UNRESOLVED_CONVERSATION);
+    }
+    let context = match interaction
+        .context
+        .map(DiscordInteractionContext::try_from)
+        .transpose()
+    {
+        Ok(context) => context,
+        Err(()) => return InteractionOutcome::Rejected(REJECT_UNRESOLVED_CONVERSATION),
+    };
+    match context {
+        Some(DiscordInteractionContext::PrivateChannel) => {
+            return InteractionOutcome::Rejected(REJECT_UNRESOLVED_CONVERSATION);
+        }
+        Some(DiscordInteractionContext::Guild) => {
+            if interaction.guild_id.is_none() {
+                return InteractionOutcome::Rejected(REJECT_UNRESOLVED_CONVERSATION);
+            }
+        }
+        Some(DiscordInteractionContext::BotDm) => {
+            if interaction.guild_id.is_some() {
+                return InteractionOutcome::Rejected(REJECT_UNRESOLVED_CONVERSATION);
+            }
+        }
+        None if interaction.guild_id.is_none() => {
+            return InteractionOutcome::Rejected(REJECT_UNRESOLVED_CONVERSATION);
+        }
+        None => {}
+    }
 
     // An interaction is explicitly addressed to this application, and it is
     // still confined to the conversations the binding was granted.
@@ -3525,14 +3696,10 @@ fn build_inbound_event(
         guild_id: interaction.guild_id.as_deref(),
         // Interaction payloads describe their own channel, so parentage never
         // needs a lookup here and an undescribed thread fails closed.
-        hint: interaction
-            .channel
-            .as_ref()
-            .map(|channel| ChannelHint {
-                kind: channel.channel_type,
-                parent_id: channel.parent_id.clone(),
-            })
-            .unwrap_or_default(),
+        hint: ChannelHint {
+            kind: channel.channel_type,
+            parent_id: channel.parent_id.clone(),
+        },
         author_id: &actor.id,
         author_is_bot: actor.is_bot,
         is_webhook: false,
@@ -3991,7 +4158,19 @@ fn authorize_resolved_outbound_destination(
     destination: &str,
     resolved: &DiscordChannelInfo,
 ) -> Result<()> {
-    if resolved.kind == CHANNEL_TYPE_DM && resolved.guild_id.is_none() {
+    let scope = classify_conversation_scope(
+        destination,
+        resolved.guild_id.as_deref(),
+        resolved.kind,
+        resolved.parent_id.as_deref(),
+    )
+    .map_err(|_| {
+        outbound_rejected(
+            REJECT_UNAUTHORIZED_DESTINATION,
+            "discord destination has invalid provider shape",
+        )
+    })?;
+    if scope.kind == ConversationKind::Dm {
         let allowed = match policy.dm_policy {
             DmPolicy::Deny => false,
             DmPolicy::Open => true,
@@ -4017,7 +4196,7 @@ fn authorize_resolved_outbound_destination(
         .as_deref()
         .is_some_and(|guild_id| policy.guild_is_allowed(guild_id));
     if policy.outbound_channel_is_allowed(destination)
-        && !is_thread_channel_type(resolved.kind)
+        && scope.kind == ConversationKind::Channel
         && resolved_guild_is_allowed
     {
         return Ok(());
@@ -4039,7 +4218,7 @@ fn authorize_resolved_outbound_destination(
                     ),
                 ));
             }
-            let parent_is_allowed = is_thread_channel_type(resolved.kind)
+            let parent_is_allowed = scope.kind == ConversationKind::Thread
                 && resolved_guild_is_allowed
                 && resolved
                     .parent_id
@@ -4057,7 +4236,7 @@ fn authorize_resolved_outbound_destination(
             }
         }
         ThreadPolicy::InheritParent => {
-            let parent_is_allowed = is_thread_channel_type(resolved.kind)
+            let parent_is_allowed = scope.kind == ConversationKind::Thread
                 && resolved_guild_is_allowed
                 && resolved
                     .parent_id
@@ -4255,12 +4434,34 @@ fn read_required_env(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| format!("{name} is required for the discord channel"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscordInteractionContext {
+    Guild,
+    BotDm,
+    PrivateChannel,
+}
+
+impl TryFrom<u8> for DiscordInteractionContext {
+    type Error = ();
+
+    fn try_from(context: u8) -> Result<Self, Self::Error> {
+        match context {
+            0 => Ok(Self::Guild),
+            1 => Ok(Self::BotDm),
+            2 => Ok(Self::PrivateChannel),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct DiscordInteraction {
     id: String,
     application_id: String,
     #[serde(rename = "type")]
     interaction_type: u8,
+    #[serde(default)]
+    context: Option<u8>,
     #[serde(default)]
     data: Option<DiscordInteractionData>,
     #[serde(default)]
@@ -4312,8 +4513,11 @@ struct DiscordCommandOption {
 
 #[derive(Debug, Deserialize)]
 struct DiscordInteractionChannel {
+    id: String,
     #[serde(default, rename = "type")]
     channel_type: Option<u8>,
+    #[serde(default)]
+    guild_id: Option<String>,
     #[serde(default)]
     parent_id: Option<String>,
 }
@@ -4483,6 +4687,7 @@ mod tests {
     /// compares against this ID rather than any display text.
     const BOT_ACCOUNT_ID: &str = "bot-account-1";
     const ALLOWED_GUILD: &str = "guild-marketing";
+    const OTHER_GUILD: &str = "guild-other";
     const ALLOWED_CHANNEL: &str = "channel-marketing";
     const OTHER_CHANNEL: &str = "channel-team-chat";
     const ALLOWED_THREAD: &str = "thread-in-marketing";
@@ -4676,7 +4881,7 @@ mod tests {
                 channels: BTreeMap::from([(
                     thread_id.to_string(),
                     DiscordChannelInfo {
-                        kind: CHANNEL_TYPE_PUBLIC_THREAD,
+                        kind: DiscordChannelKind::PublicThread as u8,
                         parent_id: Some(parent_id.to_string()),
                         guild_id: Some(guild_id.to_string()),
                         recipient_ids: Vec::new(),
@@ -4705,7 +4910,7 @@ mod tests {
             self.channels
                 .get(channel_id)
                 .cloned()
-                .ok_or_else(|| anyhow!("no test channel {channel_id}"))
+                .ok_or_else(|| anyhow!(DiscordChannelLookupFailure::Unavailable))
         }
     }
 
@@ -4946,6 +5151,368 @@ mod tests {
     // Gateway ingress: activation
     // -------------------------------------------------------------------------
 
+    fn line_config() -> ChannelConfig {
+        serde_json::from_value(json!({"line_mode": true})).expect("line config")
+    }
+
+    #[test]
+    fn line_mode_accepts_mentions_and_replies_in_unlisted_guild_channels_and_threads() {
+        let config = line_config();
+        let policy = DiscordPolicy::from_config(&config).expect("policy");
+        policy.validate_for_ingress(false).expect("shared surface");
+        let mut message = guild_message(OTHER_CHANNEL, "hello shared bot");
+        message.guild_id = Some(OTHER_GUILD.to_string());
+        message.mentions = vec![discord_user(BOT_ACCOUNT_ID, true)];
+        let event = emit(&config, &message).expect("unlisted channel mention");
+        assert_eq!(event.conversation.id, OTHER_CHANNEL);
+        assert_eq!(
+            event.conversation.workspace_id.as_deref(),
+            Some(OTHER_GUILD)
+        );
+        assert_eq!(
+            event.activation.unwrap().reason,
+            InboundActivation::REASON_DIRECT_MENTION
+        );
+
+        message.channel_id = OTHER_THREAD.to_string();
+        message.mentions.clear();
+        let message = replying_to(message, BOT_ACCOUNT_ID);
+        let event = emit_with_lookup(
+            &config,
+            &message,
+            &MapChannelLookup::thread(OTHER_THREAD, OTHER_CHANNEL, OTHER_GUILD),
+        )
+        .expect("reply in unlisted thread");
+        assert_eq!(event.conversation.kind, CONVERSATION_KIND_THREAD);
+        assert_eq!(
+            event.conversation.parent_conversation_id.as_deref(),
+            Some(OTHER_CHANNEL)
+        );
+        assert_eq!(
+            event.activation.unwrap().reason,
+            InboundActivation::REASON_REPLY_TO_AGENT
+        );
+
+        let projected = policy.to_channel_policy(&config);
+        assert!(projected.allowed_workspace_ids.is_empty());
+        assert!(projected.allowed_conversation_ids.is_empty());
+        assert!(projected.allowed_outbound_conversation_ids.is_empty());
+        assert!(projected.allowed_sender_ids.is_empty());
+        assert!(projected.allowed_thread_ids.is_empty());
+        assert!(projected.allowed_dm_sender_ids.is_empty());
+        assert!(projected.owner_id.is_none());
+        assert_eq!(
+            projected.activation.as_deref(),
+            Some(ACTIVATION_MENTION_OR_REPLY)
+        );
+        assert_eq!(
+            projected.thread_policy.as_deref(),
+            Some(THREAD_POLICY_INHERIT_PARENT)
+        );
+        assert_eq!(projected.dm_policy.as_deref(), Some(DM_POLICY_OPEN));
+    }
+
+    #[test]
+    fn line_mode_unaddressed_message_makes_no_channel_lookup() {
+        struct UnexpectedLookup;
+        impl DiscordChannelLookup for UnexpectedLookup {
+            fn channel(&self, _: &str) -> Result<DiscordChannelInfo> {
+                panic!("an unaddressed message must not query Discord");
+            }
+        }
+        let mut message = guild_message(OTHER_CHANNEL, "just chatting");
+        message.guild_id = Some(OTHER_GUILD.to_string());
+        assert!(emit_with_lookup(&line_config(), &message, &UnexpectedLookup).is_none());
+    }
+
+    #[test]
+    fn line_mode_accepts_a_direct_message_from_an_unknown_sender() {
+        let mut message = direct_message("hello shared bot");
+        message.author = discord_user("unknown-sender", false);
+        let event = emit(&line_config(), &message).expect("open DM");
+        assert_eq!(event.conversation.kind, CONVERSATION_KIND_DM);
+        assert_eq!(event.actor.id, "unknown-sender");
+        assert_eq!(
+            event.activation.unwrap().reason,
+            InboundActivation::REASON_DIRECT_MESSAGE
+        );
+    }
+
+    #[test]
+    fn line_mode_authorizes_unlisted_outbound_channels_threads_and_dms() {
+        let config = line_config();
+        // Canonical IDs also exercise the receipt-bound read-back gate.
+        let reference = MessageRef {
+            conversation_id: "345678901234567890".to_string(),
+            message_id: "456789012345678901".to_string(),
+            thread_id: None,
+        };
+        let destination = &reference.conversation_id;
+        let policy = read_back_policy(&config, &reference).expect("line read-back policy");
+        let scoped = DiscordPolicy::from_config(&scoped_config()).expect("scoped policy");
+        for lookup in [
+            MapChannelLookup::channel(destination, OTHER_GUILD),
+            MapChannelLookup::thread(destination, OTHER_CHANNEL, OTHER_GUILD),
+            MapChannelLookup::direct_message(destination, "unknown-sender"),
+        ] {
+            authorize_outbound_destination(&policy, destination, &lookup).expect("line outbound");
+            authorize_read_back_with_policy(&policy, &reference, &lookup).expect("line read-back");
+            assert!(authorize_outbound_destination(&scoped, destination, &lookup).is_err());
+        }
+    }
+
+    #[test]
+    fn line_mode_rejects_contradictory_policy_fields() {
+        for (field, value) in [
+            ("owner_id", json!(MEMBER_ID)),
+            ("allowed_guild_ids", json!([ALLOWED_GUILD])),
+            ("allowed_channel_ids", json!([ALLOWED_CHANNEL])),
+            ("allowed_channel_ids", json!(["*"])),
+            ("allowed_thread_ids", json!([ALLOWED_THREAD])),
+            ("allowed_sender_ids", json!([MEMBER_ID])),
+            ("allowed_dm_sender_ids", json!([MEMBER_ID])),
+            ("outbound_channel_ids", json!([ALLOWED_CHANNEL])),
+            ("outbound_channel_ids", json!(["*"])),
+            ("activation", json!(ACTIVATION_ALL_MESSAGES)),
+            ("activation", json!(ACTIVATION_SLASH_COMMAND)),
+            ("dm_policy", json!(DM_POLICY_DENY)),
+            ("dm_policy", json!(DM_POLICY_ALLOWLIST)),
+        ] {
+            let mut config = json!({"line_mode": true});
+            config[field] = value;
+            let config: ChannelConfig = serde_json::from_value(config).expect("config");
+            let policy = DiscordPolicy::from_config(&config).expect("known modes");
+            for webhook in [false, true] {
+                let error = policy.validate_for_ingress(webhook).expect_err(field);
+                assert!(error.to_string().contains("line_mode"), "{field}: {error}");
+            }
+        }
+        let config = ChannelConfig {
+            dm_policy: Some(DM_POLICY_OPEN.to_string()),
+            ..line_config()
+        };
+        DiscordPolicy::from_config(&config)
+            .unwrap()
+            .validate_for_ingress(false)
+            .unwrap();
+        for thread_policy in [THREAD_POLICY_DENY, THREAD_POLICY_ALLOWLIST] {
+            let config = ChannelConfig {
+                thread_policy: Some(thread_policy.to_string()),
+                ..line_config()
+            };
+            let error = DiscordPolicy::from_config(&config).unwrap_err();
+            assert!(error.to_string().contains("line_mode"));
+        }
+        let config = ChannelConfig {
+            thread_policy: Some(THREAD_POLICY_INHERIT_PARENT.to_string()),
+            ..line_config()
+        };
+        DiscordPolicy::from_config(&config)
+            .unwrap()
+            .validate_for_ingress(false)
+            .unwrap();
+    }
+
+    #[test]
+    fn line_mode_preserves_message_rejections() {
+        let config = line_config();
+        let addressed = json!({
+            "id": "message", "channel_id": OTHER_CHANNEL, "guild_id": OTHER_GUILD,
+            "content": "hello", "author": {"id": MEMBER_ID, "username": "member"},
+            "mentions": [{"id": BOT_ACCOUNT_ID, "username": "bot"}]
+        });
+        let mut bot = addressed.clone();
+        bot["author"]["bot"] = json!(true);
+        let mut webhook = addressed.clone();
+        webhook["webhook_id"] = json!("webhook");
+        let mut own = addressed.clone();
+        own["author"]["id"] = json!(BOT_ACCOUNT_ID);
+        let mut unsupported = addressed.clone();
+        unsupported["type"] = json!(7);
+        let mut empty = addressed.clone();
+        empty["content"] = json!("");
+        let mut role_and_everyone = addressed;
+        role_and_everyone["mentions"] = json!([]);
+        role_and_everyone["mention_roles"] = json!([BOT_ACCOUNT_ID]);
+        role_and_everyone["mention_everyone"] = json!(true);
+        role_and_everyone["content"] = json!("@everyone <@&role> hello");
+        for message in [bot, webhook, own, unsupported, empty, role_and_everyone] {
+            let message = serde_json::from_value(message).expect("gateway message");
+            assert!(emit(&config, &message).is_none());
+        }
+    }
+
+    #[test]
+    fn line_mode_accepts_a_slash_command_in_an_unlisted_guild() {
+        let events = interaction_events(
+            &line_config(),
+            &command_interaction_body(OTHER_GUILD, OTHER_CHANNEL),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].conversation.workspace_id.as_deref(),
+            Some(OTHER_GUILD)
+        );
+        assert_eq!(
+            events[0].activation.as_ref().unwrap().reason,
+            InboundActivation::REASON_SLASH_COMMAND
+        );
+    }
+
+    #[test]
+    fn provider_shapes_fail_closed_for_ingress_delivery_and_read_back() {
+        let destination = "345678901234567890";
+        let scoped = ChannelConfig {
+            allowed_channel_ids: vec![destination.to_string(), ALLOWED_CHANNEL.to_string()],
+            thread_policy: Some(THREAD_POLICY_INHERIT_PARENT.to_string()),
+            dm_policy: Some(DM_POLICY_OPEN.to_string()),
+            ..scoped_config()
+        };
+        let reference = MessageRef {
+            conversation_id: destination.to_string(),
+            message_id: "456789012345678901".to_string(),
+            thread_id: None,
+        };
+        for (kind, guild_id, parent_id) in [
+            (255, Some(ALLOWED_GUILD), None),
+            (DiscordChannelKind::Dm as u8, Some(ALLOWED_GUILD), None),
+            (DiscordChannelKind::GuildText as u8, None, None),
+            (DiscordChannelKind::GroupDm as u8, None, None),
+            (DiscordChannelKind::Dm as u8, None, Some(ALLOWED_CHANNEL)),
+            (
+                DiscordChannelKind::PublicThread as u8,
+                Some(ALLOWED_GUILD),
+                None,
+            ),
+            (
+                DiscordChannelKind::PublicThread as u8,
+                None,
+                Some(ALLOWED_CHANNEL),
+            ),
+            (
+                DiscordChannelKind::PublicThread as u8,
+                Some(ALLOWED_GUILD),
+                Some(destination),
+            ),
+        ] {
+            let info = DiscordChannelInfo {
+                kind,
+                guild_id: guild_id.map(str::to_owned),
+                parent_id: parent_id.map(str::to_owned),
+                recipient_ids: vec![MEMBER_ID.to_string()],
+            };
+            let lookup = MapChannelLookup {
+                channels: BTreeMap::from([(destination.to_string(), info)]),
+            };
+            let candidate = InboundCandidate {
+                channel_id: destination,
+                guild_id,
+                hint: ChannelHint {
+                    kind: Some(kind),
+                    parent_id: parent_id.map(str::to_owned),
+                },
+                author_id: MEMBER_ID,
+                author_is_bot: false,
+                is_webhook: false,
+                surface: CandidateSurface::Interaction,
+            };
+            for config in [&scoped, &line_config()] {
+                let policy = DiscordPolicy::from_config(config).expect("policy");
+                policy.validate_for_ingress(false).expect("valid policy");
+                assert!(evaluate_inbound(&policy, &bot_identity(), &candidate, &lookup).is_err());
+                let error = authorize_outbound_destination(&policy, destination, &lookup)
+                    .expect_err("invalid outbound shape");
+                assert_eq!(
+                    error
+                        .downcast_ref::<OutboundRejected>()
+                        .map(|rejection| rejection.code),
+                    Some(REJECT_UNAUTHORIZED_DESTINATION)
+                );
+                assert!(authorize_read_back_with_policy(&policy, &reference, &lookup).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn guild_channel_category_parent_does_not_change_conversation_routing() {
+        let destination = "345678901234567890";
+        let reference = MessageRef {
+            conversation_id: destination.to_string(),
+            message_id: "456789012345678901".to_string(),
+            thread_id: None,
+        };
+        let lookup = MapChannelLookup {
+            channels: BTreeMap::from([(
+                destination.to_string(),
+                DiscordChannelInfo {
+                    kind: DiscordChannelKind::GuildText as u8,
+                    guild_id: Some(ALLOWED_GUILD.to_string()),
+                    parent_id: Some("category-1".to_string()),
+                    recipient_ids: Vec::new(),
+                },
+            )]),
+        };
+        let scoped = ChannelConfig {
+            allowed_channel_ids: vec![destination.to_string()],
+            ..scoped_config()
+        };
+        let mut message = guild_message(destination, "hello");
+        message.mentions = vec![discord_user(BOT_ACCOUNT_ID, true)];
+        for config in [&scoped, &line_config()] {
+            let event = emit_with_lookup(config, &message, &lookup).expect("guild channel mention");
+            assert_eq!(event.conversation.kind, CONVERSATION_KIND_CHANNEL);
+            assert!(event.conversation.thread_id.is_none());
+            assert!(event.conversation.parent_conversation_id.is_none());
+            let policy = read_back_policy(config, &reference).expect("policy");
+            authorize_outbound_destination(&policy, destination, &lookup)
+                .expect("guild destination");
+            authorize_read_back_with_policy(&policy, &reference, &lookup).expect("guild read-back");
+        }
+    }
+
+    #[test]
+    fn only_unavailable_lookup_permits_the_strict_exact_channel_fallback() {
+        struct FailedLookup(DiscordChannelLookupFailure);
+        impl DiscordChannelLookup for FailedLookup {
+            fn channel(&self, _: &str) -> Result<DiscordChannelInfo> {
+                Err(anyhow!(self.0))
+            }
+        }
+        let mut message = guild_message(ALLOWED_CHANNEL, "hello");
+        message.mentions = vec![discord_user(BOT_ACCOUNT_ID, true)];
+        for config in [scoped_config(), line_config()] {
+            assert_eq!(
+                emit_with_lookup(
+                    &config,
+                    &message,
+                    &FailedLookup(DiscordChannelLookupFailure::Unavailable),
+                )
+                .is_some(),
+                !config.line_mode
+            );
+            assert!(
+                emit_with_lookup(
+                    &config,
+                    &message,
+                    &FailedLookup(DiscordChannelLookupFailure::InvalidResponse),
+                )
+                .is_none()
+            );
+            let lookup = MapChannelLookup {
+                channels: BTreeMap::from([(
+                    ALLOWED_CHANNEL.to_string(),
+                    DiscordChannelInfo {
+                        kind: 255,
+                        guild_id: Some(ALLOWED_GUILD.to_string()),
+                        parent_id: None,
+                        recipient_ids: Vec::new(),
+                    },
+                )]),
+            };
+            assert!(emit_with_lookup(&config, &message, &lookup).is_none());
+        }
+    }
+
     #[test]
     fn websocket_message_maps_to_inbound_event_when_it_mentions_the_bot_in_an_allowed_channel() {
         let mut message = guild_message(ALLOWED_CHANNEL, "hello websocket");
@@ -5011,7 +5578,7 @@ mod tests {
             channels: BTreeMap::from([(
                 ALLOWED_THREAD.to_string(),
                 DiscordChannelInfo {
-                    kind: CHANNEL_TYPE_PUBLIC_THREAD,
+                    kind: DiscordChannelKind::PublicThread as u8,
                     parent_id: None,
                     guild_id: Some(ALLOWED_GUILD.to_string()),
                     recipient_ids: Vec::new(),
@@ -6075,6 +6642,197 @@ mod tests {
                 "data":{{"name":"ask","type":1}}
             }}"#
         )
+    }
+
+    fn bot_dm_interaction_body() -> Value {
+        json!({
+            "id": "interaction-dm",
+            "application_id": "app-1",
+            "type": 2,
+            "context": 1,
+            "channel_id": "dm-channel-1",
+            "channel": { "id": "dm-channel-1", "type": 1 },
+            "user": { "id": MEMBER_ID, "username": "member" },
+            "data": { "name": "ask", "type": 1 }
+        })
+    }
+
+    #[test]
+    fn bot_dm_interactions_require_supported_shape_and_matching_context() {
+        let scoped = ChannelConfig {
+            dm_policy: Some(DM_POLICY_OPEN.to_string()),
+            ..scoped_config()
+        };
+        for config in [scoped, line_config()] {
+            let direct = bot_dm_interaction_body();
+            let events = interaction_events(&config, &direct.to_string());
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].conversation.kind, CONVERSATION_KIND_DM);
+            assert!(events[0].conversation.workspace_id.is_none());
+            assert_eq!(events[0].actor.id, MEMBER_ID);
+
+            let mut without_context = direct.clone();
+            without_context.as_object_mut().unwrap().remove("context");
+            assert!(interaction_events(&config, &without_context.to_string()).is_empty());
+            let mut without_channel_id = direct.clone();
+            without_channel_id
+                .as_object_mut()
+                .unwrap()
+                .remove("channel_id");
+            assert_eq!(
+                interaction_events(&config, &without_channel_id.to_string()).len(),
+                1
+            );
+
+            for context in [0, 2, 255] {
+                let mut body = direct.clone();
+                body["context"] = json!(context);
+                assert!(interaction_events(&config, &body.to_string()).is_empty());
+            }
+            for (field, value) in [
+                ("type", json!(3)),
+                ("type", json!(255)),
+                ("type", Value::Null),
+                ("id", json!("another-channel")),
+                ("guild_id", json!(ALLOWED_GUILD)),
+                ("parent_id", json!(ALLOWED_CHANNEL)),
+            ] {
+                let mut body = direct.clone();
+                body["channel"][field] = value;
+                assert!(interaction_events(&config, &body.to_string()).is_empty());
+            }
+            let mut missing_shape = direct;
+            missing_shape.as_object_mut().unwrap().remove("channel");
+            assert!(interaction_events(&config, &missing_shape.to_string()).is_empty());
+        }
+    }
+
+    #[test]
+    fn guild_interactions_require_matching_provider_coordinates() {
+        for config in [scoped_config(), line_config()] {
+            let mut body: Value =
+                serde_json::from_str(&command_interaction_body(ALLOWED_GUILD, ALLOWED_CHANNEL))
+                    .unwrap();
+            body["context"] = json!(0);
+            body["channel"]["guild_id"] = json!(ALLOWED_GUILD);
+            body["channel"]["parent_id"] = json!("category-1");
+            let events = interaction_events(&config, &body.to_string());
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].conversation.kind, CONVERSATION_KIND_CHANNEL);
+            assert!(events[0].conversation.parent_conversation_id.is_none());
+            let mut without_channel_id = body.clone();
+            without_channel_id
+                .as_object_mut()
+                .unwrap()
+                .remove("channel_id");
+            assert_eq!(
+                interaction_events(&config, &without_channel_id.to_string()).len(),
+                1
+            );
+            for context in [1, 2, 255] {
+                let mut invalid = body.clone();
+                invalid["context"] = json!(context);
+                assert!(interaction_events(&config, &invalid.to_string()).is_empty());
+            }
+            for (field, value) in [
+                ("id", json!(OTHER_CHANNEL)),
+                ("guild_id", json!(OTHER_GUILD)),
+                ("type", json!(1)),
+                ("type", json!(255)),
+                ("type", Value::Null),
+            ] {
+                let mut invalid = body.clone();
+                invalid["channel"][field] = value;
+                assert!(interaction_events(&config, &invalid.to_string()).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn supported_interactions_activate_on_scoped_and_shared_guild_surfaces() {
+        for (config, guild_id, channel_id) in [
+            (scoped_config(), ALLOWED_GUILD, ALLOWED_CHANNEL),
+            (line_config(), OTHER_GUILD, OTHER_CHANNEL),
+        ] {
+            for (interaction_type, event_type, data) in [
+                (
+                    2,
+                    "application_command",
+                    json!({ "name": "ask", "type": 1 }),
+                ),
+                (
+                    3,
+                    "message_component",
+                    json!({ "custom_id": "help", "component_type": 2 }),
+                ),
+                (
+                    5,
+                    "modal_submit",
+                    json!({
+                        "custom_id": "request",
+                        "components": [{ "components": [{ "custom_id": "query", "value": "hello" }] }]
+                    }),
+                ),
+            ] {
+                let mut body: Value =
+                    serde_json::from_str(&command_interaction_body(guild_id, channel_id)).unwrap();
+                body["context"] = json!(0);
+                body["type"] = json!(interaction_type);
+                body["data"] = data;
+                let events = interaction_events(&config, &body.to_string());
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].event_type, event_type);
+                assert_eq!(events[0].conversation.id, channel_id);
+                assert_eq!(
+                    events[0].conversation.workspace_id.as_deref(),
+                    Some(guild_id)
+                );
+                assert_eq!(
+                    events[0].activation.as_ref().unwrap().reason,
+                    InboundActivation::REASON_SLASH_COMMAND
+                );
+                assert!(!events[0].message.content.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn line_interactions_keep_application_actor_and_policy_checks() {
+        let config = ChannelConfig {
+            application_id: Some("app-1".to_string()),
+            ..line_config()
+        };
+        let body: Value =
+            serde_json::from_str(&command_interaction_body(OTHER_GUILD, OTHER_CHANNEL)).unwrap();
+        for (field, value) in [
+            ("application_id", json!("another-app")),
+            ("type", json!(4)),
+            (
+                "member",
+                json!({ "user": { "id": "bot-user", "username": "bot", "bot": true } }),
+            ),
+        ] {
+            let mut invalid = body.clone();
+            invalid[field] = value;
+            assert!(interaction_events(&config, &invalid.to_string()).is_empty());
+        }
+        let invalid_policy = ChannelConfig {
+            owner_id: Some(MEMBER_ID.to_string()),
+            ..config
+        };
+        assert!(interaction_events(&invalid_policy, &body.to_string()).is_empty());
+        let ping = base_payload(r#"{"id":"ping","application_id":"app-1","type":1,"context":255}"#);
+        let PluginResponse::IngressEventsReceived {
+            events,
+            callback_reply,
+            ..
+        } = handle_ingress_event(&invalid_policy, &ping).expect("ping")
+        else {
+            panic!("expected ping callback");
+        };
+        assert!(events.is_empty());
+        let reply: Value = serde_json::from_str(&callback_reply.unwrap().body).unwrap();
+        assert_eq!(reply["type"], 1);
     }
 
     #[test]
@@ -7858,11 +8616,11 @@ mod tests {
                 "application_id":"app-1",
                 "type":2,
                 "channel_id":"dm-channel-1",
-                "member":{
-                    "user":{
-                        "id":"user-9",
-                        "username":"dispatch-user"
-                    }
+                "context":1,
+                "channel":{"id":"dm-channel-1","type":1},
+                "user":{
+                    "id":"user-9",
+                    "username":"dispatch-user"
                 },
                 "data":{
                     "name":"ask",

@@ -20,7 +20,7 @@ Implemented:
 
 Behavior:
 
-- inbound events are emitted only for guilds, channels, threads, and DMs the binding explicitly allows, and only when the event addresses the bot
+- inbound events are emitted only for guilds, channels, threads, and DMs the binding explicitly allows, and only when the event addresses the bot; shared bots can opt into `line_mode` to accept addressed events on every reachable surface
 - outbound delivery sends bot messages to a Discord channel or thread inside the configured outbound scope
 - receipt-bound read-back fetches only the exact Discord message named by the receipt and can return its canonical Discord link
 - outbound text over Discord's 2,000-character limit is delivered in ordered chunks; the first chunk keeps the reply reference and attachment, and the receipt reports the completed chunk count
@@ -68,29 +68,33 @@ To obtain the required Discord credentials:
 
 ### Channel policy
 
-Discord permissions decide what the bot account can observe and post. They do not decide which messages may wake this binding. That is stated here, and it is fail-closed: every allowlist below is empty by default, and an empty allowlist denies.
+Discord permissions decide what the bot account can observe and post. They do not decide which messages may wake this binding. That is stated here, and it is fail-closed: every allowlist below is empty by default, and an empty allowlist denies unless `line_mode = true` explicitly delegates customer routing and ownership to the host.
 
 | Field | Meaning | Absent means |
 | --- | --- | --- |
+| `line_mode` | Shared bot: accept mentions/replies and application interactions in any reachable guild, channel, or thread, and DMs from anyone; outbound may reach any channel, thread, or DM | `false` |
 | `allowed_guild_ids` | Guilds the binding may act within | deny every guild |
 | `allowed_channel_ids` | Channels the binding may receive from. A literal `"*"` entry is the only wildcard, and it widens channel scope only inside `allowed_guild_ids` | deny every channel |
-| `thread_policy` | `deny`, `inherit_parent`, or `allowlist` | `deny` |
+| `thread_policy` | `deny`, `inherit_parent`, or `allowlist` | `deny` outside line mode; `inherit_parent` in line mode |
 | `allowed_thread_ids` | Threads allowed under `thread_policy = "allowlist"` | deny every thread |
 | `activation` | `mention_or_reply`, `slash_command`, or `all_messages` | `mention_or_reply` |
-| `dm_policy` | `deny`, `allowlist`, or `open` | `deny` |
+| `dm_policy` | `deny`, `allowlist`, or `open` | `deny` outside line mode; `open` in line mode |
 | `allowed_dm_sender_ids` | Senders allowed under `dm_policy = "allowlist"` | deny every DM sender |
 | `allowed_sender_ids` | Senders allowed in allowed guild channels | any sender already inside an allowed channel |
-| `outbound_channel_ids` | Destinations the binding may publish to | falls back to `allowed_channel_ids`, never wider |
+| `outbound_channel_ids` | Destinations the binding may publish to | falls back to `allowed_channel_ids` outside line mode; every reachable destination in line mode |
 | `reply_delivery` | `runtime_owned` or `tool_owned` | `runtime_owned` |
 | `owner_id` | Single sender the binding answers to, on every surface | no owner restriction |
 
 Fail-closed rules:
 
-- Persistent websocket guild ingress requires a non-empty `allowed_guild_ids` and a non-empty `allowed_channel_ids`. `configure` and `start_ingress` fail rather than treat an empty allowlist as "all".
+- With `line_mode = false` (the default), persistent websocket guild ingress requires a non-empty `allowed_guild_ids` and a non-empty `allowed_channel_ids`. `configure` and `start_ingress` fail rather than treat an empty allowlist as "all".
+- `line_mode = true` rejects `owner_id`, any non-empty `allowed_*` list or `outbound_channel_ids`, an `activation` other than unset or `mention_or_reply`, a `dm_policy` other than unset or `open`, and a `thread_policy` other than unset or `inherit_parent`. It grants the guild surface explicitly, treats DMs as `open`, and includes all threads. Unknown policy values still fail validation.
+- Line mode retains bot, webhook, self-message, unsupported-message-type, and empty-content rejection. Guild messages must directly mention the bot account or reply to a provider-resolved message authored by it; role and `@everyone` mentions do not activate it. Unaddressed messages are dropped before any channel API lookup.
+- Unknown channel types and inconsistent guild, DM, or thread coordinates are rejected. A guild channel's category parent does not make it a thread. Invalid channel responses never take the exact-channel fallback used when lookup is unavailable.
 - An unrecognized `activation`, `thread_policy`, `dm_policy`, or `reply_delivery` value fails validation. It never falls through to a permissive default.
 - `dm_policy = "allowlist"` requires at least one `allowed_dm_sender_ids` entry, and `dm_policy = "deny"` or `dm_policy = "open"` requires `allowed_dm_sender_ids` to be empty.
 - `allowed_dm_sender_ids` rejects a literal `"*"` entry. A sender allowlist enumerates senders and has no wildcard form; `dm_policy = "open"` is the written-down mode for accepting any sender.
-- `dm_policy = "open"` accepts a direct message from any sender. Like `activation = "all_messages"`, it is unbounded ingress, so it has to be written down: it is never inferred from an absent `dm_policy`. When `owner_id` is set it still applies, so `open` plus `owner_id` means owner-only direct messages.
+- `dm_policy = "open"` accepts a direct message from any sender. Outside line mode, it must be written down explicitly; line mode grants it when `dm_policy` is absent. When `owner_id` is set it still applies, so `open` plus `owner_id` means owner-only direct messages.
 - `activation = "all_messages"` requires explicitly listed channels and rejects the `"*"` wildcard, because it is meant for a dedicated channel.
 - A thread is a separate conversation from the channel that holds it. Under `inherit_parent` the thread's parent is resolved from Discord and must itself be allowed; if parentage cannot be proven, the event is dropped.
 - `default_channel_id` is an outbound fallback only. It grants no ingress, and it is checked against the outbound allowlist like any other destination.
@@ -102,9 +106,9 @@ In an allowed guild channel, `mention_or_reply` accepts:
 - a message whose Discord `mentions` list contains this bot's account ID; or
 - a reply whose referenced message Discord resolved to a bot-authored message.
 
-It does not accept literal text such as `@Piper`, a mention of another member, a role or `@everyone` mention, or a bare `message_reference` whose target author Discord did not resolve. A zero-content message is dropped unless a verified mention or reply, or an attachment on an otherwise authorized event, makes it actionable.
+It does not accept literal text such as `@Piper`, a mention of another member, a role or `@everyone` mention, or a bare `message_reference` whose target author Discord did not resolve. A zero-content message is dropped even with a verified mention, reply, or attachment.
 
-Slash commands, components, and modals are routed to the application by Discord, so they activate under any `activation` value. They are still confined to the allowed channels and threads, and still answer to the sender and DM rules.
+Slash commands, components, and modals are routed to the application by Discord, so they activate under any `activation` value. They are still confined to the allowed channels and threads, and still answer to the sender and DM rules. In line mode, those surfaces include every reachable guild, channel, thread, and bot DM. Interactions must describe a channel matching any additional conversation and guild coordinates. Unknown interaction contexts and private-channel contexts for other users' DMs or group DMs are rejected. Direct-message interactions require the `BOT_DM` context; a channel type alone cannot establish that the conversation includes the bot.
 
 Direct messages activate on their own, and are governed by `dm_policy` and `allowed_dm_sender_ids` independently of any guild setting. A direct message is addressed to the bot account by construction, so the sender is the only question `dm_policy` answers: `deny` refuses every direct message, `allowlist` accepts only the listed senders, and `open` accepts any sender.
 
@@ -117,6 +121,16 @@ Every emitted event carries the evidence a host revalidates on its own:
 - `activation.reason` (`direct_mention`, `reply_to_agent`, `slash_command`, `direct_message`, or `all_messages`), `activation.agent_account_id`, and `activation.referenced_message_author_id`
 
 ### Examples
+
+Shared bot serving multiple customers, with routing and ownership decided by the host:
+
+```toml
+line_mode = true
+```
+
+Guild messages still need a direct mention or reply; DMs activate on their own. Discord permissions still limit what the bot can see and send. Channel lookup must succeed to classify a guild message, including thread parentage. Use a binary that supports `line_mode`: older binaries ignore this unknown config field.
+
+The host policy projection has empty workspace, conversation, sender, thread, and outbound ID lists, `activation = "mention_or_reply"`, `thread_policy = "inherit_parent"`, and `dm_policy = "open"`. This projection does not configure any additional host scope or determine how a host interprets empty lists. Configure the host explicitly for shared routing. The host must authorize customer ownership and destinations for ingress, delivery, status, and message read-back; route metadata selects a destination and does not prove ownership.
 
 Single shared channel, mention or reply only, DMs denied:
 
@@ -189,7 +203,7 @@ dispatch channel call channel-discord \
   --request-json '{"kind":"push","config":{"default_channel_id":"123456789012345678","outbound_channel_ids":["123456789012345678"]},"message":{"content":"Dispatch Discord test"}}'
 ```
 
-A `push`, `deliver`, or `status` request to a destination outside the outbound allowlist is rejected before any Discord request, with the reason code `unauthorized_destination`.
+With line mode disabled, a `push`, `deliver`, or `status` request to a destination outside the outbound scope is rejected before sending, with the reason code `unauthorized_destination`.
 
 `get_message` and `get_permalink` accept the exact `conversation_id` and `message_id` from a Discord delivery receipt. They reauthorize that conversation against the outbound policy, resolve its provider-reported channel, thread, guild, or DM shape, and fetch only `GET /channels/{conversation_id}/messages/{message_id}`. Neither operation lists channel history or falls back to a neighboring message, and a response whose message, channel, or guild disagrees with the authorized coordinates is refused rather than returned. A Discord thread is itself the receipt conversation, so a separate `thread_id` is rejected. `get_permalink` fetches the same exact message before returning a link, so a link is only ever produced for a message the provider confirmed. Read-back uses the REST API and does not require the Message Content privileged intent.
 

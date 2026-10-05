@@ -113,6 +113,52 @@ impl fmt::Display for DiscordInvalidResponse {
 
 impl std::error::Error for DiscordInvalidResponse {}
 
+/// Whether channel placement may fall back to an explicit configured channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DiscordChannelLookupFailure {
+    Unavailable,
+    InvalidResponse,
+}
+
+impl fmt::Display for DiscordChannelLookupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("Discord channel lookup unavailable"),
+            Self::InvalidResponse => formatter.write_str("Discord channel response invalid"),
+        }
+    }
+}
+
+impl std::error::Error for DiscordChannelLookupFailure {}
+
+pub(super) fn channel_lookup_failure(error: &anyhow::Error) -> DiscordChannelLookupFailure {
+    if let Some(failure) = error
+        .chain()
+        .find_map(|source| source.downcast_ref::<DiscordChannelLookupFailure>())
+    {
+        return *failure;
+    }
+    if error
+        .chain()
+        .any(|source| source.is::<DiscordInvalidResponse>())
+    {
+        return DiscordChannelLookupFailure::InvalidResponse;
+    }
+    if error
+        .chain()
+        .any(|source| source.is::<DiscordTransportError>())
+        || error
+            .chain()
+            .find_map(|source| source.downcast_ref::<DiscordApiError>())
+            .is_some_and(|error| {
+                matches!(error.http_status, 401 | 403 | 404 | 408 | 429 | 500..=599)
+            })
+    {
+        return DiscordChannelLookupFailure::Unavailable;
+    }
+    DiscordChannelLookupFailure::InvalidResponse
+}
+
 #[derive(Debug)]
 struct DiscordChunkDeliveryError {
     failed_chunk: usize,
@@ -706,7 +752,15 @@ fn transport_error(context: &str, error: ureq::Error) -> anyhow::Error {
 fn response_body_error(context: &str, error: std::io::Error) -> anyhow::Error {
     let code = match error.kind() {
         ErrorKind::TimedOut | ErrorKind::WouldBlock => "discord_timeout",
-        _ => "discord_transport_error",
+        ErrorKind::Interrupted
+        | ErrorKind::UnexpectedEof
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::NotConnected
+        | ErrorKind::BrokenPipe => "discord_transport_error",
+        // Bounded-reader and decoder errors can use Other; they do not prove
+        // that a provider shape lookup was merely unavailable.
+        _ => return invalid_response(context, "Discord returned an invalid response body"),
     };
     anyhow!(DiscordTransportError {
         context: context.to_string(),
@@ -993,8 +1047,72 @@ mod tests {
                 delivery_error_code(&error),
                 Some("provider_invalid_response")
             );
+            assert_eq!(
+                channel_lookup_failure(&error),
+                DiscordChannelLookupFailure::InvalidResponse
+            );
             server.join().expect("server thread");
         }
+    }
+
+    #[test]
+    fn channel_lookup_classifies_operational_failures_without_error_text() {
+        for (status, expected) in [
+            ("403 Forbidden", DiscordChannelLookupFailure::Unavailable),
+            ("404 Not Found", DiscordChannelLookupFailure::Unavailable),
+            (
+                "429 Too Many Requests",
+                DiscordChannelLookupFailure::Unavailable,
+            ),
+            (
+                "503 Service Unavailable",
+                DiscordChannelLookupFailure::Unavailable,
+            ),
+            (
+                "400 Bad Request",
+                DiscordChannelLookupFailure::InvalidResponse,
+            ),
+        ] {
+            let (base_url, server) = spawn_provider(vec![(status, "{}".to_string())]);
+            let error = DiscordClient::new_for_tests(&base_url)
+                .channel("111")
+                .expect_err("provider refused channel lookup");
+            assert_eq!(channel_lookup_failure(&error), expected);
+            server.join().expect("server thread");
+        }
+        assert_eq!(
+            channel_lookup_failure(&anyhow!("unclassified lookup failure")),
+            DiscordChannelLookupFailure::InvalidResponse
+        );
+        for (kind, expected) in [
+            (
+                ErrorKind::Other,
+                DiscordChannelLookupFailure::InvalidResponse,
+            ),
+            (
+                ErrorKind::InvalidData,
+                DiscordChannelLookupFailure::InvalidResponse,
+            ),
+            (
+                ErrorKind::TimedOut,
+                DiscordChannelLookupFailure::Unavailable,
+            ),
+            (
+                ErrorKind::ConnectionReset,
+                DiscordChannelLookupFailure::Unavailable,
+            ),
+        ] {
+            let error = response_body_error("channel read", std::io::Error::from(kind));
+            assert_eq!(channel_lookup_failure(&error), expected);
+        }
+        let error = response_body_error(
+            "channel lookup",
+            ureq::Error::BodyExceedsLimit(1024 * 1024).into_io(),
+        );
+        assert_eq!(
+            channel_lookup_failure(&error),
+            DiscordChannelLookupFailure::InvalidResponse
+        );
     }
 
     #[test]
