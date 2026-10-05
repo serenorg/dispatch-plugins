@@ -291,9 +291,9 @@ fn health_report(state: &SessionState, policy: Option<&WhatsAppPolicy>) -> Healt
         SessionState::Registered { summary, .. } => HealthReport {
             ok: true,
             status: "ok".to_string(),
-            account_id: summary
-                .phone_jid
-                .clone()
+            account_id: policy
+                .and_then(WhatsAppPolicy::self_chat_account_id)
+                .or_else(|| summary.phone_jid.clone())
                 .or_else(|| summary.lid_jid.clone()),
             display_name: summary.push_name.clone(),
             metadata,
@@ -316,8 +316,9 @@ fn ingress_policy_and_account(config: &ChannelConfig) -> Result<(WhatsAppPolicy,
             "WhatsApp session has not been linked yet; run `channel-whatsapp --link` first"
         ));
     };
-    summary
-        .phone_jid
+    policy
+        .self_chat_account_id()
+        .or(summary.phone_jid)
         .or(summary.lid_jid)
         .ok_or_else(|| anyhow!("WhatsApp linked session does not provide a direct account JID"))
         .map(|account_id| (policy, account_id))

@@ -1,7 +1,10 @@
 use anyhow::{Result, anyhow, bail};
 use std::collections::{BTreeMap, BTreeSet};
 
+use whatsapp_rust::Jid;
+
 use crate::protocol::{ChannelConfig, ChannelPolicy};
+use crate::session::{RegistrationSummary, SessionState, load_session};
 
 const DM_POLICY_DENY: &str = "deny";
 const DM_POLICY_ALLOWLIST: &str = "allowlist";
@@ -29,6 +32,7 @@ enum ReplyDelivery {
 /// itself an authorization grant for every direct message it can receive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WhatsAppPolicy {
+    self_chat_jids: Vec<Jid>,
     dm_policy: DmPolicy,
     allowed_dm_sender_ids: Vec<String>,
     outbound_recipient_ids: Vec<String>,
@@ -37,6 +41,12 @@ pub struct WhatsAppPolicy {
 
 impl WhatsAppPolicy {
     pub fn from_config(config: &ChannelConfig) -> Result<Self> {
+        if config.self_chat_only {
+            let SessionState::Registered { summary, .. } = load_session(config)? else {
+                bail!("WhatsApp self-chat mode requires a linked session");
+            };
+            return Self::for_self_chat(config, &summary);
+        }
         let dm_policy = match config.dm_policy.as_deref() {
             None | Some(DM_POLICY_DENY) => DmPolicy::Deny,
             Some(DM_POLICY_ALLOWLIST) => DmPolicy::Allowlist,
@@ -104,11 +114,84 @@ impl WhatsAppPolicy {
         }
 
         Ok(Self {
+            self_chat_jids: Vec::new(),
             dm_policy,
             allowed_dm_sender_ids,
             outbound_recipient_ids,
             reply_delivery,
         })
+    }
+
+    pub(crate) fn for_self_chat(
+        config: &ChannelConfig,
+        summary: &RegistrationSummary,
+    ) -> Result<Self> {
+        let mut regular_config = config.clone();
+        regular_config.self_chat_only = false;
+        let mut policy = Self::from_config(&regular_config)?;
+        policy.validate_for_ingress()?;
+        let own_jids = [summary.phone_jid.as_deref(), summary.lid_jid.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(|raw| {
+                normalize_direct_jid(raw, "linked account")?
+                    .parse::<Jid>()
+                    .map_err(|_| anyhow!("WhatsApp linked account JID is invalid"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if own_jids.is_empty() || own_jids.iter().any(|jid| jid.device == 0) {
+            bail!("WhatsApp self-chat mode requires a linked companion identity");
+        }
+        policy.self_chat_jids = own_jids;
+        for raw in policy
+            .allowed_dm_sender_ids
+            .iter()
+            .chain(policy.outbound_recipient_ids.iter())
+            .chain(config.default_recipient.iter())
+        {
+            let jid = normalize_direct_jid(raw, "self-chat recipient")?
+                .parse::<Jid>()
+                .map_err(|_| anyhow!("WhatsApp self-chat recipient is invalid"))?;
+            if !policy.is_own_jid(&jid) {
+                bail!(
+                    "WhatsApp self-chat mode permits only the linked account in sender, outbound, and default recipient fields"
+                );
+            }
+        }
+        let ids: BTreeSet<_> = policy
+            .self_chat_jids
+            .iter()
+            .map(|jid| jid.to_non_ad().to_string())
+            .collect();
+        policy.dm_policy = DmPolicy::Allowlist;
+        policy.allowed_dm_sender_ids = ids.into_iter().collect();
+        policy.outbound_recipient_ids = policy.allowed_dm_sender_ids.clone();
+        Ok(policy)
+    }
+
+    pub fn self_chat_account_id(&self) -> Option<String> {
+        self.self_chat_jids
+            .first()
+            .map(|jid| jid.to_non_ad().to_string())
+    }
+
+    fn is_own_jid(&self, jid: &Jid) -> bool {
+        self.self_chat_jids
+            .iter()
+            .any(|own| own.server == jid.server && own.user == jid.user)
+    }
+
+    pub fn is_self_chat(&self) -> bool {
+        !self.self_chat_jids.is_empty()
+    }
+
+    pub fn accepts_self_chat(&self, chat: &Jid, sender: &Jid) -> bool {
+        self.is_own_jid(chat)
+            && self.is_own_jid(sender)
+            && !self
+                .self_chat_jids
+                .iter()
+                .any(|own| own.device == sender.device)
     }
 
     pub fn validate_for_ingress(&self) -> Result<()> {
@@ -119,6 +202,11 @@ impl WhatsAppPolicy {
     }
 
     pub fn allows_inbound_sender(&self, sender_id: &str) -> bool {
+        if !self.self_chat_jids.is_empty() {
+            return sender_id
+                .parse::<Jid>()
+                .is_ok_and(|jid| self.is_own_jid(&jid));
+        }
         matches!(self.dm_policy, DmPolicy::Open)
             || self
                 .allowed_dm_sender_ids
@@ -127,6 +215,11 @@ impl WhatsAppPolicy {
     }
 
     pub fn allows_outbound_recipient(&self, recipient_id: &str) -> bool {
+        if !self.self_chat_jids.is_empty() {
+            return recipient_id
+                .parse::<Jid>()
+                .is_ok_and(|jid| self.is_own_jid(&jid));
+        }
         (matches!(self.dm_policy, DmPolicy::Open) && self.outbound_recipient_ids.is_empty())
             || self
                 .outbound_recipient_ids
@@ -140,8 +233,12 @@ impl WhatsAppPolicy {
 
     pub fn to_channel_policy(&self) -> ChannelPolicy {
         ChannelPolicy {
-            owner_id: None,
-            allowed_sender_ids: Vec::new(),
+            owner_id: self.self_chat_account_id(),
+            allowed_sender_ids: if self.self_chat_jids.is_empty() {
+                Vec::new()
+            } else {
+                self.allowed_dm_sender_ids.clone()
+            },
             allowed_conversation_ids: self.allowed_dm_sender_ids.clone(),
             allowed_workspace_ids: Vec::new(),
             allowed_outbound_conversation_ids: self.outbound_recipient_ids.clone(),
@@ -212,9 +309,9 @@ pub fn normalize_direct_jid(raw: &str, field: &str) -> Result<String> {
             "WhatsApp {field} only accepts direct-message JIDs ending in `@s.whatsapp.net` or `@lid`"
         );
     }
-    normalized.parse::<whatsapp_rust::Jid>().map_err(|error| {
-        anyhow!("WhatsApp {field} contains an invalid direct-message JID: {error}")
-    })?;
+    normalized
+        .parse::<whatsapp_rust::Jid>()
+        .map_err(|_| anyhow!("WhatsApp {field} contains an invalid direct-message JID"))?;
     Ok(normalized.to_string())
 }
 
@@ -238,6 +335,112 @@ mod tests {
             dm_policy: Some(DM_POLICY_ALLOWLIST.to_string()),
             allowed_dm_sender_ids: vec![format!("  {SENDER}  "), SENDER.to_string()],
             ..ChannelConfig::default()
+        }
+    }
+
+    #[test]
+    fn self_chat_policy_derives_only_account_aliases_and_rejects_conflicts() {
+        let summary = RegistrationSummary {
+            phone_jid: Some(format!(
+                "{}:7@s.whatsapp.net",
+                SENDER.split('@').next().unwrap()
+            )),
+            lid_jid: Some("987654321:7@lid".to_string()),
+            device_id: 1,
+            push_name: None,
+        };
+        let config = ChannelConfig {
+            self_chat_only: true,
+            dm_policy: Some("open".to_string()),
+            ..ChannelConfig::default()
+        };
+        let policy = WhatsAppPolicy::for_self_chat(&config, &summary).unwrap();
+        for own in [SENDER, "987654321@lid", "987654321:3@lid"] {
+            assert!(policy.allows_inbound_sender(own));
+            assert!(policy.allows_outbound_recipient(own));
+        }
+        for other in [
+            OTHER,
+            "15551234567@lid",
+            "987654321@s.whatsapp.net",
+            "987654321@g.us",
+        ] {
+            assert!(!policy.allows_inbound_sender(other));
+            assert!(!policy.allows_outbound_recipient(other));
+        }
+        let projected = policy.to_channel_policy();
+        assert_eq!(projected.dm_policy.as_deref(), Some("allowlist"));
+        assert_eq!(
+            projected.allowed_dm_sender_ids,
+            vec![SENDER, "987654321@lid"]
+        );
+        assert_eq!(
+            projected.allowed_conversation_ids,
+            projected.allowed_dm_sender_ids
+        );
+        assert_eq!(
+            projected.allowed_outbound_conversation_ids,
+            projected.allowed_dm_sender_ids
+        );
+        for conflict in [
+            ChannelConfig {
+                dm_policy: None,
+                ..config.clone()
+            },
+            ChannelConfig {
+                dm_policy: Some("deny".to_string()),
+                ..config.clone()
+            },
+            ChannelConfig {
+                dm_policy: Some("allowlist".to_string()),
+                allowed_dm_sender_ids: vec![OTHER.to_string()],
+                ..config.clone()
+            },
+            ChannelConfig {
+                outbound_recipient_ids: vec![OTHER.to_string()],
+                reply_delivery: Some("tool_owned".to_string()),
+                ..config.clone()
+            },
+            ChannelConfig {
+                default_recipient: Some(OTHER.to_string()),
+                ..config.clone()
+            },
+        ] {
+            assert!(WhatsAppPolicy::for_self_chat(&conflict, &summary).is_err());
+        }
+        assert!(
+            WhatsAppPolicy::for_self_chat(
+                &ChannelConfig {
+                    dm_policy: Some("allowlist".to_string()),
+                    allowed_dm_sender_ids: vec![SENDER.to_string()],
+                    ..config
+                },
+                &summary
+            )
+            .is_ok()
+        );
+        assert!(
+            !serde_json::from_str::<ChannelConfig>("{}")
+                .unwrap()
+                .self_chat_only
+        );
+    }
+
+    #[test]
+    fn self_chat_requires_a_companion_identity() {
+        let config = ChannelConfig {
+            self_chat_only: true,
+            dm_policy: Some("open".to_string()),
+            ..ChannelConfig::default()
+        };
+        for phone_jid in [None, Some("15551234567@s.whatsapp.net".to_string())] {
+            let summary = RegistrationSummary {
+                phone_jid,
+                lid_jid: None,
+                device_id: 1,
+                push_name: None,
+            };
+            assert!(WhatsAppPolicy::for_self_chat(&config, &summary).is_err());
         }
     }
 

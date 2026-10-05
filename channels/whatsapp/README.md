@@ -68,6 +68,7 @@ On success the plugin prints a JSON summary containing the linked JIDs, device i
 
 | Field | Purpose |
 | --- | --- |
+| `self_chat_only` | `false` (default) preserves ordinary DM behavior. `true` accepts only the linked account's Message yourself chat from its other devices and restricts replies to that account. |
 | `sqlite_store_path` | Absolute path to the SQLite store. Overrides `account`. |
 | `account` | Logical account name selecting the per-account subdirectory when `sqlite_store_path` is unset. Defaults to `default`. |
 | `default_recipient` | Fallback JID for operator-driven `push`, `deliver`, and `status` frames with no routing metadata. |
@@ -97,6 +98,12 @@ Bare phone numbers are rejected. Group JIDs (`@g.us`) are not supported.
 ## Authorization policy
 
 WhatsApp persistent ingress is direct-message-only. The plugin rejects group messages before emitting a channel event and evaluates the same normalized policy for configuration, inbound messages, `deliver`, `push`, and typing-status frames. An `allowlist` requires one or more exact direct WhatsApp JIDs; `open` is an explicit unbounded direct-message surface; `deny` has no ingress or outbound surface. The plugin records its authenticated linked-account JID and direct-message activation evidence on each accepted event so the host can re-authorize it.
+
+With `self_chat_only: true`, use a linked companion session and set `dm_policy` to `open` or a nonempty `allowlist`. Omitted and `deny` policies fail validation. Sender IDs, outbound recipients, and `default_recipient` must belong to the linked account (PN or LID). The host receives an account-only allowlist containing the available account JIDs without device suffixes, even with `dm_policy: "open"`. Messages from the phone, desktop, and web count; the plugin excludes groups, other chats, and its own companion device. Replies use the event's conversation JID without a device suffix.
+
+For account-only linking, set `self_chat_only: true` and `dm_policy: "open"` with empty sender and outbound lists. The plugin derives the allowlist from the linked session.
+
+Linking and self-chat sessions skip history synchronization. WhatsApp still sends account traffic to linked devices; the plugin filters other conversations before emitting host events and does not enable inbound message persistence. The store retains the device and cryptographic routing state needed to stay connected. Enabling self-chat mode does not erase data already present in an existing session store.
 
 The intended operator flow is to receive an inbound event first, then reuse `conversation.id` as the outbound `message.metadata.conversation_id`.
 

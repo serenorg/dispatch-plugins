@@ -66,6 +66,7 @@ pub fn handle_status(
 
     let store_path = resolve_store_path(config)?;
     let sqlite_url = to_sqlite_url(&store_path);
+    let self_chat_only = policy.is_self_chat();
     let handle = std::thread::Builder::new()
         .name("channel-whatsapp-status".to_string())
         .spawn(move || -> Result<()> {
@@ -73,7 +74,12 @@ pub fn handle_status(
                 .enable_all()
                 .build()
                 .context("failed to build status-thread tokio runtime")?;
-            runtime.block_on(send_chat_state(sqlite_url, recipient, state))
+            runtime.block_on(send_chat_state(
+                sqlite_url,
+                recipient,
+                state,
+                self_chat_only,
+            ))
         })
         .context("failed to spawn channel-whatsapp status thread")?;
 
@@ -134,12 +140,23 @@ fn parse_recipient_jid(raw: &str) -> Result<Jid> {
         .with_context(|| format!("failed to parse WhatsApp recipient JID `{raw}`"))
 }
 
-async fn send_chat_state(sqlite_url: String, recipient: Jid, state: ChatStateType) -> Result<()> {
+async fn send_chat_state(
+    sqlite_url: String,
+    recipient: Jid,
+    state: ChatStateType,
+    self_chat_only: bool,
+) -> Result<()> {
     let backend = SqliteStore::new(&sqlite_url)
         .await
         .with_context(|| format!("failed to open WhatsApp session store at `{sqlite_url}`"))?;
 
-    let bot = Bot::builder()
+    let builder = Bot::builder();
+    let builder = if self_chat_only {
+        builder.skip_history_sync()
+    } else {
+        builder
+    };
+    let bot = builder
         .with_backend(backend)
         .with_transport_factory(TokioWebSocketTransportFactory::new())
         .with_http_client(UreqHttpClient::new())

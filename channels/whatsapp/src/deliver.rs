@@ -110,6 +110,7 @@ pub fn deliver_text_message(
     let store_path = resolve_store_path(config)?;
     let sqlite_url = to_sqlite_url(&store_path);
     let attachment_count = usize::from(prepared.attachment.is_some());
+    let self_chat_only = policy.is_self_chat();
     let attachment_kind = prepared
         .attachment
         .as_ref()
@@ -121,7 +122,12 @@ pub fn deliver_text_message(
                 .enable_all()
                 .build()
                 .context("failed to build send-thread tokio runtime")?;
-            runtime.block_on(send_message_inner(sqlite_url, recipient, prepared))
+            runtime.block_on(send_message_inner(
+                sqlite_url,
+                recipient,
+                prepared,
+                self_chat_only,
+            ))
         })
         .context("failed to spawn channel-whatsapp send thread")?;
 
@@ -213,12 +219,19 @@ async fn send_message_inner(
     sqlite_url: String,
     recipient: Jid,
     prepared: PreparedSend,
+    self_chat_only: bool,
 ) -> Result<String> {
     let backend = SqliteStore::new(&sqlite_url)
         .await
         .with_context(|| format!("failed to open WhatsApp session store at `{sqlite_url}`"))?;
 
-    let bot = Bot::builder()
+    let builder = Bot::builder();
+    let builder = if self_chat_only {
+        builder.skip_history_sync()
+    } else {
+        builder
+    };
+    let bot = builder
         .with_backend(backend)
         .with_transport_factory(TokioWebSocketTransportFactory::new())
         .with_http_client(UreqHttpClient::new())
