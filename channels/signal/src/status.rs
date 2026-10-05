@@ -126,6 +126,13 @@ async fn send_typing(
         .await
         .map_err(|error| anyhow!("failed to load Signal session: {error}"))?;
 
+    // libsignal-service cannot form a sent transcript for a typing message.
+    // Note to Self is already complete without sending a typing frame.
+    let own_aci = Aci::from(manager.registration_data().service_ids.aci).into();
+    if !should_send_typing(&recipient, &own_aci) {
+        return Ok(());
+    }
+
     let timestamp_ms = jiff::Timestamp::now().as_millisecond() as u64;
     let typing = TypingMessage {
         timestamp: Some(timestamp_ms),
@@ -138,6 +145,10 @@ async fn send_typing(
         .await
         .map_err(|error| anyhow!("failed to send Signal typing indicator: {error}"))?;
     Ok(())
+}
+
+fn should_send_typing(recipient: &ServiceId, own_aci: &ServiceId) -> bool {
+    recipient != own_aci
 }
 
 fn parse_service_id(raw: &str) -> Result<ServiceId> {
@@ -155,4 +166,17 @@ fn parse_service_id(raw: &str) -> Result<ServiceId> {
         )
     })?;
     Ok(Aci::from(uuid).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typing_to_own_aci_is_done_without_sending() {
+        let own = parse_service_id("00000000-0000-0000-0000-000000000001").unwrap();
+        let other = parse_service_id("00000000-0000-0000-0000-000000000002").unwrap();
+        assert!(!should_send_typing(&own, &own));
+        assert!(should_send_typing(&other, &own));
+    }
 }

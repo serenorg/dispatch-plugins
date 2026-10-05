@@ -426,10 +426,33 @@ fn build_inbound_event_from_content(
     policy: &SignalChannelPolicy,
     account_id: &str,
 ) -> Option<InboundEventEnvelope> {
-    let data_message = match &content.body {
-        ContentBody::DataMessage(msg) => msg,
-        _ => return None,
-    };
+    let (data_message, sender, timestamp_ms) =
+        if let Some((own_aci, device_id)) = policy.self_chat_account() {
+            let ContentBody::SynchronizeMessage(sync) = &content.body else {
+                return None;
+            };
+            let sent = sync.sent.as_ref()?;
+            if u32::from(content.metadata.sender_device) == device_id
+                || content.metadata.sender.service_id_string() != own_aci
+                || sent.parse_destination_service_id()?.service_id_string() != own_aci
+            {
+                return None;
+            }
+            (
+                sent.message.as_ref()?,
+                own_aci.to_string(),
+                i64::try_from(sent.timestamp?).ok()?,
+            )
+        } else {
+            let ContentBody::DataMessage(message) = &content.body else {
+                return None;
+            };
+            (
+                message,
+                content.metadata.sender.service_id_string(),
+                content.metadata.timestamp.timestamp_millis(),
+            )
+        };
     if !is_direct_message(data_message) {
         return None;
     }
@@ -442,16 +465,7 @@ fn build_inbound_event_from_content(
         return None;
     }
 
-    let timestamp_ms = content.metadata.timestamp.timestamp_millis();
-
-    inbound_event(
-        content.metadata.sender.service_id_string(),
-        timestamp_ms,
-        text,
-        attachments,
-        policy,
-        account_id,
-    )
+    inbound_event(sender, timestamp_ms, text, attachments, policy, account_id)
 }
 
 fn is_direct_message(message: &DataMessage) -> bool {
@@ -584,6 +598,159 @@ mod tests {
 
     fn service_id(value: u8) -> String {
         format!("00000000-0000-0000-0000-0000000000{value:02}")
+    }
+
+    #[test]
+    fn note_to_self_accepts_only_own_transcripts_from_other_devices() {
+        use presage::libsignal_service::content::{
+            AttachmentPointer, Metadata, SyncMessage, sync_message,
+        };
+        use presage::libsignal_service::protocol::ServiceId;
+        let own = service_id(9);
+        let friend = service_id(1);
+        let own_id = ServiceId::parse_from_service_id_string(&own).unwrap();
+        let policy = SignalChannelPolicy::for_self_chat(
+            &ChannelConfig {
+                self_chat_only: true,
+                dm_policy: DmPolicy::Open,
+                ..ChannelConfig::default()
+            },
+            &own,
+            7,
+        )
+        .unwrap();
+        let metadata = Metadata {
+            sender: own_id,
+            destination: own_id,
+            sender_device: 1_u32.try_into().unwrap(),
+            timestamp: Default::default(),
+            server_timestamp: Default::default(),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+        };
+        let mut sent = sync_message::Sent {
+            destination_service_id: Some(own.clone()),
+            timestamp: Some(42),
+            message: Some(DataMessage {
+                body: Some("hello".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let transcript = |sent: sync_message::Sent, metadata: Metadata| {
+            Content::from_body(
+                ContentBody::SynchronizeMessage(SyncMessage {
+                    sent: Some(sent),
+                    ..Default::default()
+                }),
+                metadata,
+            )
+        };
+        for device in [1_u32, 3] {
+            let mut metadata = metadata.clone();
+            metadata.sender_device = device.try_into().unwrap();
+            let event = build_inbound_event_from_content(
+                &transcript(sent.clone(), metadata),
+                &policy,
+                &own,
+            )
+            .unwrap();
+            assert_eq!(event.conversation.id, own);
+            assert_eq!(event.actor.id, own);
+            assert_eq!(event.message.id, "42");
+        }
+        let mut plugin_metadata = metadata.clone();
+        plugin_metadata.sender_device = 7_u32.try_into().unwrap();
+        assert!(
+            build_inbound_event_from_content(
+                &transcript(sent.clone(), plugin_metadata),
+                &policy,
+                &own
+            )
+            .is_none()
+        );
+        sent.destination_service_id = Some(friend.clone());
+        assert!(
+            build_inbound_event_from_content(
+                &transcript(sent.clone(), metadata.clone()),
+                &policy,
+                &own
+            )
+            .is_none()
+        );
+        // Binary destinations take precedence over the old string field.
+        sent.destination_service_id_binary = Some(own_id.service_id_binary());
+        assert!(
+            build_inbound_event_from_content(
+                &transcript(sent.clone(), metadata.clone()),
+                &policy,
+                &own
+            )
+            .is_some()
+        );
+        sent.destination_service_id_binary = None;
+        sent.destination_service_id = Some(format!("PNI:{own}"));
+        assert!(
+            build_inbound_event_from_content(
+                &transcript(sent.clone(), metadata.clone()),
+                &policy,
+                &own
+            )
+            .is_none()
+        );
+        sent.destination_service_id = Some(own.clone());
+        let mut friend_metadata = metadata.clone();
+        friend_metadata.sender = ServiceId::parse_from_service_id_string(&friend).unwrap();
+        let dm = Content::from_body(sent.message.clone().unwrap(), friend_metadata.clone());
+        assert!(build_inbound_event_from_content(&dm, &policy, &own).is_none());
+        assert!(
+            build_inbound_event_from_content(
+                &transcript(sent.clone(), friend_metadata),
+                &policy,
+                &own
+            )
+            .is_none()
+        );
+        sent.message.as_mut().unwrap().group_v2 = Some(GroupContextV2::default());
+        assert!(
+            build_inbound_event_from_content(
+                &transcript(sent.clone(), metadata.clone()),
+                &policy,
+                &own
+            )
+            .is_none()
+        );
+        sent.message = Some(DataMessage::default());
+        assert!(
+            build_inbound_event_from_content(
+                &transcript(sent.clone(), metadata.clone()),
+                &policy,
+                &own
+            )
+            .is_none()
+        );
+        sent.message
+            .as_mut()
+            .unwrap()
+            .attachments
+            .push(AttachmentPointer {
+                content_type: Some("image/png".to_string()),
+                ..Default::default()
+            });
+        assert!(
+            build_inbound_event_from_content(
+                &transcript(sent.clone(), metadata.clone()),
+                &policy,
+                &own
+            )
+            .is_some()
+        );
+        sent.message = None;
+        assert!(
+            build_inbound_event_from_content(&transcript(sent, metadata), &policy, &own).is_none()
+        );
     }
 
     #[test]

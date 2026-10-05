@@ -76,6 +76,7 @@ All configuration fields are optional. Defaults match what `--link` wrote to dis
 
 | Field | Purpose |
 | --- | --- |
+| `self_chat_only` | `false` (default) preserves ordinary DM behavior. `true` accepts only Note to Self transcripts from the linked account's other devices, with replies restricted to its ACI. |
 | `sqlite_store_path` | Absolute path to the SQLite store. Overrides `account`. |
 | `account` | Logical account name selecting the per-account subdirectory when `sqlite_store_path` is unset. Defaults to `default`. |
 | `passphrase_env` | Env var name holding a passphrase used to encrypt the store at rest (SQLCipher `PRAGMA key`). Leave unset for an unencrypted store. |
@@ -85,6 +86,10 @@ All configuration fields are optional. Defaults match what `--link` wrote to dis
 | `allowed_dm_sender_ids` | Exact Signal ServiceIds permitted to start direct-message turns when `dm_policy` is `allowlist`. |
 | `outbound_recipient_ids` | Exact Signal ServiceIds permitted for delivery. Empty falls back to `allowed_dm_sender_ids`; it cannot widen an allowlist. |
 | `reply_delivery` | `runtime_owned` (default) or `tool_owned`, selecting the runtime path that presents a turn's visible reply. |
+
+With `self_chat_only: true`, a linked session and an explicit `dm_policy` of `open` or a nonempty `allowlist` are required. Omitted/`deny` policies fail validation. Existing policy consistency rules still apply; every configured sender, outbound recipient, and `default_recipient` must be the linked account's ACI (bare UUID or `ACI:` form), never a PNI or another account. The effective host policy is always `allowlist`, naming only that ACI for senders, conversations, and outbound destinations. Even `open` is restricted to self. Only text/attachment sync transcripts to that ACI from the account's other devices are accepted; ordinary incoming messages, groups, and this plugin's device are excluded. Replies use the own ACI. No sent-ID table is needed because libsignal-service excludes the sending device from sync delivery.
+
+For browser-linked employees, set `self_chat_only: true` and `dm_policy: "open"` with empty sender/outbound lists; the plugin derives the account-only allowlist from the linked session.
 
 Default store layout:
 
@@ -189,6 +194,8 @@ Dispatch emits `status` frames to mark turn-taking. The plugin maps the subset t
 | `processing`, `delivering`, `operation_started` | typing started |
 | `completed`, `cancelled`, `operation_finished` | typing stopped |
 | `info`, `approval_needed`, `auth_required`, others | accepted, no upstream traffic |
+
+Typing to the linked account's own ACI is accepted without sending a frame, because Signal cannot send typing indicators to Note to Self.
 
 The status frame's `conversation_id` is required and is treated the same way as an outbound recipient.
 
