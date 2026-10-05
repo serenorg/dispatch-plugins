@@ -51,6 +51,7 @@ channel-signal --link --device-name "Dispatch"
 Flags:
 
 ```
+    --json                     Stream pairing events as JSON lines on stdout.
 -n, --device-name <NAME>        Device name shown in Signal's Linked
                                 Devices list. Defaults to `Dispatch`.
     --account <NAME>            Logical account name; selects the
@@ -69,6 +70,8 @@ Flags:
 ```
 
 On success the plugin prints a JSON summary containing the ACI, phone number, device id, and store path. Subsequent plugin invocations (with no arguments) reuse the stored session.
+
+For browser/gateway linking, run `channel-signal --link --json`. Stdout contains one JSON object per line: `{"pairing":"sgnl://linkdevice?...&capabilities=backup5"}`, then the existing success summary with `"status":"linked"` and `"linked":true`, preserving `aci`, `phone_number`, `device_id`, `device_name`, `sqlite_store_path`, and `signal_servers`. The pairing string is the full provisioning URL, including `capabilities=backup5`. QR art, the provisioning URL, and scan instructions stay on stderr. Each stdout line is flushed immediately.
 
 ## Configuration
 

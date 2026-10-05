@@ -30,18 +30,19 @@ use serde_json::json;
 use std::io::Write;
 
 use crate::protocol::ChannelConfig;
-use crate::session::tokio_runtime;
+use crate::session::{RegistrationSummary, tokio_runtime};
 use crate::store::{resolve_passphrase, resolve_store_path, to_sqlite_url};
 
 #[derive(Debug)]
 pub enum ParsedLinkCommand {
-    Run(LinkOptions),
+    Run(Box<LinkOptions>),
     Help,
 }
 
 /// Parsed CLI options for the `--link` subcommand.
 #[derive(Debug)]
 pub struct LinkOptions {
+    pub json: bool,
     pub device_name: String,
     pub servers: SignalServers,
     pub config: ChannelConfig,
@@ -52,6 +53,7 @@ impl LinkOptions {
     /// error with a `--help`-style message on unknown flags or bad
     /// values.
     pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParsedLinkCommand> {
+        let mut json = false;
         let mut device_name: Option<String> = None;
         let mut servers = SignalServers::Production;
         let mut sqlite_store_path: Option<String> = None;
@@ -61,6 +63,7 @@ impl LinkOptions {
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
+                "--json" => json = true,
                 "--device-name" | "-n" => {
                     device_name = Some(iter.next().context("--device-name requires a value")?);
                 }
@@ -94,7 +97,8 @@ impl LinkOptions {
             }
         }
 
-        Ok(ParsedLinkCommand::Run(Self {
+        Ok(ParsedLinkCommand::Run(Box::new(Self {
+            json,
             device_name: device_name.unwrap_or_else(|| "Dispatch".to_string()),
             servers,
             config: ChannelConfig {
@@ -103,7 +107,7 @@ impl LinkOptions {
                 passphrase_env,
                 ..ChannelConfig::default()
             },
-        }))
+        })))
     }
 }
 
@@ -115,6 +119,8 @@ primary Signal account on your phone. You only need to run this once per
 account; subsequent plugin invocations reuse the stored session.
 
 Options:
+--json
+    Stream pairing codes as JSON lines on stdout; QR instructions stay on stderr.
 -n, --device-name <NAME>
     Device name shown in Signal's `Linked devices` list.
     Defaults to `Dispatch`.
@@ -161,6 +167,7 @@ pub fn run(options: LinkOptions) -> Result<()> {
         })?;
 
     let device_name = options.device_name.clone();
+    let json_output = options.json;
     let servers = options.servers;
     let (url_tx, url_rx) = oneshot::channel::<url::Url>();
 
@@ -172,6 +179,9 @@ pub fn run(options: LinkOptions) -> Result<()> {
             match url_rx.await {
                 Ok(url) => {
                     let provisioning_url = ensure_backup_capability(url);
+                    if json_output {
+                        write_json_line(&pairing_json(provisioning_url.as_str()))?;
+                    }
                     if let Err(err) = render_qr_to_stderr(&provisioning_url) {
                         eprintln!("warning: failed to render QR code to stderr: {err}");
                         eprintln!("Provisioning URL (scan this manually): {provisioning_url}");
@@ -186,23 +196,47 @@ pub fn run(options: LinkOptions) -> Result<()> {
     });
 
     let _provisioning_url = provisioning?;
-    let manager = link_result.map_err(|error| anyhow!("linking failed: {error}"))?;
+    let manager = link_result.map_err(|_| anyhow!("Signal linking failed"))?;
 
     let data = manager.registration_data();
-    let summary = json!({
-        "status": "linked",
-        "aci": data.service_ids.aci.to_string(),
-        "phone_number": data.phone_number.to_string(),
-        "device_id": data.device_id.unwrap_or(1),
-        "device_name": data.device_name,
-        "sqlite_store_path": store_path.display().to_string(),
-        "signal_servers": match data.signal_servers {
+    let summary = RegistrationSummary {
+        aci: data.service_ids.aci.to_string(),
+        phone_number: data.phone_number.to_string(),
+        device_id: data.device_id.unwrap_or(1),
+        device_name: data.device_name.clone(),
+        servers: match data.signal_servers {
             SignalServers::Production => "production",
             SignalServers::Staging => "staging",
         },
-    });
-    println!("{summary}");
+    };
+    write_json_line(&linked_summary_json(&store_path, &summary))?;
     Ok(())
+}
+
+fn pairing_json(code: &str) -> serde_json::Value {
+    json!({"pairing": code})
+}
+
+fn write_json_line(value: &serde_json::Value) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{value}").context("failed to write linking event")?;
+    stdout.flush().context("failed to flush linking event")
+}
+
+fn linked_summary_json(
+    store_path: &std::path::Path,
+    summary: &RegistrationSummary,
+) -> serde_json::Value {
+    json!({
+        "status": "linked",
+        "linked": true,
+        "aci": summary.aci,
+        "phone_number": summary.phone_number,
+        "device_id": summary.device_id,
+        "device_name": summary.device_name,
+        "sqlite_store_path": store_path.display().to_string(),
+        "signal_servers": summary.servers,
+    })
 }
 
 fn ensure_backup_capability(mut url: url::Url) -> url::Url {
@@ -242,6 +276,36 @@ fn render_qr_to_stderr(url: &url::Url) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_linking_flags_and_lines_match_the_stream_contract() {
+        let ParsedLinkCommand::Run(options) =
+            LinkOptions::parse(vec!["--json".to_string()]).unwrap()
+        else {
+            panic!("expected link options");
+        };
+        assert!(options.json);
+        let url = ensure_backup_capability(
+            url::Url::parse("sgnl://linkdevice?uuid=test&pub_key=abc").unwrap(),
+        );
+        assert_eq!(
+            pairing_json(url.as_str()).to_string(),
+            r#"{"pairing":"sgnl://linkdevice?uuid=test&pub_key=abc&capabilities=backup5"}"#
+        );
+        let summary = RegistrationSummary {
+            aci: "00000000-0000-0000-0000-000000000009".to_string(),
+            phone_number: "+15551234567".to_string(),
+            device_id: 7,
+            device_name: Some("Dispatch".to_string()),
+            servers: "production",
+        };
+        let linked = linked_summary_json(std::path::Path::new("store.db"), &summary);
+        assert_eq!(
+            linked,
+            json!({"status":"linked", "linked":true, "aci":"00000000-0000-0000-0000-000000000009", "phone_number":"+15551234567", "device_id":7, "device_name":"Dispatch", "sqlite_store_path":"store.db", "signal_servers":"production"})
+        );
+        assert!(!linked.to_string().contains('\n'));
+    }
 
     #[test]
     fn parse_defaults_when_no_flags() {
