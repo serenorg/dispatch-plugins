@@ -2,6 +2,30 @@
 
 All notable changes to Dispatch Plugins are documented in this file.
 
+## [Unreleased]
+
+## [0.8.0] - 2026-10-15
+
+### Added
+
+- Channel ingress now journals each pending event batch and replays the exact original until the host confirms durable acceptance, including empty batches that only carry cursor state. A lost receipt or a stopped process leaves the batch pending for replay, and accepted receipts and provider cursors survive plugin restarts.
+- Shared journal storage validates private filesystem access on Unix and Windows and refuses unsafe existing paths instead of changing their permissions.
+
+### Changed
+
+- **Breaking:** All channel plugins now require Dispatch v0.8.0 and channel protocol 2. Upgrade the host and plugins together, handle ID-bearing `channel.event` requests with durable acceptance receipts, and supply a private journal directory on persistent encrypted-at-rest storage. A stdout write or heartbeat is not event acceptance.
+- **Breaking:** Discord status metadata renames `notifications_emitted` to `events_delivered` and `last_notification_at` to `last_event_delivered_at`, and the `notification_write_error` rejection reason to `event_delivery_error`. Discord also reports a new `invalid_timestamp` rejection reason. Update dashboards and alerts that read these keys.
+- **Breaking:** WhatsApp `event_id` is now a SHA-256 identity of the provider chat, sender, and message ID; `message.id` still carries the provider message ID. A message delivered before the upgrade and redelivered after it arrives with a different `event_id`.
+- Slack acknowledges Socket Mode envelopes and WhatsApp acknowledges messages only after host acceptance. Telegram polling offsets, IMAP UID cursors, and Discord resume state advance only with accepted batches. iMessage, Twilio SMS, and webhook callbacks return their HTTP reply only after the host accepts the batch. Consumers must still deduplicate stable event IDs; provider delivery and retention limits remain in effect, and WhatsApp recovered placeholder and newsletter messages remain best effort.
+- Each channel batch holds at most 32 events. An email too large for one batch fails its poll without advancing the mailbox cursor until the source message is resolved.
+- Signal continues to use unmodified upstream libraries. Its durability guarantee starts at the ingress journal; the upstream acknowledgment-before-journal loss window remains and is documented in the Signal README.
+- Signal `poll_ingress` delivers at most 30 events per call and is rejected while background ingress runs. While background ingress runs, delivery and status requests with a changed configuration are rejected until ingress restarts.
+
+### Fixed
+
+- Signal deliveries and typing indicators share the active receive session instead of opening competing Signal connections that interrupted it. Host receipt waits and reconnect backoff no longer delay them.
+- Signal ingress no longer stops when the upstream client answers contact, key, or blocked-list sync requests, or requests keys after its queue empties.
+
 ## [0.7.0] - 2026-10-05
 
 ### Added

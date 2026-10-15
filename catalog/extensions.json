@@ -2,14 +2,14 @@
   "schema": "https://serenorg.github.io/dispatch/schemas/extension-catalog.v1.json",
   "catalog_id": "seren",
   "repository": "dispatch-plugins",
-  "generated_at": "2026-10-05T21:18:55Z",
+  "generated_at": "2026-10-15T09:50:00Z",
   "entries": [
     {
       "id": "seren.channel.discord",
       "name": "channel-discord",
       "display_name": "Discord Channel",
       "kind": "channel",
-      "version": "0.7.0",
+      "version": "0.8.0",
       "description": "Discord channel plugin for Dispatch.",
       "protocol": "jsonl",
       "protocol_version": 2,
@@ -47,11 +47,11 @@
         ],
         "platforms": []
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.7.0/channels/discord/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.8.0/channels/discord/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.7.0",
+        "tag": "v0.8.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -97,7 +97,7 @@
       "name": "channel-email",
       "display_name": "Email Channel",
       "kind": "channel",
-      "version": "0.7.0",
+      "version": "0.8.0",
       "description": "Email channel plugin for Dispatch using IMAP ingress and SMTP delivery.",
       "protocol": "jsonl",
       "protocol_version": 2,
@@ -134,11 +134,11 @@
           "smtp"
         ]
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.7.0/channels/email/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.8.0/channels/email/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.7.0",
+        "tag": "v0.8.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -184,7 +184,7 @@
       "name": "channel-gmail",
       "display_name": "Gmail Channel",
       "kind": "channel",
-      "version": "0.7.0",
+      "version": "0.8.0",
       "description": "Gmail channel plugin for Dispatch using Gmail IMAP ingress and SMTP delivery.",
       "protocol": "jsonl",
       "protocol_version": 2,
@@ -224,11 +224,11 @@
           "smtp"
         ]
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.7.0/channels/gmail/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.8.0/channels/gmail/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.7.0",
+        "tag": "v0.8.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -274,7 +274,7 @@
       "name": "channel-imessage",
       "display_name": "iMessage Channel",
       "kind": "channel",
-      "version": "0.7.0",
+      "version": "0.8.0",
       "description": "iMessage channel plugin for Dispatch through BlueBubbles.",
       "protocol": "jsonl",
       "protocol_version": 2,
@@ -310,11 +310,11 @@
         ],
         "platforms": []
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.7.0/channels/imessage/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.8.0/channels/imessage/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.7.0",
+        "tag": "v0.8.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -360,7 +360,7 @@
       "name": "channel-outlook",
       "display_name": "Outlook Channel",
       "kind": "channel",
-      "version": "0.7.0",
+      "version": "0.8.0",
       "description": "Outlook channel plugin for Dispatch using Outlook / Microsoft 365 IMAP ingress and SMTP delivery.",
       "protocol": "jsonl",
       "protocol_version": 2,
@@ -401,11 +401,11 @@
           "outlook"
         ]
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.7.0/channels/outlook/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.8.0/channels/outlook/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.7.0",
+        "tag": "v0.8.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -451,7 +451,7 @@
       "name": "channel-signal",
       "display_name": "Signal Channel",
       "kind": "channel",
-      "version": "0.7.0",
+      "version": "0.8.0",
       "description": "Signal channel plugin for Dispatch using the native Rust presage client.",
       "protocol": "jsonl",
       "protocol_version": 2,
@@ -497,11 +497,11 @@
           "presage"
         ]
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.7.0/channels/signal/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.8.0/channels/signal/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.7.0",
+        "tag": "v0.8.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -547,7 +547,7 @@
       "name": "channel-slack",
       "display_name": "Slack Channel",
       "kind": "channel",
-      "version": "0.7.0",
+      "version": "0.8.0",
       "description": "Slack channel plugin for Dispatch.",
       "protocol": "jsonl",
       "protocol_version": 2,
@@ -589,11 +589,11 @@
           "slack-incoming-webhook"
         ]
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.7.0/channels/slack/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.8.0/channels/slack/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.7.0",
+        "tag": "v0.8.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -639,7 +639,7 @@
       "name": "channel-telegram",
       "display_name": "Telegram Channel",
       "kind": "channel",
-      "version": "0.7.0",
+      "version": "0.8.0",
       "description": "Telegram channel plugin for Dispatch.",
       "protocol": "jsonl",
       "protocol_version": 2,
@@ -675,11 +675,11 @@
         ],
         "platforms": []
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.7.0/channels/telegram/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.8.0/channels/telegram/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.7.0",
+        "tag": "v0.8.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -725,7 +725,7 @@
       "name": "channel-twilio-sms",
       "display_name": "Twilio SMS Channel",
       "kind": "channel",
-      "version": "0.7.0",
+      "version": "0.8.0",
       "description": "Twilio SMS channel plugin for Dispatch.",
       "protocol": "jsonl",
       "protocol_version": 2,
@@ -765,11 +765,11 @@
         ],
         "platforms": []
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.7.0/channels/twilio-sms/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.8.0/channels/twilio-sms/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.7.0",
+        "tag": "v0.8.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -815,7 +815,7 @@
       "name": "channel-webhook",
       "display_name": "Generic Webhook Channel",
       "kind": "channel",
-      "version": "0.7.0",
+      "version": "0.8.0",
       "description": "Generic webhook channel plugin for Dispatch.",
       "protocol": "jsonl",
       "protocol_version": 2,
@@ -849,11 +849,11 @@
         ],
         "platforms": []
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.7.0/channels/webhook/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.8.0/channels/webhook/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.7.0",
+        "tag": "v0.8.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
@@ -899,7 +899,7 @@
       "name": "channel-whatsapp",
       "display_name": "WhatsApp Channel",
       "kind": "channel",
-      "version": "0.7.0",
+      "version": "0.8.0",
       "description": "WhatsApp channel plugin for Dispatch using the native Rust whatsapp-rust client.",
       "protocol": "jsonl",
       "protocol_version": 2,
@@ -937,11 +937,11 @@
           "whatsapp-rust"
         ]
       },
-      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.7.0/channels/whatsapp/channel-plugin.json",
+      "manifest_url": "https://raw.githubusercontent.com/serenorg/dispatch-plugins/v0.8.0/channels/whatsapp/channel-plugin.json",
       "source": {
         "type": "github_release",
         "repo": "serenorg/dispatch-plugins",
-        "tag": "v0.7.0",
+        "tag": "v0.8.0",
         "checksum_asset": "SHA256SUMS.txt",
         "binaries": [
           {
