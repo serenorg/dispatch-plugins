@@ -491,7 +491,7 @@ mod tests {
             version: "0.1.0".to_string(),
             description: "Slack messaging bridge".to_string(),
             protocol: "jsonl".to_string(),
-            protocol_version: 1,
+            protocol_version: 2,
             source_dir: "channels/slack".to_string(),
             manifest_path: "channels/slack/channel-plugin.json".to_string(),
             manifest_url: Some(
@@ -580,7 +580,7 @@ mod tests {
                         "version": "0.1.0",
                         "description": "Slack messaging bridge",
                         "protocol": "jsonl",
-                        "protocol_version": 1,
+                        "protocol_version": 2,
                         "source_dir": "channels/slack",
                         "manifest_path": "channels/slack/channel-plugin.json"
                     }
@@ -620,7 +620,7 @@ mod tests {
                         "version": "0.1.0",
                         "description": "Slack messaging bridge",
                         "protocol": "jsonl",
-                        "protocol_version": 1,
+                        "protocol_version": 2,
                         "source_dir": "channels/slack",
                         "manifest_path": "channels/slack/channel-plugin.json"
                     }
@@ -660,7 +660,7 @@ mod tests {
                         "version": "0.1.0",
                         "description": "Slack messaging bridge",
                         "protocol": "jsonl",
-                        "protocol_version": 1,
+                        "protocol_version": 2,
                         "source_dir": "channels/slack",
                         "manifest_path": "channels/slack/channel-plugin.json"
                     },
@@ -672,7 +672,7 @@ mod tests {
                         "version": "0.1.0",
                         "description": "Slack messaging bridge",
                         "protocol": "jsonl",
-                        "protocol_version": 1,
+                        "protocol_version": 2,
                         "source_dir": "channels/slack",
                         "manifest_path": "channels/slack/channel-plugin.json"
                     }

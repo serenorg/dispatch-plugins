@@ -4,7 +4,7 @@
   "name": "channel-gmail",
   "version": "0.7.0",
   "protocol": "jsonl",
-  "protocol_version": 1,
+  "protocol_version": 2,
   "description": "Gmail channel plugin for Dispatch using Gmail IMAP ingress and SMTP delivery.",
   "entrypoint": {
     "command": "../../target/release/channel-gmail",

@@ -4,7 +4,7 @@
   "name": "channel-imessage",
   "version": "0.7.0",
   "protocol": "jsonl",
-  "protocol_version": 1,
+  "protocol_version": 2,
   "description": "iMessage channel plugin for Dispatch through BlueBubbles.",
   "entrypoint": {
     "command": "../../target/release/channel-imessage",

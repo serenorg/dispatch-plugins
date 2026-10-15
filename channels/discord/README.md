@@ -241,7 +241,7 @@ When `webhook_public_url` is configured, this plugin treats `start_ingress` as a
 
 When no webhook URL is configured, `start_ingress` resolves the bot account through `GET /users/@me`, then starts a long-running Discord Gateway websocket session owned by the plugin. The gateway `READY` frame is cross-checked against that account, and against `application_id` when one is configured; a mismatch ends the session rather than running under an unverified identity.
 
-The websocket session emits `channel.event` notifications only for message events that satisfy the binding policy, and preserves Discord resume metadata and the proven bot identity across reconnects when Discord marks the session resumable. For local smoke tests, run `dispatch channel poll` or a `dispatch up` project with a channel binding in `mode = "poll"`; the plugin reports websocket ingress through the same receive loop.
+The websocket session delivers `channel.event` batches only for message events that satisfy the binding policy, and preserves Discord resume metadata and the proven bot identity across reconnects when Discord marks the session resumable. Resume metadata advances only with a batch the host durably accepted; after a failed delivery the worker reconnects from the last accepted sequence so Discord replays the unconfirmed dispatch. Discord retains resumable sessions only briefly. When it refuses a resume and the plugin must identify again, dispatches sent while the plugin was disconnected are not redelivered. For local smoke tests, run `dispatch channel poll` or a `dispatch up` project with a channel binding in `mode = "poll"`; the plugin reports websocket ingress through the same receive loop.
 
 A Discord gateway `MESSAGE_CREATE` event does not include a channel object, so the plugin classifies the conversation through the channel API. If that lookup fails, an exact `allowed_channel_ids` entry classifies the conversation as a top-level channel. This fallback runs only after the guild ID matches `allowed_guild_ids`. The channel wildcard does not enable it. A conversation the provider classified as a thread keeps the configured thread policy. Interaction webhooks describe their own channel in the payload and never use the fallback.
 
@@ -254,7 +254,7 @@ The state includes these counters:
 - `frames_dispatch_total` counts gateway dispatch frames. `frames_message_create`, `frames_ready`, and `frames_other_dispatch` split the total by frame type. `frames_ready` counts `READY` and `RESUMED` frames.
 - `messages_decoded` counts `MESSAGE_CREATE` payloads that parsed. `message_decode_errors` counts payloads that did not.
 - `messages_accepted` counts decoded messages that satisfied the binding policy.
-- `notifications_emitted` counts accepted events delivered to the host. In websocket mode it increments after the `channel.event` notification is written. In polling mode it increments when events are returned in the ingress response.
+- `events_delivered` counts accepted events in batches the host durably accepted. The value carried in a batch already includes that batch's events, because the counters travel inside the confirmed state.
 - `reject_<reason>` counts dropped events by stable reason.
 
 The rejection reasons are:
@@ -271,16 +271,17 @@ The rejection reasons are:
 - `empty_message`
 - `application_mismatch`
 - `invalid_policy`
-- `notification_write_error`
+- `invalid_timestamp`
+- `event_delivery_error`
 
 The state includes these UTC timestamps:
 
 - `last_dispatch_frame_at`: the last dispatch frame of any type
 - `last_message_frame_at`: the last `MESSAGE_CREATE` frame
 - `last_heartbeat_at`: the last heartbeat acknowledgment
-- `last_notification_at`: the last successful event delivery
+- `last_event_delivered_at`: the last event batch the host durably accepted
 
-`event_path_degraded` is `false` until a failure is observed. A message decode error or a failed event notification sets it to `true`. A heartbeat acknowledgment does not clear it. A successful event delivery clears it. The plugin preserves the counters and the flag across gateway reconnects through ingress state.
+`event_path_degraded` is `false` until a failure is observed. A message decode error or a batch the host did not durably accept sets it to `true`. A heartbeat acknowledgment does not clear it. A successful event delivery clears it. The plugin preserves the counters and the flag across gateway reconnects through ingress state.
 
 Set `DISCORD_GATEWAY_DEBUG=1` to log each rejection and its provider message ID.
 

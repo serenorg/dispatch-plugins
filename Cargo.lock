@@ -210,6 +210,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "atomicwrites"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ef1bb8d1b645fe38d51dfc331d720fb5fc2c94b440c76cc79c80ff265ca33e3"
+dependencies = [
+ "rustix 0.38.44",
+ "tempfile",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -538,6 +549,7 @@ version = "0.7.0"
 dependencies = [
  "channel-schema",
  "dispatch-channel-protocol",
+ "dispatch-channel-runtime",
  "hmac",
  "jiff",
  "serde",
@@ -574,6 +586,7 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "dispatch-channel-protocol",
+ "dispatch-channel-runtime",
  "futures",
  "jiff",
  "libsqlite3-sys",
@@ -628,6 +641,7 @@ dependencies = [
  "base64 0.23.1",
  "channel-schema",
  "dispatch-channel-protocol",
+ "dispatch-channel-runtime",
  "hmac",
  "jiff",
  "serde",
@@ -645,9 +659,11 @@ dependencies = [
  "anyhow",
  "channel-schema",
  "dispatch-channel-protocol",
+ "dispatch-channel-runtime",
  "jiff",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "ureq",
 ]
 
@@ -658,11 +674,13 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "dispatch-channel-protocol",
+ "dispatch-channel-runtime",
  "futures",
  "jiff",
  "qrcode",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "url",
@@ -1260,20 +1278,25 @@ dependencies = [
 
 [[package]]
 name = "dispatch-channel-protocol"
-version = "0.7.0"
-source = "git+https://github.com/serenorg/dispatch?tag=v0.7.0#c43886e066547bbc1a371996b98f755eacefc34c"
+version = "0.8.0"
+source = "git+https://github.com/serenorg/dispatch?tag=v0.8.0#fe792f84a67362092384d8ac573f4ae81750b324"
 dependencies = [
  "dispatch-plugin-rpc",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]
 name = "dispatch-channel-runtime"
 version = "0.7.0"
 dependencies = [
+ "atomicwrites",
  "dispatch-channel-protocol",
+ "fs2",
+ "serde_json",
  "thiserror 2.0.20",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1288,8 +1311,8 @@ dependencies = [
 
 [[package]]
 name = "dispatch-plugin-rpc"
-version = "0.7.0"
-source = "git+https://github.com/serenorg/dispatch?tag=v0.7.0#c43886e066547bbc1a371996b98f755eacefc34c"
+version = "0.8.0"
+source = "git+https://github.com/serenorg/dispatch?tag=v0.8.0#fe792f84a67362092384d8ac573f4ae81750b324"
 dependencies = [
  "serde",
  "serde_json",
@@ -1518,6 +1541,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -4422,7 +4455,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -5379,6 +5412,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "626c4bac6755d76ffc12cb01b2eac751db1996b9e0041de9aa02c8c211ddc82c"
 
 [[package]]
+name = "winapi"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
+dependencies = [
+ "winapi-i686-pc-windows-gnu",
+ "winapi-x86_64-pc-windows-gnu",
+]
+
+[[package]]
+name = "winapi-i686-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5386,6 +5435,12 @@ checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "winapi-x86_64-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows-core"

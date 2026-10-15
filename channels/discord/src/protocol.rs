@@ -7,8 +7,8 @@ pub use proto::{
     ConfiguredChannel, DeliveryReceipt, HealthReport, InboundActivation, InboundActor,
     InboundAttachment, InboundConversationRef, InboundEventEnvelope, InboundMessage,
     IngressCallbackReply, IngressMode, IngressPayload, IngressState, OutboundAttachment,
-    PluginResponse, StatusAcceptance, StatusFrame, StatusKind, ThreadingModel,
-    parse_jsonrpc_request, plugin_error, response_to_jsonrpc,
+    PluginResponse, StatusAcceptance, StatusFrame, StatusKind, ThreadingModel, plugin_error,
+    response_to_jsonrpc,
 };
 
 /// Discord binding configuration.

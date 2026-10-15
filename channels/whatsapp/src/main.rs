@@ -1,7 +1,9 @@
-use anyhow::{Context, Result, anyhow};
-use dispatch_channel_protocol::{ChannelEventNotification, IngressMode, IngressState};
+use anyhow::{Result, anyhow};
+use dispatch_channel_protocol::{ChannelEventBatch, IngressMode, IngressState, parse_plugin_input};
+use dispatch_channel_runtime::{
+    deliver_channel_event_batch, spawn_plugin_input_reader, write_stdout_line,
+};
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, Write};
 use std::sync::{Arc, Mutex};
 
 mod deliver;
@@ -16,9 +18,8 @@ mod store;
 use ingress::{IngressWorker, poll_ingress_once, start_ingress_worker};
 use policy::WhatsAppPolicy;
 use protocol::{
-    CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ConfiguredChannel, HealthReport,
-    PluginNotificationEnvelope, PluginRequest, PluginRequestEnvelope, PluginResponse, capabilities,
-    notification_to_jsonrpc, parse_jsonrpc_request, plugin_error, response_to_jsonrpc,
+    CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ConfiguredChannel, HealthReport, PluginRequest,
+    PluginRequestEnvelope, PluginResponse, capabilities, plugin_error, response_to_jsonrpc,
 };
 use session::{SessionState, load_session};
 
@@ -41,18 +42,14 @@ fn main() -> Result<()> {
         ));
     }
 
-    let stdin = io::stdin().lock();
     let stdout_lock = Arc::new(Mutex::new(()));
     let mut ingress_worker: Option<IngressWorker> = None;
 
-    for line in stdin.lines() {
-        let line = line.context("failed to read stdin")?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let (request_id, envelope) = parse_jsonrpc_request(&line)
-            .map_err(|error| anyhow!("failed to parse channel request: {error}"))?;
+    for request in spawn_plugin_input_reader(
+        Arc::clone(&stdout_lock),
+        parse_plugin_input::<ChannelConfig, protocol::OutboundMessage>,
+    ) {
+        let (request_id, envelope) = request?;
         let should_exit = matches!(envelope.request, PluginRequest::Shutdown);
         let response = handle_request(&envelope, &stdout_lock, &mut ingress_worker);
         let json = response_to_jsonrpc(&request_id, &response).map_err(|error| anyhow!(error))?;
@@ -96,8 +93,10 @@ fn handle_request(
         }
         PluginRequest::Configure { config } => configure(config),
         PluginRequest::Health { config } => health(config),
-        PluginRequest::PollIngress { config, state } => poll_ingress(config, state.as_ref()),
-        PluginRequest::StartIngress { config, state } => {
+        PluginRequest::PollIngress { config, state, .. } => {
+            poll_ingress(config, state.as_ref(), stdout_lock)
+        }
+        PluginRequest::StartIngress { config, state, .. } => {
             start_ingress(config, state.as_ref(), stdout_lock, ingress_worker)
         }
         PluginRequest::StopIngress { config, state } => {
@@ -152,19 +151,35 @@ fn handle_status(config: &ChannelConfig, frame: &protocol::StatusFrame) -> Plugi
     }
 }
 
-fn poll_ingress(config: &ChannelConfig, _state: Option<&IngressState>) -> PluginResponse {
+fn poll_ingress(
+    config: &ChannelConfig,
+    _state: Option<&IngressState>,
+    stdout_lock: &Arc<Mutex<()>>,
+) -> PluginResponse {
     let (policy, account_id) = match ingress_policy_and_account(config) {
         Ok(value) => value,
         Err(error) => return plugin_error("poll_ingress_failed", format!("{error:#}")),
     };
-    match poll_ingress_once(config, policy, account_id) {
-        Ok(events) => PluginResponse::IngressEventsReceived {
-            events,
-            callback_reply: None,
-            state: Some(running_ingress_state(config, IngressMode::Polling)),
+    if let Err(error) = poll_ingress_once(config, policy, account_id, Arc::clone(stdout_lock)) {
+        return plugin_error("poll_ingress_failed", format!("{error:#}"));
+    }
+    // Every poll ends with a confirmed state batch; an unchanged one replays
+    // the accepted original.
+    let state = Some(running_ingress_state(config, IngressMode::Polling));
+    match deliver_channel_event_batch(
+        stdout_lock,
+        ChannelEventBatch {
+            events: Vec::new(),
+            state: state.clone(),
             poll_after_ms: None,
         },
-        Err(error) => plugin_error("poll_ingress_failed", format!("{error:#}")),
+    ) {
+        Ok(()) => PluginResponse::IngressEventsReceived {
+            callback_reply: None,
+            state,
+            poll_after_ms: None,
+        },
+        Err(error) => plugin_error("event_delivery_failed", error.to_string()),
     }
 }
 
@@ -356,32 +371,6 @@ fn not_implemented(kind: &str) -> PluginResponse {
         "not_implemented",
         format!("channel-whatsapp does not implement `{kind}` yet"),
     )
-}
-
-pub(crate) fn emit_channel_event_notifications(
-    stdout_lock: &Arc<Mutex<()>>,
-    events: Vec<protocol::InboundEventEnvelope>,
-) -> Result<()> {
-    let envelope = PluginNotificationEnvelope {
-        protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
-        notification: ChannelEventNotification {
-            events,
-            state: None,
-            poll_after_ms: None,
-        },
-    };
-    let json = notification_to_jsonrpc(&envelope).map_err(|error| anyhow!(error.to_string()))?;
-    write_stdout_line(stdout_lock, &json)
-}
-
-pub(crate) fn write_stdout_line(stdout_lock: &Arc<Mutex<()>>, line: &str) -> Result<()> {
-    let _guard = stdout_lock
-        .lock()
-        .map_err(|_| anyhow!("stdout lock poisoned"))?;
-    let mut stdout = io::stdout().lock();
-    writeln!(stdout, "{line}")?;
-    stdout.flush()?;
-    Ok(())
 }
 
 #[cfg(test)]

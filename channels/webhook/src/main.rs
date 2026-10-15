@@ -1,11 +1,13 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use dispatch_channel_protocol::MessageRef;
+use dispatch_channel_protocol::parse_plugin_input;
+use dispatch_channel_runtime::{IngressCycle, spawn_plugin_input_reader, write_stdout_line};
 use jiff::Timestamp;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    hash::{Hash, Hasher},
-    io::{self, BufRead, Write},
+    sync::{Arc, Mutex},
 };
 
 mod protocol;
@@ -16,37 +18,32 @@ use protocol::{
     HealthReport, InboundActor, InboundAttachment, InboundConversationRef, InboundEventEnvelope,
     InboundMessage, IngressCallbackReply, IngressMode, IngressPayload, IngressState,
     OutboundMessage, PluginRequest, PluginRequestEnvelope, PluginResponse, StatusAcceptance,
-    StatusFrame, StatusKind, capabilities, parse_jsonrpc_request, plugin_error,
-    response_to_jsonrpc,
+    StatusFrame, StatusKind, capabilities, plugin_error, response_to_jsonrpc,
 };
 
 fn main() -> Result<()> {
-    let stdin = io::stdin().lock();
-    let mut stdout = io::stdout().lock();
-
-    for line in stdin.lines() {
-        let line = line.context("failed to read stdin")?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let (request_id, envelope) = parse_jsonrpc_request(&line)
-            .map_err(|error| anyhow!("failed to parse channel request: {error}"))?;
-
-        let response = match handle_request(&envelope) {
+    let stdout_lock = Arc::new(Mutex::new(()));
+    for request in spawn_plugin_input_reader(
+        Arc::clone(&stdout_lock),
+        parse_plugin_input::<ChannelConfig, OutboundMessage>,
+    ) {
+        let (request_id, envelope) = request?;
+        let response = match handle_request(&envelope, &stdout_lock) {
             Ok(response) => response,
             Err(error) => plugin_error("internal_error", error.to_string()),
         };
 
         let json = response_to_jsonrpc(&request_id, &response).map_err(|error| anyhow!(error))?;
-        writeln!(stdout, "{json}")?;
-        stdout.flush()?;
+        write_stdout_line(&stdout_lock, &json)?;
     }
 
     Ok(())
 }
 
-fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
+fn handle_request(
+    envelope: &PluginRequestEnvelope,
+    stdout_lock: &Arc<Mutex<()>>,
+) -> Result<PluginResponse> {
     if envelope.protocol_version != CHANNEL_PLUGIN_PROTOCOL_VERSION {
         return Ok(plugin_error(
             "unsupported_protocol_version",
@@ -89,7 +86,9 @@ fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
         )),
         PluginRequest::IngressEvent {
             config, payload, ..
-        } => handle_ingress_event(config, payload),
+        } => handle_ingress_event(config, payload)?
+            .publish(stdout_lock)
+            .map_err(Into::into),
         PluginRequest::Status { config, update } => Ok(PluginResponse::StatusAccepted {
             status: send_status(config, update)?,
         }),
@@ -245,12 +244,9 @@ fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<Delivery
     })
 }
 
-fn handle_ingress_event(
-    config: &ChannelConfig,
-    payload: &IngressPayload,
-) -> Result<PluginResponse> {
+fn handle_ingress_event(config: &ChannelConfig, payload: &IngressPayload) -> Result<IngressCycle> {
     if let Some(reply) = validate_ingress_secret(config, payload)? {
-        return Ok(PluginResponse::IngressEventsReceived {
+        return Ok(IngressCycle::Events {
             events: Vec::new(),
             callback_reply: Some(reply),
             state: None,
@@ -263,7 +259,7 @@ fn handle_ingress_event(
     let received_at = received_at(payload.received_at.as_deref())?;
     let event = build_inbound_event(config, payload, body.as_ref(), &content_type, &received_at)?;
 
-    Ok(PluginResponse::IngressEventsReceived {
+    Ok(IngressCycle::Events {
         events: vec![event],
         callback_reply: None,
         state: None,
@@ -405,10 +401,9 @@ fn build_inbound_event(
         .and_then(|value| lookup_string(value, &["event_type", "type"]))
         .unwrap_or_else(|| "webhook.received".to_string());
     let account_id = body.and_then(|value| lookup_string(value, &["account_id"]));
-    let event_id = body
+    let supplied_event_id = body
         .and_then(|value| lookup_string(value, &["event_id"]))
-        .or_else(|| header_value(&payload.headers, "X-Dispatch-Event-Id"))
-        .unwrap_or_else(|| generated_event_id(payload, &message.id));
+        .or_else(|| header_value(&payload.headers, "X-Dispatch-Event-Id"));
 
     let mut metadata = BTreeMap::new();
     metadata.insert("transport".to_string(), "webhook".to_string());
@@ -437,8 +432,8 @@ fn build_inbound_event(
         metadata.insert("body_format".to_string(), "text".to_string());
     }
 
-    Ok(InboundEventEnvelope {
-        event_id,
+    let mut event = InboundEventEnvelope {
+        event_id: supplied_event_id.clone().unwrap_or_default(),
         platform: "webhook".to_string(),
         event_type,
         received_at: received_at.to_string(),
@@ -448,7 +443,11 @@ fn build_inbound_event(
         account_id,
         activation: None,
         metadata,
-    })
+    };
+    if supplied_event_id.is_none() {
+        event.event_id = generated_event_id(&event)?;
+    }
+    Ok(event)
 }
 
 fn resolve_conversation(payload: &IngressPayload, body: Option<&Value>) -> InboundConversationRef {
@@ -707,24 +706,21 @@ fn message_content_from_json(body: &Value) -> Option<String> {
         .or_else(|| body.get("content").and_then(string_value))
 }
 
-fn generated_event_id(payload: &IngressPayload, message_id: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    payload.method.hash(&mut hasher);
-    payload.path.hash(&mut hasher);
-    payload.body.hash(&mut hasher);
-    message_id.hash(&mut hasher);
-    if let Some(endpoint_id) = &payload.endpoint_id {
-        endpoint_id.hash(&mut hasher);
-    }
-    format!("webhook-evt-{:016x}", hasher.finish())
+/// Identity of an event without a supplied ID: a digest of every field the
+/// event carries except the host observation time, so one generated ID never
+/// names two different events.
+fn generated_event_id(event: &InboundEventEnvelope) -> Result<String> {
+    let content = dispatch_channel_protocol::canonical_channel_event_content_bytes(event)
+        .map_err(|error| anyhow!("webhook event identity failed: {error}"))?;
+    Ok(format!("webhook-evt-{:x}", Sha256::digest(content)))
 }
 
 fn generated_message_id(payload: &IngressPayload) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    payload.method.hash(&mut hasher);
-    payload.path.hash(&mut hasher);
-    payload.body.hash(&mut hasher);
-    format!("webhook-msg-{:016x}", hasher.finish())
+    let identity = (&payload.method, &payload.path, &payload.body);
+    format!(
+        "webhook-msg-{:x}",
+        Sha256::digest(serde_json::to_vec(&identity).expect("webhook identity serializes"))
+    )
 }
 
 fn received_at(value: Option<&str>) -> Result<String> {
@@ -800,7 +796,7 @@ mod tests {
         };
 
         let response = handle_ingress_event(&config, &payload).expect("ingress succeeds");
-        let PluginResponse::IngressEventsReceived {
+        let IngressCycle::Events {
             events,
             callback_reply,
             ..
@@ -866,7 +862,7 @@ mod tests {
         };
 
         let response = handle_ingress_event(&config, &payload).expect("ingress succeeds");
-        let PluginResponse::IngressEventsReceived {
+        let IngressCycle::Events {
             events,
             callback_reply,
             ..
@@ -884,6 +880,71 @@ mod tests {
         unsafe {
             std::env::remove_var("WEBHOOK_TEST_INGRESS_SECRET");
         }
+    }
+
+    #[test]
+    fn generated_identity_is_stable_across_host_observations() {
+        let payload = IngressPayload {
+            endpoint_id: Some("endpoint".into()),
+            method: "POST".into(),
+            path: "/events".into(),
+            headers: BTreeMap::new(),
+            query: BTreeMap::new(),
+            raw_query: None,
+            body: r#"{"conversation_id":"customer","actor_id":"sender","content":"hello"}"#.into(),
+            trust_verified: true,
+            received_at: Some("2026-04-11T00:00:00Z".into()),
+        };
+        let first = handle_ingress_event(&ChannelConfig::default(), &payload).unwrap();
+        let IngressCycle::Events { events: first, .. } = first else {
+            panic!("expected event batch");
+        };
+        let observed_later = IngressPayload {
+            received_at: Some("2026-04-12T00:00:00Z".into()),
+            ..payload.clone()
+        };
+        let second = handle_ingress_event(&ChannelConfig::default(), &observed_later).unwrap();
+        let IngressCycle::Events { events: second, .. } = second else {
+            panic!("expected replayed event batch");
+        };
+        assert_eq!(first[0].event_id, second[0].event_id);
+        assert_eq!(first[0].message.id, second[0].message.id);
+        assert_eq!(
+            dispatch_channel_protocol::canonical_channel_event_content_bytes(&first[0]).unwrap(),
+            dispatch_channel_protocol::canonical_channel_event_content_bytes(&second[0]).unwrap()
+        );
+        assert_ne!(first[0].received_at, second[0].received_at);
+    }
+
+    #[test]
+    fn generated_event_ids_differ_when_any_event_field_differs() {
+        let payload = IngressPayload {
+            endpoint_id: Some("webhook".into()),
+            method: "POST".into(),
+            path: "/events".into(),
+            headers: BTreeMap::new(),
+            query: BTreeMap::new(),
+            raw_query: None,
+            body: r#"{"actor_id":"sender","content":"hello"}"#.into(),
+            trust_verified: true,
+            received_at: Some("2026-04-11T00:00:00Z".into()),
+        };
+        let event = |payload: &IngressPayload| {
+            let IngressCycle::Events { events, .. } =
+                handle_ingress_event(&ChannelConfig::default(), payload).unwrap()
+            else {
+                panic!("expected event batch");
+            };
+            events.into_iter().next().unwrap()
+        };
+        let original = event(&payload);
+        let rerouted = event(&IngressPayload {
+            query: BTreeMap::from([("conversation_id".to_string(), "other".to_string())]),
+            ..payload.clone()
+        });
+        assert_ne!(original.conversation.id, rerouted.conversation.id);
+        assert_ne!(original.event_id, rerouted.event_id);
+        assert!(original.event_id.starts_with("webhook-evt-"));
     }
 
     #[test]

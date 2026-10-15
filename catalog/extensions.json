@@ -12,7 +12,7 @@
       "version": "0.7.0",
       "description": "Discord channel plugin for Dispatch.",
       "protocol": "jsonl",
-      "protocol_version": 1,
+      "protocol_version": 2,
       "source_dir": "channels/discord",
       "manifest_path": "channels/discord/channel-plugin.json",
       "keywords": [
@@ -100,7 +100,7 @@
       "version": "0.7.0",
       "description": "Email channel plugin for Dispatch using IMAP ingress and SMTP delivery.",
       "protocol": "jsonl",
-      "protocol_version": 1,
+      "protocol_version": 2,
       "source_dir": "channels/email",
       "manifest_path": "channels/email/channel-plugin.json",
       "keywords": [
@@ -187,7 +187,7 @@
       "version": "0.7.0",
       "description": "Gmail channel plugin for Dispatch using Gmail IMAP ingress and SMTP delivery.",
       "protocol": "jsonl",
-      "protocol_version": 1,
+      "protocol_version": 2,
       "source_dir": "channels/gmail",
       "manifest_path": "channels/gmail/channel-plugin.json",
       "keywords": [
@@ -277,7 +277,7 @@
       "version": "0.7.0",
       "description": "iMessage channel plugin for Dispatch through BlueBubbles.",
       "protocol": "jsonl",
-      "protocol_version": 1,
+      "protocol_version": 2,
       "source_dir": "channels/imessage",
       "manifest_path": "channels/imessage/channel-plugin.json",
       "keywords": [
@@ -363,7 +363,7 @@
       "version": "0.7.0",
       "description": "Outlook channel plugin for Dispatch using Outlook / Microsoft 365 IMAP ingress and SMTP delivery.",
       "protocol": "jsonl",
-      "protocol_version": 1,
+      "protocol_version": 2,
       "source_dir": "channels/outlook",
       "manifest_path": "channels/outlook/channel-plugin.json",
       "keywords": [
@@ -454,7 +454,7 @@
       "version": "0.7.0",
       "description": "Signal channel plugin for Dispatch using the native Rust presage client.",
       "protocol": "jsonl",
-      "protocol_version": 1,
+      "protocol_version": 2,
       "source_dir": "channels/signal",
       "manifest_path": "channels/signal/channel-plugin.json",
       "keywords": [
@@ -550,7 +550,7 @@
       "version": "0.7.0",
       "description": "Slack channel plugin for Dispatch.",
       "protocol": "jsonl",
-      "protocol_version": 1,
+      "protocol_version": 2,
       "source_dir": "channels/slack",
       "manifest_path": "channels/slack/channel-plugin.json",
       "keywords": [
@@ -642,7 +642,7 @@
       "version": "0.7.0",
       "description": "Telegram channel plugin for Dispatch.",
       "protocol": "jsonl",
-      "protocol_version": 1,
+      "protocol_version": 2,
       "source_dir": "channels/telegram",
       "manifest_path": "channels/telegram/channel-plugin.json",
       "keywords": [
@@ -728,7 +728,7 @@
       "version": "0.7.0",
       "description": "Twilio SMS channel plugin for Dispatch.",
       "protocol": "jsonl",
-      "protocol_version": 1,
+      "protocol_version": 2,
       "source_dir": "channels/twilio-sms",
       "manifest_path": "channels/twilio-sms/channel-plugin.json",
       "keywords": [
@@ -818,7 +818,7 @@
       "version": "0.7.0",
       "description": "Generic webhook channel plugin for Dispatch.",
       "protocol": "jsonl",
-      "protocol_version": 1,
+      "protocol_version": 2,
       "source_dir": "channels/webhook",
       "manifest_path": "channels/webhook/channel-plugin.json",
       "keywords": [
@@ -902,7 +902,7 @@
       "version": "0.7.0",
       "description": "WhatsApp channel plugin for Dispatch using the native Rust whatsapp-rust client.",
       "protocol": "jsonl",
-      "protocol_version": 1,
+      "protocol_version": 2,
       "source_dir": "channels/whatsapp",
       "manifest_path": "channels/whatsapp/channel-plugin.json",
       "keywords": [

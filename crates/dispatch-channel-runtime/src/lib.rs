@@ -1,17 +1,29 @@
 use dispatch_channel_protocol::{
-    CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelEventNotification, InboundEventEnvelope, IngressState,
-    JsonRpcMessageError, PluginNotificationEnvelope, PluginResponse, notification_to_jsonrpc,
+    CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelEventBatch, ChannelHeartbeat, InboundEventEnvelope,
+    IngressCallbackReply, IngressState, PluginInput, PluginNotificationEnvelope, PluginRequest,
+    PluginRequestEnvelope, PluginRequestId, PluginResponse, heartbeat_to_jsonrpc,
 };
 use std::{
-    io::{self, Write},
+    collections::BTreeMap,
+    io::{self, BufRead, Write},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
+
+mod event_delivery;
+mod journal_fs;
+pub use event_delivery::{
+    close_event_input, configure_event_storage, deliver_channel_event_batch,
+    deliver_channel_event_batch_until, replay_pending_event_batch,
+    replay_pending_event_batch_until, route_event_acceptance,
+};
+pub use journal_fs::create_event_journal_directory;
 
 const MAX_CONSECUTIVE_RECEIVE_FAILURES: u32 = 5;
 const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
@@ -22,8 +34,10 @@ const RECONNECT_STABILITY_WINDOW: Duration = Duration::from_secs(30);
 pub enum RuntimeError {
     #[error("stdout lock poisoned")]
     StdoutLockPoisoned,
-    #[error("failed to encode channel event notification: {0}")]
-    NotificationEncode(JsonRpcMessageError),
+    #[error("channel event journal or receipt failed: {0}")]
+    Journal(String),
+    #[error("channel plugin stdin protocol failed: {0}")]
+    Input(String),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -69,10 +83,130 @@ impl StopSignal {
 
 pub fn no_after_cycle<C>(_: &C, _: &StopSignal) {}
 
-/// Provides shutdown-aware waits and in-cycle stdout delivery to poll callbacks.
+/// Plugin-owned ingress result. Event content never appears in a control response.
+#[derive(Debug)]
+pub enum IngressCycle {
+    Events {
+        events: Vec<InboundEventEnvelope>,
+        callback_reply: Option<IngressCallbackReply>,
+        state: Option<IngressState>,
+        poll_after_ms: Option<u64>,
+    },
+    Control(PluginResponse),
+}
+
+impl IngressCycle {
+    /// Deliver the batch durably, then build the content-free control response.
+    pub fn publish(self, stdout_lock: &Arc<Mutex<()>>) -> Result<PluginResponse, RuntimeError> {
+        match self {
+            Self::Events {
+                events,
+                callback_reply,
+                state,
+                poll_after_ms,
+            } => {
+                deliver_channel_event_batch(
+                    stdout_lock,
+                    ChannelEventBatch {
+                        events,
+                        state: state.clone(),
+                        poll_after_ms,
+                    },
+                )?;
+                Ok(PluginResponse::IngressEventsReceived {
+                    callback_reply,
+                    state,
+                    poll_after_ms,
+                })
+            }
+            Self::Control(response) => Ok(response),
+        }
+    }
+}
+
+impl From<PluginResponse> for IngressCycle {
+    fn from(response: PluginResponse) -> Self {
+        Self::Control(response)
+    }
+}
+
+/// One host request from plugin stdin, or the error that ended input.
+type InputRequest<C, M> =
+    Result<(PluginRequestId, PluginRequestEnvelope<PluginRequest<C, M>>), RuntimeError>;
+
+/// Read plugin stdin on its own thread so receipts reach a waiting batch while
+/// the request loop is busy. Host ingress requests configure the journal and
+/// take the host's accepted cursor; receipts never reach the request loop.
+pub fn spawn_plugin_input_reader<C, M, E, Parse>(
+    stdout_lock: Arc<Mutex<()>>,
+    parse: Parse,
+) -> mpsc::Receiver<InputRequest<C, M>>
+where
+    C: Send + 'static,
+    M: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+    Parse: Fn(&str) -> Result<PluginInput<C, M>, E> + Send + 'static,
+{
+    let (send, receive) = mpsc::channel();
+    thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            let input = match line {
+                Ok(line) if line.trim().is_empty() => continue,
+                Ok(line) => parse(&line).map_err(|error| RuntimeError::Input(error.to_string())),
+                Err(error) => Err(RuntimeError::Io(error)),
+            };
+            let outcome = match input {
+                Ok(PluginInput::Request { id, mut envelope }) => {
+                    configure_ingress_request(&stdout_lock, &mut envelope.request)
+                        .map(|()| Some((id, *envelope)))
+                }
+                Ok(PluginInput::EventAcceptance { id, acceptance }) => {
+                    route_event_acceptance(&stdout_lock, id, acceptance).map(|()| None)
+                }
+                Err(error) => Err(error),
+            };
+            match outcome {
+                Ok(Some(request)) => {
+                    if send.send(Ok(request)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = send.send(Err(error));
+                    break;
+                }
+            }
+        }
+        close_event_input(&stdout_lock);
+    });
+    receive
+}
+
+fn configure_ingress_request<C, M>(
+    stdout_lock: &Arc<Mutex<()>>,
+    request: &mut PluginRequest<C, M>,
+) -> Result<(), RuntimeError> {
+    let (PluginRequest::StartIngress { storage, state, .. }
+    | PluginRequest::PollIngress { storage, state, .. }
+    | PluginRequest::IngressEvent { storage, state, .. }) = request
+    else {
+        return Ok(());
+    };
+    configure_event_storage(stdout_lock, storage)?;
+    // The authenticated host head owns the cursor, including an inherited one.
+    if let Some(recovery) = &storage.recovery {
+        *state = recovery.state.clone();
+    }
+    Ok(())
+}
+
+/// Provides shutdown-aware waits and in-cycle durable delivery to poll callbacks.
 pub struct IngressPollContext<'a> {
     stop: &'a StopSignal,
-    emit: &'a dyn Fn(ChannelEventNotification) -> Result<(), RuntimeError>,
+    emit: &'a dyn Fn(ChannelEventBatch) -> Result<(), RuntimeError>,
+    /// State of the latest batch confirmed during this cycle.
+    delivered_state: &'a Mutex<Option<Option<IngressState>>>,
 }
 
 impl IngressPollContext<'_> {
@@ -85,18 +219,23 @@ impl IngressPollContext<'_> {
         self.stop.sleep_until_stopped(total);
     }
 
-    /// Serialize and flush events to plugin stdout before the poll returns.
+    /// Persist and confirm events with the host before the poll returns.
     pub fn deliver(
         &self,
         events: Vec<InboundEventEnvelope>,
         state: Option<IngressState>,
         poll_after_ms: Option<u64>,
     ) -> Result<(), RuntimeError> {
-        (self.emit)(ChannelEventNotification {
+        (self.emit)(ChannelEventBatch {
             events,
-            state,
+            state: state.clone(),
             poll_after_ms,
-        })
+        })?;
+        *self
+            .delivered_state
+            .lock()
+            .expect("channel ingress delivery state poisoned") = Some(state);
+        Ok(())
     }
 }
 
@@ -110,7 +249,7 @@ pub fn restart_ingress_worker<C, Poll, After, E>(
     after_cycle: After,
 ) where
     C: Send + 'static,
-    Poll: Fn(&C, Option<IngressState>, &IngressPollContext<'_>) -> Result<PluginResponse, E>
+    Poll: Fn(&C, Option<IngressState>, &IngressPollContext<'_>) -> Result<IngressCycle, E>
         + Send
         + 'static,
     After: Fn(&C, &StopSignal) + Send + 'static,
@@ -144,6 +283,18 @@ pub fn write_stdout_line(stdout_lock: &Arc<Mutex<()>>, line: &str) -> Result<(),
     Ok(())
 }
 
+pub fn publish_channel_heartbeat(stdout_lock: &Arc<Mutex<()>>) -> Result<(), RuntimeError> {
+    let envelope = PluginNotificationEnvelope {
+        protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
+        notification: ChannelHeartbeat {
+            metadata: BTreeMap::new(),
+        },
+    };
+    let json =
+        heartbeat_to_jsonrpc(&envelope).map_err(|error| RuntimeError::Input(error.to_string()))?;
+    write_stdout_line(stdout_lock, &json)
+}
+
 fn spawn_ingress_worker<C, Poll, After, E>(
     config: C,
     initial_state: IngressState,
@@ -154,7 +305,7 @@ fn spawn_ingress_worker<C, Poll, After, E>(
 ) -> IngressWorker
 where
     C: Send + 'static,
-    Poll: Fn(&C, Option<IngressState>, &IngressPollContext<'_>) -> Result<PluginResponse, E>
+    Poll: Fn(&C, Option<IngressState>, &IngressPollContext<'_>) -> Result<IngressCycle, E>
         + Send
         + 'static,
     After: Fn(&C, &StopSignal) + Send + 'static,
@@ -165,13 +316,21 @@ where
     let stop_signal = StopSignal(Arc::clone(&stop));
     let shared_state = Arc::clone(&state);
     let handle = thread::spawn(move || {
+        let stopped = || stop_signal.is_stopped();
+        if let Err(error) = replay_pending_event_batch_until(&stdout_lock, &stopped) {
+            if stop_signal.is_stopped() {
+                return;
+            }
+            eprintln!("{plugin_label} ingress replay failed: {error}");
+            std::process::exit(1);
+        }
         let result = run_ingress_worker_loop(
             &config,
             &shared_state,
             &stop_signal,
             &poll,
             &after_cycle,
-            |notification| emit_channel_event_notification(&stdout_lock, notification),
+            |batch| deliver_channel_event_batch_until(&stdout_lock, batch, &stopped),
         );
         if let IngressWorkerExit::Terminal(failure) = result {
             eprintln!(
@@ -205,47 +364,73 @@ fn run_ingress_worker_loop<C, Poll, After, E, Emit>(
     emit: Emit,
 ) -> IngressWorkerExit
 where
-    Poll: Fn(&C, Option<IngressState>, &IngressPollContext<'_>) -> Result<PluginResponse, E>,
+    Poll: Fn(&C, Option<IngressState>, &IngressPollContext<'_>) -> Result<IngressCycle, E>,
     After: Fn(&C, &StopSignal),
     E: std::fmt::Display,
-    Emit: Fn(ChannelEventNotification) -> Result<(), RuntimeError>,
+    Emit: Fn(ChannelEventBatch) -> Result<(), RuntimeError>,
 {
+    let delivered_state = Mutex::new(None);
     let context = IngressPollContext {
         stop: stop_signal,
         emit: &emit,
+        delivered_state: &delivered_state,
     };
     let mut consecutive_failures = 0;
     let mut last_successful_receive_unix_ms = None;
     let mut last_receive_failure_at = None;
     while !stop_signal.is_stopped() {
+        *delivered_state
+            .lock()
+            .expect("channel ingress delivery state poisoned") = None;
         let prior_state = shared_state
             .lock()
             .expect("channel ingress state poisoned")
             .clone();
         match poll(config, prior_state, &context) {
-            Ok(PluginResponse::IngressEventsReceived {
+            Ok(IngressCycle::Events {
                 events,
                 state,
                 poll_after_ms,
                 ..
             }) => {
                 last_successful_receive_unix_ms = Some(unix_time_millis());
-                if let Some(next_state) = state.clone() {
-                    *shared_state.lock().expect("channel ingress state poisoned") =
-                        Some(next_state);
-                }
-                if let Err(error) = emit(ChannelEventNotification {
-                    events,
-                    state,
-                    poll_after_ms,
-                }) {
+                // The cursor advances only with a confirmed batch; an in-cycle
+                // delivery covers the result only when it carried the same state.
+                let already_confirmed = events.is_empty()
+                    && delivered_state
+                        .lock()
+                        .expect("channel ingress delivery state poisoned")
+                        .as_ref()
+                        == Some(&state);
+                if !already_confirmed
+                    && let Err(error) = emit(ChannelEventBatch {
+                        events,
+                        state: state.clone(),
+                        poll_after_ms,
+                    })
+                {
+                    if stop_signal.is_stopped() {
+                        return IngressWorkerExit::Shutdown;
+                    }
                     return IngressWorkerExit::Terminal(IngressTerminalFailure {
-                        reason: "notification_delivery",
+                        reason: "event_delivery",
                         retryable: false,
                         retry_count: 0,
                         last_successful_receive_unix_ms,
                         message: error.to_string(),
                     });
+                }
+                // A state-free result keeps the cursor confirmed earlier in the cycle.
+                let confirmed_state = state.or_else(|| {
+                    delivered_state
+                        .lock()
+                        .expect("channel ingress delivery state poisoned")
+                        .clone()
+                        .flatten()
+                });
+                if let Some(next_state) = confirmed_state {
+                    *shared_state.lock().expect("channel ingress state poisoned") =
+                        Some(next_state);
                 }
                 if stop_signal.is_stopped() {
                     return IngressWorkerExit::Shutdown;
@@ -258,7 +443,7 @@ where
                     last_receive_failure_at = None;
                 }
             }
-            Ok(PluginResponse::Error { error }) => {
+            Ok(IngressCycle::Control(PluginResponse::Error { error })) => {
                 if stop_signal.is_stopped() {
                     return IngressWorkerExit::Shutdown;
                 }
@@ -312,8 +497,8 @@ where
 
 fn classify_plugin_error(code: &str) -> &'static str {
     let code = code.to_ascii_lowercase();
-    if code.contains("notification_delivery") {
-        "notification_delivery"
+    if code.contains("event_delivery") {
+        "event_delivery"
     } else if ["auth", "credential", "permission", "token", "unauthorized"]
         .iter()
         .any(|marker| code.contains(marker))
@@ -358,22 +543,10 @@ fn unix_time_millis() -> u128 {
         .as_millis()
 }
 
-fn emit_channel_event_notification(
-    stdout_lock: &Arc<Mutex<()>>,
-    notification: ChannelEventNotification,
-) -> Result<(), RuntimeError> {
-    let envelope = PluginNotificationEnvelope {
-        protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
-        notification,
-    };
-    let json = notification_to_jsonrpc(&envelope).map_err(RuntimeError::NotificationEncode)?;
-    write_stdout_line(stdout_lock, &json)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        IngressPollContext, IngressWorkerExit, StopSignal, classify_plugin_error,
+        IngressCycle, IngressPollContext, IngressWorkerExit, StopSignal, classify_plugin_error,
         run_ingress_worker_loop,
     };
     use dispatch_channel_protocol::{
@@ -391,10 +564,10 @@ mod tests {
     };
 
     #[test]
-    fn notification_delivery_errors_keep_their_terminal_reason() {
+    fn event_delivery_errors_keep_their_terminal_reason() {
         assert_eq!(
-            classify_plugin_error("notification_delivery_failed"),
-            "notification_delivery"
+            classify_plugin_error("event_delivery_failed"),
+            "event_delivery"
         );
     }
 
@@ -455,7 +628,7 @@ mod tests {
                 if calls.fetch_add(1, Ordering::Relaxed) == 0 {
                     Err("temporary transport failure")
                 } else {
-                    Ok(PluginResponse::IngressEventsReceived {
+                    Ok(IngressCycle::Events {
                         events: vec![test_event()],
                         callback_reply: None,
                         state: None,
@@ -464,19 +637,19 @@ mod tests {
                 }
             },
             &|_, signal| signal.0.store(true, Ordering::Relaxed),
-            move |notification| {
+            move |batch| {
                 emitted_for_callback
                     .lock()
-                    .expect("emitted notifications lock")
-                    .push(notification);
+                    .expect("emitted batches lock")
+                    .push(batch);
                 Ok(())
             },
         );
 
         assert_eq!(result, IngressWorkerExit::Shutdown);
-        let notifications = emitted.lock().expect("emitted notifications lock");
-        assert_eq!(notifications.len(), 1);
-        assert_eq!(notifications[0].events[0].event_id, "event-1");
+        let batches = emitted.lock().expect("emitted batches lock");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].events[0].event_id, "event-1");
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
@@ -496,16 +669,16 @@ mod tests {
             &(),
             &state,
             &stop_signal,
-            &move |_, _, context: &IngressPollContext<'_>| -> Result<PluginResponse, &str> {
+            &move |_, _, context: &IngressPollContext<'_>| -> Result<IngressCycle, &str> {
                 context
                     .deliver(vec![test_event()], None, Some(1000))
                     .expect("delivery should succeed");
                 delivered_flag.store(
-                    observed.lock().expect("emitted notifications lock").len() == 1,
+                    observed.lock().expect("emitted batches lock").len() == 1,
                     Ordering::Relaxed,
                 );
                 stop_during_poll.store(true, Ordering::Relaxed);
-                Ok(PluginResponse::IngressEventsReceived {
+                Ok(IngressCycle::Events {
                     events: Vec::new(),
                     callback_reply: None,
                     state: None,
@@ -513,11 +686,11 @@ mod tests {
                 })
             },
             &|_, _| {},
-            move |notification| {
+            move |batch| {
                 emitted_for_callback
                     .lock()
-                    .expect("emitted notifications lock")
-                    .push(notification);
+                    .expect("emitted batches lock")
+                    .push(batch);
                 Ok(())
             },
         );
@@ -525,12 +698,105 @@ mod tests {
         assert_eq!(result, IngressWorkerExit::Shutdown);
         assert!(
             delivered_before_return.load(Ordering::Relaxed),
-            "the event must be on the wire before the poll returns"
+            "the event must be confirmed before the poll returns"
         );
-        let notifications = emitted.lock().expect("emitted notifications lock");
-        assert_eq!(notifications.len(), 2, "event then liveness heartbeat");
-        assert_eq!(notifications[0].events[0].event_id, "event-1");
-        assert!(notifications[1].events.is_empty());
+        let batches = emitted.lock().expect("emitted batches lock");
+        assert_eq!(
+            batches.len(),
+            1,
+            "an unchanged cycle result is already confirmed"
+        );
+        assert_eq!(batches[0].events[0].event_id, "event-1");
+    }
+
+    #[test]
+    fn cursor_advances_only_after_its_own_batch_is_confirmed() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_signal = StopSignal(Arc::clone(&stop));
+        let state = Arc::new(Mutex::new(None));
+        let cursor = |value: &str| IngressState {
+            mode: IngressMode::Polling,
+            status: "running".to_string(),
+            endpoint: None,
+            metadata: BTreeMap::from([("cursor".to_string(), value.to_string())]),
+        };
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let emitted_for_callback = Arc::clone(&emitted);
+        let stop_during_poll = Arc::clone(&stop);
+        let delivered_cursor = cursor("1");
+        let returned_cursor = cursor("2");
+
+        let result = run_ingress_worker_loop(
+            &(),
+            &state,
+            &stop_signal,
+            &move |_, _, context: &IngressPollContext<'_>| -> Result<IngressCycle, &str> {
+                context
+                    .deliver(vec![test_event()], Some(delivered_cursor.clone()), None)
+                    .expect("delivery should succeed");
+                stop_during_poll.store(true, Ordering::Relaxed);
+                Ok(IngressCycle::Events {
+                    events: Vec::new(),
+                    callback_reply: None,
+                    state: Some(returned_cursor.clone()),
+                    poll_after_ms: None,
+                })
+            },
+            &|_, _| {},
+            move |batch| {
+                emitted_for_callback
+                    .lock()
+                    .expect("emitted batches lock")
+                    .push(batch);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, IngressWorkerExit::Shutdown);
+        let batches = emitted.lock().expect("emitted batches lock");
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[1].state, Some(cursor("2")));
+        assert_eq!(*state.lock().unwrap(), Some(cursor("2")));
+    }
+
+    #[test]
+    fn failed_delivery_keeps_the_previous_cursor_and_stops_quietly_on_shutdown() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_signal = StopSignal(Arc::clone(&stop));
+        let previous = IngressState {
+            mode: IngressMode::Polling,
+            status: "running".to_string(),
+            endpoint: None,
+            metadata: BTreeMap::from([("cursor".to_string(), "1".to_string())]),
+        };
+        let state = Arc::new(Mutex::new(Some(previous.clone())));
+        let mut next = previous.clone();
+        next.metadata.insert("cursor".to_string(), "2".to_string());
+        let stop_during_delivery = Arc::clone(&stop);
+
+        let result = run_ingress_worker_loop(
+            &(),
+            &state,
+            &stop_signal,
+            &move |_, _, _| -> Result<IngressCycle, &str> {
+                Ok(IngressCycle::Events {
+                    events: vec![test_event()],
+                    callback_reply: None,
+                    state: Some(next.clone()),
+                    poll_after_ms: None,
+                })
+            },
+            &|_, _| {},
+            move |_| {
+                stop_during_delivery.store(true, Ordering::Relaxed);
+                Err(super::RuntimeError::Journal(
+                    "event acceptance wait stopped".to_string(),
+                ))
+            },
+        );
+
+        assert_eq!(result, IngressWorkerExit::Shutdown);
+        assert_eq!(*state.lock().unwrap(), Some(previous));
     }
 
     #[test]
@@ -549,7 +815,7 @@ mod tests {
             &(),
             &state,
             &stop_signal,
-            &|_, _, context: &IngressPollContext<'_>| -> Result<PluginResponse, &str> {
+            &|_, _, context: &IngressPollContext<'_>| -> Result<IngressCycle, &str> {
                 context.sleep_until_stopped(Duration::from_secs(60));
                 Err("rate limited")
             },
@@ -572,13 +838,13 @@ mod tests {
             &(),
             &state,
             &stop_signal,
-            &|_, _, _| -> Result<PluginResponse, &str> {
-                Ok(PluginResponse::Error {
+            &|_, _, _| -> Result<IngressCycle, &str> {
+                Ok(IngressCycle::Control(PluginResponse::Error {
                     error: dispatch_channel_protocol::PluginErrorPayload {
                         code: "invalid_auth".to_string(),
                         message: "credentials rejected".to_string(),
                     },
-                })
+                }))
             },
             &|_, _| {},
             |_| Ok(()),
@@ -601,14 +867,14 @@ mod tests {
             &(),
             &state,
             &stop_signal,
-            &move |_, _, _| -> Result<PluginResponse, &str> {
+            &move |_, _, _| -> Result<IngressCycle, &str> {
                 stop_during_poll.store(true, Ordering::Relaxed);
-                Ok(PluginResponse::Error {
+                Ok(IngressCycle::Control(PluginResponse::Error {
                     error: dispatch_channel_protocol::PluginErrorPayload {
                         code: "transport_closed".to_string(),
                         message: "poll interrupted by shutdown".to_string(),
                     },
-                })
+                }))
             },
             &|_, _| {},
             |_| Ok(()),
@@ -629,9 +895,9 @@ mod tests {
             &(),
             &state,
             &stop_signal,
-            &move |_, _, _| -> Result<PluginResponse, &str> {
+            &move |_, _, _| -> Result<IngressCycle, &str> {
                 stop_during_poll.store(true, Ordering::Relaxed);
-                Ok(PluginResponse::IngressEventsReceived {
+                Ok(IngressCycle::Events {
                     events: vec![test_event()],
                     callback_reply: None,
                     state: None,
@@ -639,18 +905,18 @@ mod tests {
                 })
             },
             &|_, _| panic!("after-cycle hook must not run after shutdown"),
-            move |notification| {
+            move |batch| {
                 emitted_for_callback
                     .lock()
-                    .expect("emitted notifications lock")
-                    .push(notification);
+                    .expect("emitted batches lock")
+                    .push(batch);
                 Ok(())
             },
         );
 
         assert_eq!(result, IngressWorkerExit::Shutdown);
-        let notifications = emitted.lock().expect("emitted notifications lock");
-        assert_eq!(notifications.len(), 1);
-        assert_eq!(notifications[0].events[0].event_id, "event-1");
+        let batches = emitted.lock().expect("emitted batches lock");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].events[0].event_id, "event-1");
     }
 }

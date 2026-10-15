@@ -3,13 +3,11 @@ use serde::{Deserialize, Serialize};
 
 #[allow(unused_imports)]
 pub use proto::{
-    AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities,
-    ChannelEventNotification, ChannelPolicy, ConfiguredChannel, DeliveryReceipt, HealthReport,
-    InboundActivation, InboundActor, InboundAttachment, InboundConversationRef,
-    InboundEventEnvelope, InboundMessage, IngressMode, IngressState, OutboundAttachment,
-    OutboundMessageEnvelope, PluginNotificationEnvelope, PluginResponse, StatusAcceptance,
-    StatusFrame, StatusKind, ThreadingModel, notification_to_jsonrpc, parse_jsonrpc_request,
-    plugin_error, response_to_jsonrpc,
+    AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities, ChannelPolicy,
+    ConfiguredChannel, DeliveryReceipt, HealthReport, InboundActivation, InboundActor,
+    InboundAttachment, InboundConversationRef, InboundEventEnvelope, InboundMessage, IngressMode,
+    IngressState, OutboundAttachment, OutboundMessageEnvelope, PluginResponse, StatusAcceptance,
+    StatusFrame, StatusKind, ThreadingModel, plugin_error, response_to_jsonrpc,
 };
 
 /// Configuration for the native Rust WhatsApp channel plugin.

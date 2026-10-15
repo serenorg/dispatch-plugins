@@ -3,29 +3,29 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use dispatch_channel_protocol::MessageRef;
 use dispatch_channel_runtime::{
-    IngressPollContext, IngressWorker, no_after_cycle,
-    restart_ingress_worker as restart_runtime_ingress_worker, stop_ingress_worker,
-    write_stdout_line,
+    IngressCycle, IngressPollContext, IngressWorker, no_after_cycle,
+    restart_ingress_worker as restart_runtime_ingress_worker, spawn_plugin_input_reader,
+    stop_ingress_worker, write_stdout_line,
 };
 use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
-    io::{self, BufRead},
     sync::{Arc, Mutex},
 };
 
 mod protocol;
 mod telegram_api;
 
+use dispatch_channel_protocol::parse_plugin_input;
 use protocol::{
     CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ChannelPolicy, ConfiguredChannel,
     DeliveryReceipt, HealthReport, InboundActor, InboundAttachment, InboundConversationRef,
     InboundEventEnvelope, InboundMessage, IngressCallbackReply, IngressMode, IngressPayload,
     IngressState, OutboundAttachment, OutboundMessage, PluginRequest, PluginRequestEnvelope,
-    PluginResponse, StatusAcceptance, StatusFrame, StatusKind, capabilities, parse_jsonrpc_request,
-    plugin_error, response_to_jsonrpc,
+    PluginResponse, StatusAcceptance, StatusFrame, StatusKind, capabilities, plugin_error,
+    response_to_jsonrpc,
 };
 use telegram_api::{TelegramClient, TelegramMediaSource, TelegramUpload};
 
@@ -66,18 +66,14 @@ const TRANSPORT_WEBHOOK: &str = "webhook";
 const TRANSPORT_POLLING: &str = "polling";
 
 fn main() -> Result<()> {
-    let stdin = io::stdin().lock();
     let stdout_lock = Arc::new(Mutex::new(()));
     let mut ingress_worker: Option<IngressWorker> = None;
 
-    for line in stdin.lines() {
-        let line = line.context("failed to read stdin")?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let (request_id, envelope) = parse_jsonrpc_request(&line)
-            .map_err(|error| anyhow!("failed to parse channel request: {error}"))?;
+    for request in spawn_plugin_input_reader(
+        Arc::clone(&stdout_lock),
+        parse_plugin_input::<ChannelConfig, OutboundMessage>,
+    ) {
+        let (request_id, envelope) = request?;
         let should_exit = matches!(envelope.request, PluginRequest::Shutdown);
 
         let response = match handle_request(&envelope, &stdout_lock, &mut ingress_worker) {
@@ -121,8 +117,10 @@ fn handle_request(
         PluginRequest::Health { config } => Ok(PluginResponse::Health {
             health: health(config)?,
         }),
-        PluginRequest::PollIngress { config, state } => poll_ingress(config, state.clone()),
-        PluginRequest::StartIngress { config, state } => {
+        PluginRequest::PollIngress { config, state, .. } => poll_ingress(config, state.clone())?
+            .publish(stdout_lock)
+            .map_err(Into::into),
+        PluginRequest::StartIngress { config, state, .. } => {
             let started = start_ingress(config)?;
             let started = match (&started.mode, state.clone()) {
                 (IngressMode::Polling, Some(state)) if state.mode == IngressMode::Polling => state,
@@ -158,7 +156,9 @@ fn handle_request(
         )),
         PluginRequest::IngressEvent {
             config, payload, ..
-        } => handle_ingress_event(config, payload),
+        } => handle_ingress_event(config, payload)?
+            .publish(stdout_lock)
+            .map_err(Into::into),
         PluginRequest::Status { config, update } => Ok(PluginResponse::StatusAccepted {
             status: send_status(config, update)?,
         }),
@@ -190,7 +190,7 @@ fn telegram_poll_ingress(
     config: &ChannelConfig,
     state: Option<IngressState>,
     _context: &IngressPollContext<'_>,
-) -> Result<PluginResponse> {
+) -> Result<IngressCycle> {
     poll_ingress(config, state)
 }
 
@@ -337,16 +337,16 @@ fn stop_ingress(config: &ChannelConfig, state: Option<IngressState>) -> Result<I
     }
 }
 
-fn poll_ingress(config: &ChannelConfig, state: Option<IngressState>) -> Result<PluginResponse> {
+fn poll_ingress(config: &ChannelConfig, state: Option<IngressState>) -> Result<IngressCycle> {
     let ingress_mode = match state.as_ref() {
         Some(state) => state.mode.clone(),
         None => selected_ingress_mode(config)?,
     };
     if !matches!(ingress_mode, IngressMode::Polling) {
-        return Ok(plugin_error(
+        return Ok(IngressCycle::Control(plugin_error(
             "polling_not_supported",
             "telegram poll_ingress requires polling ingress mode",
-        ));
+        )));
     }
 
     let client = TelegramClient::from_env(bot_token_env(config))?;
@@ -386,7 +386,6 @@ fn poll_ingress(config: &ChannelConfig, state: Option<IngressState>) -> Result<P
                 transport: TRANSPORT_POLLING,
                 endpoint_id: None,
                 path: None,
-                host_received_at: None,
             },
             conversation_id,
         )?;
@@ -402,7 +401,7 @@ fn poll_ingress(config: &ChannelConfig, state: Option<IngressState>) -> Result<P
     }
 
     let next_update_id = max_update_id.map(|value| value.saturating_add(1));
-    Ok(PluginResponse::IngressEventsReceived {
+    Ok(IngressCycle::Events {
         events,
         callback_reply: None,
         state: Some(polling_state(config, next_update_id)),
@@ -480,10 +479,7 @@ fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<Delivery
     })
 }
 
-fn handle_ingress_event(
-    config: &ChannelConfig,
-    payload: &IngressPayload,
-) -> Result<PluginResponse> {
+fn handle_ingress_event(config: &ChannelConfig, payload: &IngressPayload) -> Result<IngressCycle> {
     if !payload.method.eq_ignore_ascii_case("POST") {
         return Ok(ingress_rejection(
             405,
@@ -492,7 +488,7 @@ fn handle_ingress_event(
     }
 
     if let Some(reply) = validate_ingress_secret(config, payload)? {
-        return Ok(PluginResponse::IngressEventsReceived {
+        return Ok(IngressCycle::Events {
             events: Vec::new(),
             callback_reply: Some(reply),
             state: None,
@@ -506,7 +502,7 @@ fn handle_ingress_event(
     };
 
     let Some((event_type, message)) = update.event_and_message() else {
-        return Ok(PluginResponse::IngressEventsReceived {
+        return Ok(IngressCycle::Events {
             events: Vec::new(),
             callback_reply: None,
             state: None,
@@ -516,7 +512,7 @@ fn handle_ingress_event(
 
     let conversation_id = telegram_id_to_string(&message.chat.id)?;
     if !chat_is_allowed(config, &conversation_id) {
-        return Ok(PluginResponse::IngressEventsReceived {
+        return Ok(IngressCycle::Events {
             events: Vec::new(),
             callback_reply: None,
             state: None,
@@ -532,7 +528,6 @@ fn handle_ingress_event(
             transport: TRANSPORT_WEBHOOK,
             endpoint_id: payload.endpoint_id.as_deref(),
             path: Some(payload.path.as_str()),
-            host_received_at: payload.received_at.as_deref(),
         },
         conversation_id,
     )?;
@@ -542,14 +537,14 @@ fn handle_ingress_event(
         event.conversation.kind.eq_ignore_ascii_case("private"),
         &event.conversation.kind,
     ) {
-        return Ok(PluginResponse::IngressEventsReceived {
+        return Ok(IngressCycle::Events {
             events: Vec::new(),
             callback_reply: None,
             state: None,
             poll_after_ms: None,
         });
     }
-    Ok(PluginResponse::IngressEventsReceived {
+    Ok(IngressCycle::Events {
         events: vec![event],
         callback_reply: None,
         state: None,
@@ -855,7 +850,7 @@ fn build_inbound_event(
         .reply_to_message
         .as_ref()
         .map(|reply| reply.message_id.to_string());
-    let received_at = received_at(ingress.host_received_at, message.date)?;
+    let received_at = received_at(message.date)?;
     let content = message
         .text
         .clone()
@@ -927,7 +922,6 @@ struct TelegramIngressContext<'a> {
     transport: &'a str,
     endpoint_id: Option<&'a str>,
     path: Option<&'a str>,
-    host_received_at: Option<&'a str>,
 }
 
 fn extract_attachments(
@@ -1156,11 +1150,7 @@ fn inbound_actor(message: &TelegramInboundMessage) -> Result<InboundActor> {
     })
 }
 
-fn received_at(host_received_at: Option<&str>, message_date: i64) -> Result<String> {
-    if let Some(host_received_at) = host_received_at {
-        return Ok(host_received_at.to_string());
-    }
-
+fn received_at(message_date: i64) -> Result<String> {
     Ok(Timestamp::from_second(message_date)
         .context("telegram update date is out of range")?
         .to_string())
@@ -1233,8 +1223,8 @@ fn id_matches_allowlist(allowlist: &[String], value: &str) -> bool {
         .any(|allowed| allowed == "*" || allowed == value)
 }
 
-fn ingress_rejection(status: u16, message: &str) -> PluginResponse {
-    PluginResponse::IngressEventsReceived {
+fn ingress_rejection(status: u16, message: &str) -> IngressCycle {
+    IngressCycle::Events {
         events: Vec::new(),
         callback_reply: Some(callback_reply(status, message)),
         state: None,
@@ -1543,7 +1533,7 @@ mod tests {
         };
 
         let response = handle_ingress_event(&config, &payload).expect("ingress event succeeds");
-        let PluginResponse::IngressEventsReceived {
+        let IngressCycle::Events {
             events,
             callback_reply,
             ..
@@ -1557,7 +1547,19 @@ mod tests {
         let event = &events[0];
         assert_eq!(event.event_id, "telegram:812345678:321");
         assert_eq!(event.event_type, "message.received");
-        assert_eq!(event.received_at, "2026-04-10T21:12:13Z");
+        assert_eq!(
+            event.received_at,
+            Timestamp::from_second(1_710_000_000).unwrap().to_string()
+        );
+        let original = serde_json::to_vec(event).unwrap();
+        let mut redelivered = payload.clone();
+        redelivered.received_at = Some("2026-04-11T21:12:13Z".to_string());
+        let IngressCycle::Events { events, .. } =
+            handle_ingress_event(&config, &redelivered).unwrap()
+        else {
+            panic!("unexpected response variant");
+        };
+        assert_eq!(serde_json::to_vec(&events[0]).unwrap(), original);
         assert_eq!(event.conversation.id, "-1001234567890");
         assert_eq!(event.conversation.kind, "supergroup");
         assert_eq!(event.conversation.thread_id.as_deref(), Some("44"));
@@ -1610,7 +1612,7 @@ mod tests {
         let response = handle_ingress_event(&config, &payload).expect("secret check succeeds");
         set_env_for_test("DISPATCH_TELEGRAM_SECRET", None);
 
-        let PluginResponse::IngressEventsReceived {
+        let IngressCycle::Events {
             events,
             callback_reply,
             ..
@@ -1682,7 +1684,7 @@ mod tests {
         };
 
         let response = handle_ingress_event(&config, &payload).expect("ingress event succeeds");
-        let PluginResponse::IngressEventsReceived { events, .. } = response else {
+        let IngressCycle::Events { events, .. } = response else {
             panic!("unexpected response variant");
         };
 
@@ -1772,7 +1774,7 @@ mod tests {
         )
         .expect("ingress event succeeds");
 
-        let PluginResponse::IngressEventsReceived { events, .. } = response else {
+        let IngressCycle::Events { events, .. } = response else {
             panic!("unexpected response variant");
         };
         assert!(events.is_empty());

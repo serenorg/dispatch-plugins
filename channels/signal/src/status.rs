@@ -12,7 +12,9 @@ use presage::libsignal_service::proto::TypingMessage;
 use presage::libsignal_service::proto::typing_message::Action;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::model::identity::OnNewIdentity;
+use presage::{Manager, manager::Registered};
 use presage_store_sqlite::SqliteStore;
+use std::collections::BTreeMap;
 use tokio::runtime::Builder;
 
 use crate::content_store::SignalStore;
@@ -38,6 +40,95 @@ pub fn handle_status(
     frame: &StatusFrame,
     policy: &SignalChannelPolicy,
 ) -> Result<StatusAcceptance> {
+    let (recipient, action, mut metadata) = match prepare_status(frame, policy)? {
+        PreparedStatus::Accepted(acceptance) => return Ok(acceptance),
+        PreparedStatus::Typing {
+            recipient,
+            action,
+            metadata,
+        } => (recipient, action, metadata),
+    };
+
+    let store_path = resolve_store_path(config)?;
+    if !store_path.exists() {
+        return Err(anyhow!(
+            "Signal session has not been linked yet; run `channel-signal --link` first (store path: {})",
+            store_path.display()
+        ));
+    }
+    let url = to_sqlite_url(&store_path);
+    let passphrase = resolve_passphrase(config)?;
+    let policy = policy.clone();
+
+    let handle = std::thread::Builder::new()
+        .name("channel-signal-status".to_string())
+        .stack_size(SIGNAL_THREAD_STACK_SIZE)
+        .spawn(move || -> Result<TypingOutcome> {
+            let runtime = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to build status-thread tokio runtime")?;
+            runtime.block_on(async {
+                let store = SqliteStore::open_with_passphrase(
+                    &url,
+                    passphrase.as_deref(),
+                    OnNewIdentity::Trust,
+                )
+                .await
+                .with_context(|| format!("failed to open Signal session store at `{url}`"))?;
+                let mut manager = SignalStore::load_registered(store, &policy).await?;
+                send_typing(&mut manager, recipient, action).await
+            })
+        })
+        .context("failed to spawn channel-signal status thread")?;
+
+    let outcome = handle
+        .join()
+        .map_err(|_| anyhow!("channel-signal status thread panicked"))??;
+    metadata.insert(
+        "typing_action".to_string(),
+        typing_action(outcome, action).to_string(),
+    );
+    Ok(StatusAcceptance {
+        accepted: true,
+        metadata,
+    })
+}
+
+pub(crate) async fn status_with_manager(
+    manager: &mut Manager<SignalStore, Registered>,
+    frame: &StatusFrame,
+    policy: &SignalChannelPolicy,
+) -> Result<StatusAcceptance> {
+    let (recipient, action, mut metadata) = match prepare_status(frame, policy)? {
+        PreparedStatus::Accepted(acceptance) => return Ok(acceptance),
+        PreparedStatus::Typing {
+            recipient,
+            action,
+            metadata,
+        } => (recipient, action, metadata),
+    };
+    let outcome = send_typing(manager, recipient, action).await?;
+    metadata.insert(
+        "typing_action".to_string(),
+        typing_action(outcome, action).to_string(),
+    );
+    Ok(StatusAcceptance {
+        accepted: true,
+        metadata,
+    })
+}
+
+enum PreparedStatus {
+    Accepted(StatusAcceptance),
+    Typing {
+        recipient: ServiceId,
+        action: Action,
+        metadata: BTreeMap<String, String>,
+    },
+}
+
+fn prepare_status(frame: &StatusFrame, policy: &SignalChannelPolicy) -> Result<PreparedStatus> {
     let action = match frame.kind {
         StatusKind::Processing | StatusKind::Delivering | StatusKind::OperationStarted => {
             Some(Action::Started)
@@ -57,10 +148,10 @@ pub fn handle_status(
 
     let Some(action) = action else {
         metadata.insert("typing_action".to_string(), "ignored".to_string());
-        return Ok(StatusAcceptance {
+        return Ok(PreparedStatus::Accepted(StatusAcceptance {
             accepted: true,
             metadata,
-        });
+        }));
     };
 
     let recipient_raw = frame
@@ -83,63 +174,25 @@ pub fn handle_status(
     {
         metadata.insert("typing_action".to_string(), "ignored".to_string());
         metadata.insert("recipient".to_string(), recipient_raw);
-        return Ok(StatusAcceptance {
+        return Ok(PreparedStatus::Accepted(StatusAcceptance {
             accepted: true,
             metadata,
-        });
+        }));
     }
 
-    let store_path = resolve_store_path(config)?;
-    if !store_path.exists() {
-        return Err(anyhow!(
-            "Signal session has not been linked yet; run `channel-signal --link` first (store path: {})",
-            store_path.display()
-        ));
-    }
-    let url = to_sqlite_url(&store_path);
-    let passphrase = resolve_passphrase(config)?;
-    let policy = policy.clone();
-
-    let handle = std::thread::Builder::new()
-        .name("channel-signal-status".to_string())
-        .stack_size(SIGNAL_THREAD_STACK_SIZE)
-        .spawn(move || -> Result<TypingOutcome> {
-            let runtime = Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("failed to build status-thread tokio runtime")?;
-            runtime.block_on(send_typing(url, passphrase, recipient, action, policy))
-        })
-        .context("failed to spawn channel-signal status thread")?;
-
-    let outcome = handle
-        .join()
-        .map_err(|_| anyhow!("channel-signal status thread panicked"))??;
-
-    metadata.insert(
-        "typing_action".to_string(),
-        typing_action(outcome, action).to_string(),
-    );
     metadata.insert("recipient".to_string(), recipient_raw);
-    Ok(StatusAcceptance {
-        accepted: true,
+    Ok(PreparedStatus::Typing {
+        recipient,
+        action,
         metadata,
     })
 }
 
 async fn send_typing(
-    url: String,
-    passphrase: Option<String>,
+    manager: &mut Manager<SignalStore, Registered>,
     recipient: ServiceId,
     action: Action,
-    policy: SignalChannelPolicy,
 ) -> Result<TypingOutcome> {
-    let store =
-        SqliteStore::open_with_passphrase(&url, passphrase.as_deref(), OnNewIdentity::Trust)
-            .await
-            .with_context(|| format!("failed to open Signal session store at `{url}`"))?;
-    let mut manager = SignalStore::load_registered(store, &policy).await?;
-
     // Signal cannot send typing indicators to Note to Self.
     let own_aci = Aci::from(manager.registration_data().service_ids.aci).into();
     if !should_send_typing(&recipient, &own_aci) {

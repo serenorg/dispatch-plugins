@@ -1,11 +1,7 @@
 //! Outbound delivery for the native presage-backed Signal plugin.
 //!
-//! Sends are implemented by spinning a short-lived dedicated OS
-//! thread that owns its own current-thread tokio runtime and its own
-//! Manager loaded from the shared SQLite store. This mirrors the
-//! receive worker's pattern and satisfies presage's `!Send` store
-//! constraint (libsignal stores hold `Rc<UnsafeCell<_>>` internally
-//! and cannot cross work-stealing tokio workers).
+//! A running receive worker sends through its shared Manager. Standalone
+//! requests use a short-lived OS thread and current-thread tokio runtime.
 //!
 //! Outbound delivery supports plain text. The recipient is
 //! resolved from `message.metadata.conversation_id` first, then
@@ -23,6 +19,7 @@ use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::libsignal_service::sender::AttachmentSpec;
 use presage::model::identity::OnNewIdentity;
+use presage::{Manager, manager::Registered};
 use presage_store_sqlite::SqliteStore;
 use std::collections::BTreeMap;
 use tokio::runtime::Builder;
@@ -49,17 +46,9 @@ pub fn deliver_text_message(
     message: &OutboundMessage,
     policy: &SignalChannelPolicy,
 ) -> Result<DeliveryReceipt> {
-    let recipient_raw =
-        policy.authorize_outbound_recipient(&resolve_recipient_raw(config, message)?)?;
-    let recipient = parse_service_id(&recipient_raw)?;
-    let content = message.content.trim().to_string();
-
-    let prepared_attachments = prepare_outbound_attachments(&message.attachments)?;
-    if content.is_empty() && prepared_attachments.is_empty() {
-        return Err(anyhow!(
-            "channel-signal requires a non-empty `message.content` or at least one attachment for outbound delivery"
-        ));
-    }
+    let prepared = prepare_message(config, message, policy)?;
+    let recipient_raw = prepared.recipient_raw.clone();
+    let attachment_count = prepared.attachments.len();
 
     let store_path = resolve_store_path(config)?;
     if !store_path.exists() {
@@ -70,7 +59,6 @@ pub fn deliver_text_message(
     }
     let url = to_sqlite_url(&store_path);
     let passphrase = resolve_passphrase(config)?;
-    let attachment_count = prepared_attachments.len();
     let policy = policy.clone();
 
     let handle = std::thread::Builder::new()
@@ -81,14 +69,17 @@ pub fn deliver_text_message(
                 .enable_all()
                 .build()
                 .context("failed to build send-thread tokio runtime")?;
-            runtime.block_on(send_message_inner(
-                url,
-                passphrase,
-                recipient,
-                content,
-                prepared_attachments,
-                policy,
-            ))
+            runtime.block_on(async {
+                let store = SqliteStore::open_with_passphrase(
+                    &url,
+                    passphrase.as_deref(),
+                    OnNewIdentity::Trust,
+                )
+                .await
+                .with_context(|| format!("failed to open Signal session store at `{url}`"))?;
+                let mut manager = SignalStore::load_registered(store, &policy).await?;
+                send_message_inner(&mut manager, prepared).await
+            })
         })
         .context("failed to spawn channel-signal send thread")?;
 
@@ -96,19 +87,78 @@ pub fn deliver_text_message(
         .join()
         .map_err(|_| anyhow!("channel-signal send thread panicked"))??;
 
+    Ok(delivery_receipt(
+        recipient_raw,
+        attachment_count,
+        timestamp_ms,
+    ))
+}
+
+pub(crate) async fn deliver_with_manager(
+    manager: &mut Manager<SignalStore, Registered>,
+    config: &ChannelConfig,
+    message: &OutboundMessage,
+    policy: &SignalChannelPolicy,
+) -> Result<DeliveryReceipt> {
+    let prepared = prepare_message(config, message, policy)?;
+    let recipient_raw = prepared.recipient_raw.clone();
+    let attachment_count = prepared.attachments.len();
+    let timestamp_ms = send_message_inner(manager, prepared).await?;
+    Ok(delivery_receipt(
+        recipient_raw,
+        attachment_count,
+        timestamp_ms,
+    ))
+}
+
+struct PreparedMessage {
+    recipient_raw: String,
+    recipient: ServiceId,
+    content: String,
+    attachments: Vec<(AttachmentSpec, Vec<u8>)>,
+}
+
+fn prepare_message(
+    config: &ChannelConfig,
+    message: &OutboundMessage,
+    policy: &SignalChannelPolicy,
+) -> Result<PreparedMessage> {
+    let recipient_raw =
+        policy.authorize_outbound_recipient(&resolve_recipient_raw(config, message)?)?;
+    let recipient = parse_service_id(&recipient_raw)?;
+    let content = message.content.trim().to_string();
+    let attachments = prepare_outbound_attachments(&message.attachments)?;
+    if content.is_empty() && attachments.is_empty() {
+        return Err(anyhow!(
+            "channel-signal requires a non-empty `message.content` or at least one attachment for outbound delivery"
+        ));
+    }
+    Ok(PreparedMessage {
+        recipient_raw,
+        recipient,
+        content,
+        attachments,
+    })
+}
+
+fn delivery_receipt(
+    recipient_raw: String,
+    attachment_count: usize,
+    timestamp_ms: u64,
+) -> DeliveryReceipt {
     let mut metadata = BTreeMap::new();
     metadata.insert("platform".to_string(), PLATFORM_SIGNAL.to_string());
     metadata.insert("transport".to_string(), "websocket".to_string());
     metadata.insert("signal_timestamp_ms".to_string(), timestamp_ms.to_string());
     metadata.insert("attachment_count".to_string(), attachment_count.to_string());
-    Ok(DeliveryReceipt {
+    DeliveryReceipt {
         reference: MessageRef {
             conversation_id: recipient_raw,
             message_id: timestamp_ms.to_string(),
             thread_id: None,
         },
         metadata,
-    })
+    }
 }
 
 /// Decode base64-inlined attachment payloads and pair each with an
@@ -147,18 +197,15 @@ fn prepare_outbound_attachments(
 }
 
 async fn send_message_inner(
-    url: String,
-    passphrase: Option<String>,
-    recipient: ServiceId,
-    content: String,
-    attachments: Vec<(AttachmentSpec, Vec<u8>)>,
-    policy: SignalChannelPolicy,
+    manager: &mut Manager<SignalStore, Registered>,
+    prepared: PreparedMessage,
 ) -> Result<u64> {
-    let store =
-        SqliteStore::open_with_passphrase(&url, passphrase.as_deref(), OnNewIdentity::Trust)
-            .await
-            .with_context(|| format!("failed to open Signal session store at `{url}`"))?;
-    let mut manager = SignalStore::load_registered(store, &policy).await?;
+    let PreparedMessage {
+        recipient,
+        content,
+        attachments,
+        ..
+    } = prepared;
 
     let uploaded = if attachments.is_empty() {
         Vec::new()

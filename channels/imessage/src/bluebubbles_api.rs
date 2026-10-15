@@ -25,6 +25,7 @@ pub enum ImessageError {
     UnsupportedProtocolVersion,
     PollingNotSupported,
     UnsupportedRequest,
+    EventDeliveryFailed,
 }
 
 impl ImessageError {
@@ -46,6 +47,7 @@ impl ImessageError {
             Self::UnsupportedProtocolVersion => "unsupported_protocol_version",
             Self::PollingNotSupported => "polling_not_supported",
             Self::UnsupportedRequest => "unsupported_request",
+            Self::EventDeliveryFailed => "event_delivery_failed",
         }
     }
 }

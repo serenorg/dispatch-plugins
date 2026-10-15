@@ -155,7 +155,7 @@ The plugin transport is JSON-RPC 2.0 over JSONL on stdio. For the full wire form
 - `poll_ingress` performs one `getUpdates` cycle when configured for polling mode
 - `start_ingress` deletes the webhook and starts a background receive loop when configured for polling mode
 - webhook payloads are parsed through `ingress_event`
-- polling events are delivered back to Dispatch as `channel.event` notifications
+- polling events are delivered back to Dispatch as durable `channel.event` batches of at most 32 updates; the `getUpdates` offset that confirms them to Telegram advances only with a batch the host has durably accepted
 
 Common failure modes:
 

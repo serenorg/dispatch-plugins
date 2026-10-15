@@ -94,7 +94,7 @@ With `self_chat_only: true`, use a linked session and set `dm_policy` to `open` 
 
 For account-only linking, set `self_chat_only: true` and `dm_policy: "open"` with empty sender and outbound lists. The plugin derives the allowlist from the linked session.
 
-Self-chat mode passes the intended Note to Self messages to the host without saving local copies of message text or attachments. It saves only validated self-chat expiration settings, registration, and cryptographic protocol state needed to keep the device connected. It does not save contacts, profiles, groups, avatars, or sticker packs. Signal still sends account traffic to linked devices, and the library decrypts and processes it before the plugin filters host events. The plugin preserves the self-chat's disappearing-message timer when replying.
+Self-chat mode passes the intended Note to Self messages to the host without saving message text or attachments in the Signal session store. The host ingress journal still holds pending event batches until the host accepts them. The Signal session store saves only validated self-chat expiration settings, registration, and cryptographic protocol state needed to keep the device connected. It does not save contacts, profiles, groups, avatars, or sticker packs. Signal still sends account traffic to linked devices, and the library decrypts and processes it before the plugin filters host events. The plugin preserves the self-chat's disappearing-message timer when replying.
 
 Enabling self-chat mode does not erase content saved by earlier sessions. Existing unrelated records remain hidden from the plugin's content operations. Use a dedicated session store for self-chat mode if the account previously ran with ordinary message storage.
 
@@ -142,24 +142,26 @@ The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Dispatch operators nor
 
 ## Ingress model
 
-- `poll_ingress` opens a single WebSocket to Signal, drains all queued messages until Signal reports `QueueEmpty`, then closes. Useful for CLI-driven `dispatch channel poll --once` and for short-lived environments.
-- `start_ingress` / `stop_ingress` run a persistent background receive worker on a dedicated OS thread with its own tokio current-thread runtime. The worker sends inbound messages to the host as `channel.event` notifications without waiting for another JSON-RPC request.
+- `poll_ingress` opens a receive session to Signal and drains queued messages until Signal reports `QueueEmpty`, the poll timeout elapses, or 30 events have been delivered, then closes. The event limit keeps one poll within the host's per-request acceptance page. Useful for CLI-driven `dispatch channel poll --once` and for short-lived environments; use `start_ingress` for continuous delivery. Polling is rejected while background ingress is running, so it cannot open a competing receiver.
+- `start_ingress` / `stop_ingress` run a persistent background receive worker on a dedicated OS thread with its own tokio current-thread runtime and local task set. The worker submits inbound messages to the host as ID-bearing `channel.event` batches without waiting for another JSON-RPC request.
+
+While background ingress runs, delivery and typing commands use clones of its registered Manager, sharing its cached Signal sockets and SQLite pool. Sends and receive-session opening are coordinated without stopping the current receiver. Once the worker has loaded the Signal session, commands continue while ingress waits for a host receipt or reconnect backoff. A command that arrives while the session is still loading waits for the load; if loading keeps failing, the plugin exits without sending it. The plugin never retries a failed send. If the socket closes or the worker stops during a send, the plugin reports an error and the delivery outcome is unknown. Commands with a changed configuration are rejected; restart ingress before using the new configuration. Without background ingress, delivery and status requests retain their standalone send path.
 
 The plugin always owns the upstream receive loop. There is no webhook or polling-of-third-party-service transport.
 
-## Delivery guarantee
+## Delivery boundary and limitations
 
-Inbound delivery is best effort. Messages can be lost or processed more than once. Do not rely on this plugin for messages that must never be lost or duplicated.
+The plugin uses unmodified upstream `presage` and `libsignal-service`. Their receive path queues an acknowledgment to Signal before `presage` decrypts the envelope and yields content to the plugin. This receive path exposes no way for the plugin to delay that acknowledgment. It cannot guarantee delivery from Signal to the host without a loss window.
 
-`presage` processes each message before yielding it to the plugin. Ordinary mode stores messages; self-chat mode stores only expiration settings. The plugin then writes a `channel.event` notification to stdout. It has no local outbox and the protocol has no host-acceptance acknowledgement, so a crash or a failed stdout write between those two steps drops that message with no replay path. A write failure ends the receive session, which the supervisor reports, but the upstream message has already been consumed.
+Plugin-controlled durability starts when the host ingress journal saves and fsyncs a `channel.event` batch. Fsync asks the operating system to persist the file. The plugin journals each batch before it sends the batch, then waits for a receipt that matches the exact batch. A missing receipt, delivery error, or requested stop leaves the journaled batch for replay before the next receive session. These guarantees cover journaled batches, not all envelopes that Signal sends.
 
-Redelivery is equally unprotected in the other direction: the host allocates a new execution identifier for every notification and does not claim the provider event id, so a message that did arrive twice would produce two runs and two replies.
+A crash before that journal write can lose an event even though Signal already received an acknowledgment. Upstream can read ahead and acknowledge up to three buffered envelopes that it has not yet yielded, plus one being decrypted or processed. Dropping the receive stream on stop, a poll timeout or event limit, or a plugin-side error can discard these envelopes. A remote stream close does not itself discard the queued envelopes if the plugin keeps polling the stream until it ends. Each poll ends its session, so polling remains best effort and incurs this boundary on every call. A message that arrives while the plugin is stopping is still journaled if upstream has already yielded it.
 
-Reliable delivery without duplicate runs needs all three of the following, none of which exist yet:
+Upstream crypto state updates and decoded content storage do not share an atomic receive transaction. Ciphertext redelivery alone is not a recovery guarantee after crypto state advances. Upstream logs some decryption or storage failures without exposing a retryable error to the plugin. Some decryption failures never yield content. Sharing the running worker's Manager prevents outbound requests from independently opening competing identified sockets; it does not close the acknowledgment-before-journal loss window.
 
-- a host-side claim on `(organization, deployment, binding, platform account, provider event id)` taken before a run is created, so redelivery is collapsed into one run and one reply;
-- an explicit host-acceptance acknowledgement in the channel protocol, so the plugin learns when a notification is durably held rather than merely written;
-- a plugin-side outbox that retains an event until that acknowledgement arrives.
+Messages outside the binding policy and non-event traffic produce no host batch. The plugin retains the upstream receive loop for account, key, contact, and group processing. Transport or host-delivery errors that reach the plugin trigger supervision. After five consecutive receive-session failures, the supervisor exits so that the host can replace the plugin. This does not recover envelopes that upstream already acknowledged but never journaled.
+
+A journal replay after a lost receipt delivers the same event again. Consumers must deduplicate by `event_id` (`signal:<sender ACI>:<sender timestamp>`). The plugin does not recover unjournaled events from its Signal session history. Messages that Signal no longer retains when the plugin reconnects cannot be recovered.
 
 Both ingress paths emit the same `InboundEventEnvelope` shape:
 

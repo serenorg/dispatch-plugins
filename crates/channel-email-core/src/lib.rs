@@ -3,16 +3,16 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use dispatch_channel_protocol as proto;
 use dispatch_channel_runtime::{
-    IngressPollContext, IngressWorker, StopSignal,
-    restart_ingress_worker as restart_runtime_ingress_worker, stop_ingress_worker,
-    write_stdout_line,
+    IngressCycle, IngressPollContext, IngressWorker, StopSignal,
+    restart_ingress_worker as restart_runtime_ingress_worker, spawn_plugin_input_reader,
+    stop_ingress_worker, write_stdout_line,
 };
 use jiff::Timestamp;
 use mail_parser::{MessageParser, MimeHeaders};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    io::{self, BufRead},
+    io,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -28,13 +28,12 @@ use imap_smtp::{
 };
 
 pub use imap_smtp::{FetchedEmail, MailboxStatus, OutgoingAttachment, OutgoingEmail, SentEmail};
+use proto::parse_plugin_input;
 pub use proto::{
-    AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities,
-    ChannelEventNotification, ConfiguredChannel, DeliveryReceipt, HealthReport, InboundActor,
-    InboundAttachment, InboundConversationRef, InboundEventEnvelope, InboundMessage, IngressMode,
-    IngressState, OutboundMessageEnvelope, PluginNotificationEnvelope, PluginResponse,
-    StatusAcceptance, ThreadingModel, notification_to_jsonrpc, parse_jsonrpc_request, plugin_error,
-    response_to_jsonrpc,
+    AttachmentSource, CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelCapabilities, ConfiguredChannel,
+    DeliveryReceipt, HealthReport, InboundActor, InboundAttachment, InboundConversationRef,
+    InboundEventEnvelope, InboundMessage, IngressMode, IngressState, OutboundMessageEnvelope,
+    PluginResponse, StatusAcceptance, ThreadingModel, plugin_error, response_to_jsonrpc,
 };
 
 const META_PLATFORM: &str = "platform";
@@ -121,12 +120,8 @@ pub type EmailResult<T> = std::result::Result<T, EmailCoreError>;
 pub enum EmailCoreError {
     #[error(transparent)]
     Io(#[from] io::Error),
-    #[error("failed to read stdin: {0}")]
-    ReadStdin(io::Error),
     #[error(transparent)]
     Runtime(#[from] dispatch_channel_runtime::RuntimeError),
-    #[error("failed to parse channel request: {0}")]
-    RequestParse(proto::JsonRpcMessageError),
     #[error("failed to encode channel response: {0}")]
     ResponseEncode(proto::JsonRpcMessageError),
     #[error("configuration error: {0}")]
@@ -169,18 +164,14 @@ pub fn capabilities<P: EmailPreset>() -> ChannelCapabilities {
 }
 
 pub fn run<P: EmailPreset>() -> EmailResult<()> {
-    let stdin = io::stdin().lock();
     let stdout_lock = Arc::new(Mutex::new(()));
     let mut ingress_worker: Option<IngressWorker> = None;
 
-    for line in stdin.lines() {
-        let line = line.map_err(EmailCoreError::ReadStdin)?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let (request_id, envelope): (_, PluginRequestEnvelope) =
-            parse_jsonrpc_request(&line).map_err(EmailCoreError::RequestParse)?;
+    for request in spawn_plugin_input_reader(
+        Arc::clone(&stdout_lock),
+        parse_plugin_input::<ChannelConfig, OutboundMessageEnvelope>,
+    ) {
+        let (request_id, envelope): (_, PluginRequestEnvelope) = request?;
         let should_exit = matches!(envelope.request, PluginRequest::Shutdown);
 
         let response = match handle_request::<P>(&envelope, &stdout_lock, &mut ingress_worker) {
@@ -225,8 +216,12 @@ fn handle_request<P: EmailPreset>(
         PluginRequest::Health { config } => Ok(PluginResponse::Health {
             health: health::<P>(config)?,
         }),
-        PluginRequest::PollIngress { config, state } => poll_ingress::<P>(config, state.clone()),
-        PluginRequest::StartIngress { config, state } => {
+        PluginRequest::PollIngress { config, state, .. } => {
+            poll_ingress::<P>(config, state.clone())?
+                .publish(stdout_lock)
+                .map_err(Into::into)
+        }
+        PluginRequest::StartIngress { config, state, .. } => {
             let started = start_ingress::<P>(config)?;
             let started = match (&started.mode, state.clone()) {
                 (IngressMode::Polling, Some(state)) if state.mode == IngressMode::Polling => state,
@@ -301,7 +296,7 @@ fn email_poll_ingress<P: EmailPreset>(
     config: &ChannelConfig,
     state: Option<IngressState>,
     _context: &IngressPollContext<'_>,
-) -> Result<PluginResponse> {
+) -> Result<IngressCycle> {
     poll_ingress::<P>(config, state)
 }
 
@@ -464,7 +459,7 @@ fn stop_ingress<P: EmailPreset>(
 fn poll_ingress<P: EmailPreset>(
     config: &ChannelConfig,
     state: Option<IngressState>,
-) -> Result<PluginResponse> {
+) -> Result<IngressCycle> {
     require_imap_config::<P>(config)?;
 
     let last_uid = state
@@ -480,7 +475,7 @@ fn poll_ingress<P: EmailPreset>(
 
     let poll = fetch_messages_since::<P>(config, last_uid)?;
     if prior_uid_validity.is_some() && poll.mailbox.uid_validity != prior_uid_validity {
-        return Ok(PluginResponse::IngressEventsReceived {
+        return Ok(IngressCycle::Events {
             events: Vec::new(),
             callback_reply: None,
             state: Some(polling_state::<P>(
@@ -493,24 +488,66 @@ fn poll_ingress<P: EmailPreset>(
         });
     }
 
-    let mut events = Vec::new();
-    for fetched in &poll.messages {
-        if let Some(event) = build_inbound_event::<P>(config, &poll.mailbox, fetched)? {
-            events.push(event);
-        }
-    }
+    batch_polled_messages::<P>(config, &poll, last_uid)
+}
 
-    Ok(PluginResponse::IngressEventsReceived {
-        events,
-        callback_reply: None,
+fn batch_polled_messages<P: EmailPreset>(
+    config: &ChannelConfig,
+    poll: &imap_smtp::ImapPollResult,
+    last_uid: Option<u32>,
+) -> Result<IngressCycle> {
+    let poll_after_ms = Some(u64::from(poll_interval_secs(config)) * 1_000);
+    // One batch must fit the channel byte bound. The cursor covers only the
+    // messages included here; later messages are fetched by the next poll.
+    let mut used = proto::canonical_channel_batch_bytes(&proto::ChannelEventBatch {
+        events: Vec::new(),
         state: Some(polling_state::<P>(
             config,
             "running",
             &poll.mailbox,
-            poll.latest_uid,
+            Some(u32::MAX),
         )),
-        poll_after_ms: Some(u64::from(poll_interval_secs(config)) * 1_000),
+        poll_after_ms,
     })
+    .map_err(|error| anyhow!("failed to measure email batch: {error}"))?
+    .len();
+    let mut events = Vec::new();
+    let mut cursor = poll.latest_uid;
+    let mut consumed_uid = last_uid;
+    for fetched in &poll.messages {
+        let Some(event) = build_inbound_event::<P>(config, &poll.mailbox, fetched)? else {
+            consumed_uid = Some(fetched.uid);
+            continue;
+        };
+        let budget = proto::MAX_CHANNEL_BATCH_BYTES.saturating_sub(used + 1);
+        let size = serialized_len(&event)?;
+        if size > budget {
+            if !events.is_empty() {
+                cursor = consumed_uid;
+                break;
+            }
+            return Err(anyhow!(
+                "email UID {} exceeds the channel batch limit; mailbox cursor was not advanced",
+                fetched.uid
+            ));
+        }
+        used += size + 1;
+        events.push(event);
+        consumed_uid = Some(fetched.uid);
+    }
+
+    Ok(IngressCycle::Events {
+        events,
+        callback_reply: None,
+        state: Some(polling_state::<P>(config, "running", &poll.mailbox, cursor)),
+        poll_after_ms,
+    })
+}
+
+fn serialized_len(event: &InboundEventEnvelope) -> Result<usize> {
+    Ok(serde_json::to_vec(event)
+        .context("failed to measure email event")?
+        .len())
 }
 
 fn deliver<P: EmailPreset>(
@@ -1095,6 +1132,63 @@ mod tests {
         const DEFAULT_SMTP_HOST: Option<&'static str> = None;
         const DEFAULT_IMAP_PASSWORD_ENV: &'static str = "EMAIL_IMAP_PASSWORD";
         const DEFAULT_SMTP_PASSWORD_ENV: &'static str = "EMAIL_SMTP_PASSWORD";
+    }
+
+    #[test]
+    fn oversized_message_keeps_original_and_does_not_advance_cursor() {
+        let body = "\u{1}x".repeat(proto::MAX_CHANNEL_BATCH_BYTES);
+        let raw = format!(
+            "From: Sender <sender@example.com>\r\nMessage-ID: <big@example.com>\r\nSubject: Large\r\nContent-Type: text/plain; charset=\"utf-8\"\r\n\r\n{body}\r\n"
+        );
+        let oversized = FetchedEmail {
+            uid: 2,
+            raw_message: raw.into_bytes(),
+        };
+        let small = FetchedEmail {
+            uid: 1,
+            raw_message: b"From: Sender <sender@example.com>\r\nMessage-ID: <small@example.com>\r\nSubject: Small\r\n\r\nhello\r\n".to_vec(),
+        };
+        let mailbox = MailboxStatus {
+            mailbox: "INBOX".to_string(),
+            uid_next: Some(3),
+            uid_validity: Some(1),
+            exists: 2,
+            recent: 2,
+        };
+        let poll = imap_smtp::ImapPollResult {
+            mailbox: mailbox.clone(),
+            latest_uid: Some(2),
+            messages: vec![small, oversized.clone()],
+        };
+        let IngressCycle::Events { events, state, .. } =
+            batch_polled_messages::<GenericEmailPreset>(&ChannelConfig::default(), &poll, None)
+                .unwrap()
+        else {
+            panic!("expected email events");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            state
+                .unwrap()
+                .metadata
+                .get(META_LAST_UID)
+                .map(String::as_str),
+            Some("1")
+        );
+        let original = oversized.raw_message.clone();
+        let blocked = imap_smtp::ImapPollResult {
+            mailbox,
+            latest_uid: Some(2),
+            messages: vec![oversized],
+        };
+        let error = batch_polled_messages::<GenericEmailPreset>(
+            &ChannelConfig::default(),
+            &blocked,
+            Some(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("UID 2 exceeds"));
+        assert_eq!(blocked.messages[0].raw_message, original);
     }
 
     #[test]

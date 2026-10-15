@@ -1,10 +1,13 @@
+use dispatch_channel_protocol::parse_plugin_input;
+use dispatch_channel_runtime::{IngressCycle, spawn_plugin_input_reader, write_stdout_line};
 use hmac::{Hmac, KeyInit, Mac};
 use jiff::Timestamp;
 use serde_json::Value;
 use sha1::Sha1;
 use std::{
     collections::BTreeMap,
-    io::{self, BufRead, Write},
+    io,
+    sync::{Arc, Mutex},
 };
 use url::form_urlencoded;
 
@@ -20,25 +23,21 @@ use protocol::{
     HealthReport, InboundActor, InboundAttachment, InboundConversationRef, InboundEventEnvelope,
     InboundMessage, IngressCallbackReply, IngressMode, IngressPayload, IngressState, MessageRef,
     OutboundMessage, PluginRequest, PluginRequestEnvelope, PluginResponse, StatusAcceptance,
-    capabilities, parse_jsonrpc_request, plugin_error, response_to_jsonrpc,
+    capabilities, plugin_error, response_to_jsonrpc,
 };
 
 fn main() -> io::Result<()> {
-    let stdin = io::stdin().lock();
-    let mut stdout = io::stdout().lock();
-    for line in stdin.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let (request_id, envelope) = parse_jsonrpc_request(&line)
-            .map_err(|_| io::Error::other("invalid_channel_request"))?;
-        let response = handle_request(&envelope)
+    let stdout_lock = Arc::new(Mutex::new(()));
+    for request in spawn_plugin_input_reader(
+        Arc::clone(&stdout_lock),
+        parse_plugin_input::<ChannelConfig, OutboundMessage>,
+    ) {
+        let (request_id, envelope) = request.map_err(io::Error::other)?;
+        let response = handle_request(&envelope, &stdout_lock)
             .unwrap_or_else(|error| plugin_error(error.code(), error.code()));
         let json = response_to_jsonrpc(&request_id, &response)
             .map_err(|_| io::Error::other("invalid_channel_response"))?;
-        writeln!(stdout, "{json}")?;
-        stdout.flush()?;
+        write_stdout_line(&stdout_lock, &json).map_err(io::Error::other)?;
         if matches!(envelope.request, PluginRequest::Shutdown) {
             break;
         }
@@ -46,7 +45,10 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
+fn handle_request(
+    envelope: &PluginRequestEnvelope,
+    stdout_lock: &Arc<Mutex<()>>,
+) -> Result<PluginResponse> {
     if envelope.protocol_version != CHANNEL_PLUGIN_PROTOCOL_VERSION {
         return Err(ImessageError::UnsupportedProtocolVersion);
     }
@@ -100,7 +102,9 @@ fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
             };
             handle_ingress_event(payload, password.as_deref(), |chat| {
                 BlueBubblesClient::from_env(config)?.verify_dm_chat(chat)
-            })
+            })?
+            .publish(stdout_lock)
+            .map_err(|_| ImessageError::EventDeliveryFailed)
         }
         PluginRequest::PollIngress { .. } => Err(ImessageError::PollingNotSupported),
         PluginRequest::GetMessage { .. } | PluginRequest::GetPermalink { .. } => {
@@ -176,7 +180,7 @@ fn handle_ingress_event(
     payload: &IngressPayload,
     password: Option<&str>,
     verify_chat: impl FnOnce(ImessageDmChat<'_>) -> Result<()>,
-) -> Result<PluginResponse> {
+) -> Result<IngressCycle> {
     if !payload.trust_verified && !verify_password(payload, password) {
         return Ok(ingress_reply(401, vec![]));
     }
@@ -232,8 +236,8 @@ fn verify_password(payload: &IngressPayload, expected: Option<&str>) -> bool {
         .is_ok()
 }
 
-fn ingress_reply(status: u16, events: Vec<InboundEventEnvelope>) -> PluginResponse {
-    PluginResponse::IngressEventsReceived {
+fn ingress_reply(status: u16, events: Vec<InboundEventEnvelope>) -> IngressCycle {
+    IngressCycle::Events {
         events,
         callback_reply: Some(IngressCallbackReply {
             status,
@@ -401,7 +405,7 @@ mod tests {
     }
 
     fn outcome(payload: &IngressPayload, secret: Option<&str>) -> (Vec<InboundEventEnvelope>, u16) {
-        let PluginResponse::IngressEventsReceived {
+        let IngressCycle::Events {
             events,
             callback_reply,
             ..
@@ -535,6 +539,7 @@ mod tests {
 
     #[test]
     fn deliver_and_push_reject_unsupported_messages_before_credentials() {
+        let stdout_lock = Arc::new(Mutex::new(()));
         let config = ChannelConfig {
             bluebubbles_url_env: Some(String::new()),
             ..Default::default()
@@ -560,7 +565,7 @@ mod tests {
                     request,
                 };
                 assert_eq!(
-                    handle_request(&envelope).unwrap_err(),
+                    handle_request(&envelope, &stdout_lock).unwrap_err(),
                     ImessageError::DmRequired
                 );
             }
@@ -586,7 +591,7 @@ mod tests {
                 request,
             };
             assert_eq!(
-                handle_request(&envelope).unwrap_err(),
+                handle_request(&envelope, &stdout_lock).unwrap_err(),
                 ImessageError::OutboundAttachmentsUnsupported
             );
         }
@@ -717,7 +722,7 @@ mod tests {
             if let Some(error) = error {
                 assert_eq!(result.unwrap_err(), error);
             } else {
-                let PluginResponse::IngressEventsReceived {
+                let IngressCycle::Events {
                     events,
                     callback_reply,
                     ..
@@ -748,7 +753,7 @@ mod tests {
             .remove("service");
         let server = HttpFixture::new(vec![(200, chat_response(guid, 45).to_string())]);
         let client = server.client();
-        let PluginResponse::IngressEventsReceived { events, .. } =
+        let IngressCycle::Events { events, .. } =
             handle_ingress_event(&payload(body), Some("test-secret"), |chat| {
                 client.verify_dm_chat(chat)
             })
@@ -768,7 +773,7 @@ mod tests {
                 let mut body = unspecified_chat_fixture();
                 body["data"]["chats"][0]["guid"] = json!(guid);
                 body["data"]["handle"]["service"] = service;
-                let PluginResponse::IngressEventsReceived {
+                let IngressCycle::Events {
                     events,
                     callback_reply,
                     ..
@@ -783,7 +788,7 @@ mod tests {
                 assert_eq!(callback_reply.unwrap().status, 200);
             }
         }
-        let PluginResponse::IngressEventsReceived {
+        let IngressCycle::Events {
             events,
             callback_reply,
             ..

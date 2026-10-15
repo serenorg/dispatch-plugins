@@ -2,17 +2,19 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use dispatch_channel_protocol::{
-    ChannelEventNotification, FetchedMessage, FetchedMessageAuthor, MessagePermalink, MessageRef,
-    PluginNotificationEnvelope, notification_to_jsonrpc,
+    ChannelEventBatch, FetchedMessage, FetchedMessageAuthor, MessagePermalink, MessageRef,
+    parse_plugin_input,
 };
-use dispatch_channel_runtime::write_stdout_line;
+use dispatch_channel_runtime::{
+    IngressCycle, deliver_channel_event_batch_until, replay_pending_event_batch_until,
+    spawn_plugin_input_reader, write_stdout_line,
+};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    io::{self, BufRead},
     net::TcpStream,
     sync::{
         Arc, Mutex, PoisonError,
@@ -42,7 +44,7 @@ use protocol::{
     InboundConversationRef, InboundEventEnvelope, InboundMessage, IngressCallbackReply,
     IngressMode, IngressPayload, IngressState, OutboundMessage, PluginRequest,
     PluginRequestEnvelope, PluginResponse, StatusAcceptance, StatusFrame, StatusKind, capabilities,
-    parse_jsonrpc_request, plugin_error, response_to_jsonrpc,
+    plugin_error, response_to_jsonrpc,
 };
 
 const META_REASON: &str = "reason";
@@ -112,11 +114,11 @@ const META_FRAMES_OTHER_DISPATCH: &str = "frames_other_dispatch";
 const META_MESSAGES_DECODED: &str = "messages_decoded";
 const META_MESSAGE_DECODE_ERRORS: &str = "message_decode_errors";
 const META_MESSAGES_ACCEPTED: &str = "messages_accepted";
-const META_NOTIFICATIONS_EMITTED: &str = "notifications_emitted";
+const META_EVENTS_DELIVERED: &str = "events_delivered";
 const META_LAST_DISPATCH_FRAME_AT: &str = "last_dispatch_frame_at";
 const META_LAST_MESSAGE_FRAME_AT: &str = "last_message_frame_at";
 const META_LAST_HEARTBEAT_AT: &str = "last_heartbeat_at";
-const META_LAST_NOTIFICATION_AT: &str = "last_notification_at";
+const META_LAST_EVENT_DELIVERED_AT: &str = "last_event_delivered_at";
 /// True while a decode or event delivery failure remains unresolved. Reports
 /// only observed failures; it never claims an unproven healthy path.
 const META_EVENT_PATH_DEGRADED: &str = "event_path_degraded";
@@ -199,11 +201,12 @@ const REJECT_NOT_ADDRESSED: &str = "not_addressed";
 const REJECT_EMPTY_MESSAGE: &str = "empty_message";
 const REJECT_APPLICATION_MISMATCH: &str = "application_mismatch";
 const REJECT_INVALID_POLICY: &str = "invalid_policy";
+const REJECT_INVALID_TIMESTAMP: &str = "invalid_timestamp";
 const REJECT_MISSING_DESTINATION: &str = "missing_destination";
 const REJECT_UNAUTHORIZED_DESTINATION: &str = "unauthorized_destination";
 const REJECT_CHANNEL_TARGET_DENIED: &str = "channel_target_denied";
-/// A channel event notification could not be written to the host.
-const REJECT_NOTIFICATION_WRITE: &str = "notification_write_error";
+/// A channel event batch was not durably accepted by the host.
+const REJECT_EVENT_DELIVERY: &str = "event_delivery_error";
 
 // Discord message type discriminants. Only ordinary and reply messages carry a
 // user request; the rest are provider system notices about the channel itself.
@@ -244,19 +247,15 @@ const DISCORD_SESSION_STABILITY_WINDOW: Duration = Duration::from_secs(60);
 const DISCORD_MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
 fn main() -> Result<()> {
-    let stdin = io::stdin().lock();
     let stdout_lock = Arc::new(Mutex::new(()));
     let mut ingress_worker: Option<DiscordIngressWorker> = None;
     let mut typing_manager = DiscordTypingManager::default();
 
-    for line in stdin.lines() {
-        let line = line.context("failed to read stdin")?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let (request_id, envelope) = parse_jsonrpc_request(&line)
-            .map_err(|error| anyhow!("failed to parse channel request: {error}"))?;
+    for request in spawn_plugin_input_reader(
+        Arc::clone(&stdout_lock),
+        parse_plugin_input::<ChannelConfig, OutboundMessage>,
+    ) {
+        let (request_id, envelope) = request?;
         let should_exit = matches!(envelope.request, PluginRequest::Shutdown);
 
         let response = match handle_request(
@@ -313,10 +312,12 @@ fn handle_request(
             typing_manager.write_metadata(&mut report.metadata);
             Ok(PluginResponse::Health { health: report })
         }
-        PluginRequest::PollIngress { config, state } => {
-            handle_websocket_receive(config, state.as_ref())
+        PluginRequest::PollIngress { config, state, .. } => {
+            handle_websocket_receive(config, state.as_ref())?
+                .publish(stdout_lock)
+                .map_err(Into::into)
         }
-        PluginRequest::StartIngress { config, state } => {
+        PluginRequest::StartIngress { config, state, .. } => {
             let started = start_ingress(config)?;
             let started = match (&started.mode, state.clone()) {
                 (IngressMode::Websocket, Some(state)) if state.mode == IngressMode::Websocket => {
@@ -359,7 +360,9 @@ fn handle_request(
         PluginRequest::GetPermalink { config, reference } => get_permalink(config, reference),
         PluginRequest::IngressEvent {
             config, payload, ..
-        } => handle_ingress_event(config, payload),
+        } => handle_ingress_event(config, payload)?
+            .publish(stdout_lock)
+            .map_err(Into::into),
         PluginRequest::Status { config, update } => Ok(PluginResponse::StatusAccepted {
             status: send_status(config, update, typing_manager)?,
         }),
@@ -1720,6 +1723,14 @@ fn restart_ingress_worker(
     let worker_stop = Arc::clone(&stop);
     let worker_state = Arc::clone(&shared_state);
     let handle = thread::spawn(move || {
+        let stopped = || worker_stop.load(Ordering::Relaxed);
+        if let Err(error) = replay_pending_event_batch_until(&stdout_lock, &stopped) {
+            if stopped() {
+                return;
+            }
+            eprintln!("discord ingress replay failed: {error}");
+            std::process::exit(1);
+        }
         run_discord_websocket_worker(config, state, worker_stop, worker_state, stdout_lock);
     });
     *worker = Some(DiscordIngressWorker {
@@ -1803,7 +1814,7 @@ fn websocket_ingress_state(policy: &DiscordPolicy, identity: &DiscordBotIdentity
     let mut metadata = websocket_state_metadata();
     metadata.insert(
         META_HOST_ACTION.to_string(),
-        "keep a Discord websocket connection open and emit message events as channel.event notifications".to_string(),
+        "keep a Discord websocket connection open and deliver message events as durable channel.event batches".to_string(),
     );
     metadata.insert(META_BOT_USER_ID.to_string(), identity.account_id.clone());
     metadata.extend(policy.diagnostics());
@@ -1851,10 +1862,7 @@ fn stop_ingress(config: &ChannelConfig, state: Option<IngressState>) -> Result<I
     Ok(stopped)
 }
 
-fn handle_ingress_event(
-    config: &ChannelConfig,
-    payload: &IngressPayload,
-) -> Result<PluginResponse> {
+fn handle_ingress_event(config: &ChannelConfig, payload: &IngressPayload) -> Result<IngressCycle> {
     if !payload.method.eq_ignore_ascii_case("POST") {
         return Ok(ingress_rejection(
             405,
@@ -1863,7 +1871,7 @@ fn handle_ingress_event(
     }
 
     if let Some(reply) = validate_ingress_signature(config, payload)? {
-        return Ok(PluginResponse::IngressEventsReceived {
+        return Ok(IngressCycle::Events {
             events: Vec::new(),
             callback_reply: Some(reply),
             state: None,
@@ -1882,7 +1890,7 @@ fn handle_ingress_event(
     };
 
     if interaction.interaction_type == INTERACTION_TYPE_PING {
-        return Ok(PluginResponse::IngressEventsReceived {
+        return Ok(IngressCycle::Events {
             events: Vec::new(),
             callback_reply: Some(discord_json_reply(json!({ "type": INTERACTION_TYPE_PING }))),
             state: None,
@@ -1899,7 +1907,7 @@ fn handle_ingress_event(
             // An unresolvable policy authorizes nothing, including an
             // interaction the provider addressed to this application.
             debug_discord_reject(REJECT_INVALID_POLICY, &interaction.id);
-            return Ok(PluginResponse::IngressEventsReceived {
+            return Ok(IngressCycle::Events {
                 events: Vec::new(),
                 callback_reply: Some(discord_ephemeral_message(
                     "This Discord binding is not configured for this request.",
@@ -1911,7 +1919,7 @@ fn handle_ingress_event(
     };
 
     match build_inbound_event(&policy, &interaction, payload) {
-        InteractionOutcome::Event(event) => Ok(PluginResponse::IngressEventsReceived {
+        InteractionOutcome::Event(event) => Ok(IngressCycle::Events {
             events: vec![*event],
             callback_reply: Some(discord_ephemeral_message(
                 "Dispatch is processing your request.",
@@ -1921,7 +1929,7 @@ fn handle_ingress_event(
         }),
         InteractionOutcome::Rejected(reason) => {
             debug_discord_reject(reason, &interaction.id);
-            Ok(PluginResponse::IngressEventsReceived {
+            Ok(IngressCycle::Events {
                 events: Vec::new(),
                 callback_reply: Some(discord_ephemeral_message(
                     "This Discord conversation is not allowed for this binding.",
@@ -1938,7 +1946,7 @@ fn handle_ingress_event(
             } else {
                 "This Discord interaction type is not implemented by this plugin."
             };
-            Ok(PluginResponse::IngressEventsReceived {
+            Ok(IngressCycle::Events {
                 events: Vec::new(),
                 callback_reply: Some(discord_ephemeral_message(message)),
                 state: None,
@@ -1951,14 +1959,14 @@ fn handle_ingress_event(
 fn handle_websocket_receive(
     config: &ChannelConfig,
     state: Option<&IngressState>,
-) -> Result<PluginResponse> {
+) -> Result<IngressCycle> {
     discord_websocket_receive(config, state.cloned())
 }
 
 fn discord_websocket_receive(
     config: &ChannelConfig,
     state: Option<IngressState>,
-) -> Result<PluginResponse> {
+) -> Result<IngressCycle> {
     let client = DiscordClient::from_env(bot_token_env(config))?;
     let mut session = DiscordGatewaySession::from_state(state.as_ref());
     let policy = DiscordPolicy::from_config(config)?;
@@ -1981,7 +1989,7 @@ fn discord_websocket_receive(
     loop {
         let now = Instant::now();
         if now >= deadline {
-            return Ok(PluginResponse::IngressEventsReceived {
+            return Ok(IngressCycle::Events {
                 events: Vec::new(),
                 callback_reply: None,
                 state: Some(session.to_state("running")),
@@ -2036,7 +2044,7 @@ fn discord_websocket_receive(
             Ok(Message::Pong(_)) => {}
             Ok(Message::Close(frame)) => {
                 let close_action = handle_discord_close_frame(&mut session, frame.as_ref());
-                return Ok(PluginResponse::IngressEventsReceived {
+                return Ok(IngressCycle::Events {
                     events: Vec::new(),
                     callback_reply: None,
                     state: Some(session.to_state(discord_close_status(close_action))),
@@ -2053,7 +2061,7 @@ fn discord_websocket_receive(
                 continue;
             }
             Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
-                return Ok(PluginResponse::IngressEventsReceived {
+                return Ok(IngressCycle::Events {
                     events: Vec::new(),
                     callback_reply: None,
                     state: Some(session.to_state("closed")),
@@ -2155,16 +2163,17 @@ fn apply_gateway_action(
     session: &mut DiscordGatewaySession,
     shared_state: &Arc<Mutex<Option<IngressState>>>,
     stdout_lock: &Arc<Mutex<()>>,
+    stop: &AtomicBool,
     healthy_since: &mut Option<Instant>,
 ) -> Result<Option<IngressState>> {
     match action {
         DiscordGatewayAction::Event(event) => {
-            emit_gateway_notification(session, shared_state, stdout_lock, vec![*event])?;
+            deliver_gateway_batch(session, shared_state, stdout_lock, stop, vec![*event])?;
             healthy_since.get_or_insert_with(Instant::now);
             Ok(None)
         }
         DiscordGatewayAction::Heartbeat => {
-            emit_gateway_notification(session, shared_state, stdout_lock, Vec::new())?;
+            deliver_gateway_batch(session, shared_state, stdout_lock, stop, Vec::new())?;
             healthy_since.get_or_insert_with(Instant::now);
             Ok(None)
         }
@@ -2176,27 +2185,42 @@ fn apply_gateway_action(
     }
 }
 
-fn emit_gateway_notification(
+fn deliver_gateway_batch(
     session: &mut DiscordGatewaySession,
     shared_state: &Arc<Mutex<Option<IngressState>>>,
     stdout_lock: &Arc<Mutex<()>>,
+    stop: &AtomicBool,
     events: Vec<InboundEventEnvelope>,
 ) -> Result<()> {
     let counters_before = session.counters.clone();
     if !events.is_empty() {
-        session.counters.record_emitted();
+        session.counters.record_delivered();
     }
     let state = session.to_state("running");
-    match emit_channel_event_notification(stdout_lock, events, Some(state.clone()), Some(0)) {
+    match deliver_event_batch(stdout_lock, stop, events, Some(state.clone()), Some(0)) {
         Ok(()) => {
             set_worker_state(shared_state, state);
             Ok(())
         }
         Err(error) => {
             session.counters = counters_before;
-            session.counters.record_rejection(REJECT_NOTIFICATION_WRITE);
+            session.counters.record_rejection(REJECT_EVENT_DELIVERY);
             session.counters.mark_emission_failed();
-            set_worker_state(shared_state, session.to_state("running"));
+            // Resume from the last confirmed sequence so Discord replays the
+            // unconfirmed dispatch; only the failure counters move forward.
+            let mut failed = session.to_state("running");
+            let confirmed = shared_state.lock().ok().and_then(|guard| guard.clone());
+            for key in ["sequence", "session_id", "resume_gateway_url"] {
+                match confirmed.as_ref().and_then(|state| state.metadata.get(key)) {
+                    Some(value) => {
+                        failed.metadata.insert(key.to_string(), value.clone());
+                    }
+                    None => {
+                        failed.metadata.remove(key);
+                    }
+                }
+            }
+            set_worker_state(shared_state, failed);
             Err(error)
         }
     }
@@ -2257,6 +2281,7 @@ fn run_discord_websocket_session(
                     &mut session,
                     shared_state,
                     stdout_lock,
+                    stop,
                     &mut *healthy_since,
                 )? {
                     return Ok(state);
@@ -2276,6 +2301,7 @@ fn run_discord_websocket_session(
                     &mut session,
                     shared_state,
                     stdout_lock,
+                    stop,
                     &mut *healthy_since,
                 )? {
                     return Ok(state);
@@ -2330,23 +2356,23 @@ fn sleep_until_stopped(stop: &AtomicBool, duration: Duration) {
     }
 }
 
-fn emit_channel_event_notification(
+fn deliver_event_batch(
     stdout_lock: &Arc<Mutex<()>>,
+    stop: &AtomicBool,
     events: Vec<InboundEventEnvelope>,
     state: Option<IngressState>,
     poll_after_ms: Option<u64>,
 ) -> Result<()> {
-    let envelope = PluginNotificationEnvelope {
-        protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
-        notification: ChannelEventNotification {
+    deliver_channel_event_batch_until(
+        stdout_lock,
+        ChannelEventBatch {
             events,
             state,
             poll_after_ms,
         },
-    };
-    let json = notification_to_jsonrpc(&envelope)
-        .map_err(|error| anyhow!("failed to encode channel event notification: {error}"))?;
-    write_stdout_line(stdout_lock, &json).context("failed to write channel event notification")
+        &|| stop.load(Ordering::Relaxed),
+    )
+    .context("failed to confirm channel event batch")
 }
 
 /// Dispatch frame class used by content-free counters.
@@ -2367,13 +2393,13 @@ struct GatewayCounters {
     messages_decoded: u64,
     message_decode_errors: u64,
     messages_accepted: u64,
-    notifications_emitted: u64,
+    events_delivered: u64,
     rejections: BTreeMap<String, u64>,
     last_dispatch_frame_at: Option<String>,
     last_message_frame_at: Option<String>,
     last_heartbeat_at: Option<String>,
-    last_notification_at: Option<String>,
-    /// Cleared only after an event notification succeeds.
+    last_event_delivered_at: Option<String>,
+    /// Cleared only after an event batch is durably accepted.
     event_path_degraded: bool,
 }
 
@@ -2408,9 +2434,9 @@ impl GatewayCounters {
         self.messages_accepted = self.messages_accepted.saturating_add(1);
     }
 
-    fn record_emitted(&mut self) {
-        self.notifications_emitted = self.notifications_emitted.saturating_add(1);
-        self.last_notification_at = Some(now_timestamp());
+    fn record_delivered(&mut self) {
+        self.events_delivered = self.events_delivered.saturating_add(1);
+        self.last_event_delivered_at = Some(now_timestamp());
         self.event_path_degraded = false;
     }
 
@@ -2452,8 +2478,8 @@ impl GatewayCounters {
             self.messages_accepted.to_string(),
         );
         metadata.insert(
-            META_NOTIFICATIONS_EMITTED.to_string(),
-            self.notifications_emitted.to_string(),
+            META_EVENTS_DELIVERED.to_string(),
+            self.events_delivered.to_string(),
         );
         metadata.insert(
             META_EVENT_PATH_DEGRADED.to_string(),
@@ -2475,8 +2501,8 @@ impl GatewayCounters {
         insert_optional(metadata, META_LAST_HEARTBEAT_AT, &self.last_heartbeat_at);
         insert_optional(
             metadata,
-            META_LAST_NOTIFICATION_AT,
-            &self.last_notification_at,
+            META_LAST_EVENT_DELIVERED_AT,
+            &self.last_event_delivered_at,
         );
     }
 
@@ -2504,12 +2530,12 @@ impl GatewayCounters {
             messages_decoded: count(META_MESSAGES_DECODED),
             message_decode_errors: count(META_MESSAGE_DECODE_ERRORS),
             messages_accepted: count(META_MESSAGES_ACCEPTED),
-            notifications_emitted: count(META_NOTIFICATIONS_EMITTED),
+            events_delivered: count(META_EVENTS_DELIVERED),
             rejections,
             last_dispatch_frame_at: metadata.get(META_LAST_DISPATCH_FRAME_AT).cloned(),
             last_message_frame_at: metadata.get(META_LAST_MESSAGE_FRAME_AT).cloned(),
             last_heartbeat_at: metadata.get(META_LAST_HEARTBEAT_AT).cloned(),
-            last_notification_at: metadata.get(META_LAST_NOTIFICATION_AT).cloned(),
+            last_event_delivered_at: metadata.get(META_LAST_EVENT_DELIVERED_AT).cloned(),
             event_path_degraded: metadata
                 .get(META_EVENT_PATH_DEGRADED)
                 .map(|value| value == "true")
@@ -2608,27 +2634,27 @@ enum DiscordGatewayCloseAction {
 fn discord_gateway_action_response(
     action: DiscordGatewayAction,
     session: &mut DiscordGatewaySession,
-) -> PluginResponse {
+) -> IngressCycle {
     match action {
         DiscordGatewayAction::Event(event) => {
-            // The ingress response is the polling path's event delivery, so it
-            // counts as emitted and clears the degraded flag like a websocket
-            // notification does.
-            session.counters.record_emitted();
-            PluginResponse::IngressEventsReceived {
+            // The confirmed polling batch is this path's event delivery, so it
+            // counts as delivered and clears the degraded flag like a websocket
+            // batch does.
+            session.counters.record_delivered();
+            IngressCycle::Events {
                 events: vec![*event],
                 callback_reply: None,
                 state: Some(session.to_state("running")),
                 poll_after_ms: Some(0),
             }
         }
-        DiscordGatewayAction::Heartbeat => PluginResponse::IngressEventsReceived {
+        DiscordGatewayAction::Heartbeat => IngressCycle::Events {
             events: Vec::new(),
             callback_reply: None,
             state: Some(session.to_state("running")),
             poll_after_ms: Some(0),
         },
-        DiscordGatewayAction::Reconnect => PluginResponse::IngressEventsReceived {
+        DiscordGatewayAction::Reconnect => IngressCycle::Events {
             events: Vec::new(),
             callback_reply: None,
             state: Some(session.to_state("reconnect")),
@@ -2720,7 +2746,7 @@ fn handle_discord_gateway_text(
                     return Ok(None);
                 }
             }
-            // Keep decode errors visible until an event notification succeeds.
+            // Keep decode errors visible until an event batch is durably accepted.
             let message: DiscordGatewayMessage = match serde_json::from_value(payload.data) {
                 Ok(message) => message,
                 Err(error) => {
@@ -3039,10 +3065,10 @@ fn build_websocket_inbound_event(
         event_id: message.id.clone(),
         platform: PLATFORM_DISCORD.to_string(),
         event_type: "message.created".to_string(),
-        received_at: message
-            .timestamp
-            .clone()
-            .unwrap_or_else(|| Timestamp::now().to_string()),
+        received_at: match message.timestamp.as_deref() {
+            Some(timestamp) if !timestamp.trim().is_empty() => timestamp.to_string(),
+            _ => discord_snowflake_timestamp(&message.id).map_err(|_| REJECT_INVALID_TIMESTAMP)?,
+        },
         conversation: InboundConversationRef {
             id: authorized.scope.id.clone(),
             kind: authorized.scope.kind.name().to_string(),
@@ -3710,7 +3736,13 @@ fn build_inbound_event(
         Err(reason) => return InteractionOutcome::Rejected(reason),
     };
 
-    let received_at = received_at(payload.received_at.as_deref());
+    let received_at = match discord_snowflake_timestamp(&interaction.id) {
+        Ok(timestamp) => timestamp,
+        Err(_) => match payload.received_at.as_deref() {
+            Some(observed) => observed.to_string(),
+            None => return InteractionOutcome::Rejected(REJECT_INVALID_TIMESTAMP),
+        },
+    };
     let (content, mut message_metadata) = interaction_message(interaction);
     let attachments = extract_source_attachments(interaction, &mut message_metadata);
     let mut event_metadata = BTreeMap::new();
@@ -4302,14 +4334,22 @@ fn source_message_id_or_interaction_id(interaction: &DiscordInteraction) -> Stri
         .unwrap_or_else(|| interaction.id.clone())
 }
 
-fn received_at(host_received_at: Option<&str>) -> String {
-    host_received_at
-        .map(str::to_owned)
-        .unwrap_or_else(|| Timestamp::now().to_string())
+fn discord_snowflake_timestamp(id: &str) -> Result<String> {
+    // Discord documents 42 timestamp bits above the lower 22 bits, measured
+    // in milliseconds since its 2015 epoch.
+    let snowflake: u64 = id.parse().context("discord snowflake is invalid")?;
+    let milliseconds = (snowflake >> 22)
+        .checked_add(1_420_070_400_000)
+        .context("discord snowflake timestamp overflow")?;
+    Ok(Timestamp::from_millisecond(
+        i64::try_from(milliseconds).context("discord snowflake timestamp overflow")?,
+    )
+    .context("discord snowflake timestamp is out of range")?
+    .to_string())
 }
 
-fn ingress_rejection(status: u16, message: &str) -> PluginResponse {
-    PluginResponse::IngressEventsReceived {
+fn ingress_rejection(status: u16, message: &str) -> IngressCycle {
+    IngressCycle::Events {
         events: Vec::new(),
         callback_reply: Some(callback_reply(status, message)),
         state: None,
@@ -4986,7 +5026,7 @@ mod tests {
     fn interaction_events(config: &ChannelConfig, body: &str) -> Vec<InboundEventEnvelope> {
         let payload = base_payload(body);
         match handle_ingress_event(config, &payload).expect("handle ingress") {
-            PluginResponse::IngressEventsReceived { events, .. } => events,
+            IngressCycle::Events { events, .. } => events,
             other => panic!("unexpected response: {other:?}"),
         }
     }
@@ -5013,7 +5053,7 @@ mod tests {
             handle_ingress_event(&ChannelConfig::default(), &payload).expect("handle ingress");
 
         match response {
-            PluginResponse::IngressEventsReceived {
+            IngressCycle::Events {
                 events,
                 callback_reply,
                 ..
@@ -5029,14 +5069,14 @@ mod tests {
     }
 
     #[test]
-    fn gateway_heartbeat_action_emits_an_empty_liveness_notification() {
+    fn gateway_heartbeat_action_emits_an_empty_state_batch() {
         let mut session = DiscordGatewaySession::from_state(None);
 
         let response =
             discord_gateway_action_response(DiscordGatewayAction::Heartbeat, &mut session);
 
         match response {
-            PluginResponse::IngressEventsReceived {
+            IngressCycle::Events {
                 events,
                 state,
                 poll_after_ms,
@@ -5098,7 +5138,7 @@ mod tests {
         let response = handle_ingress_event(&scoped_config(), &payload).expect("handle ingress");
 
         match response {
-            PluginResponse::IngressEventsReceived {
+            IngressCycle::Events {
                 events,
                 callback_reply,
                 ..
@@ -5223,6 +5263,37 @@ mod tests {
         let mut message = guild_message(OTHER_CHANNEL, "just chatting");
         message.guild_id = Some(OTHER_GUILD.to_string());
         assert!(emit_with_lookup(&line_config(), &message, &UnexpectedLookup).is_none());
+    }
+
+    #[test]
+    fn websocket_message_without_a_usable_timestamp_uses_a_stable_rejection_reason() {
+        let config = line_config();
+        let policy = DiscordPolicy::from_config(&config).expect("policy");
+        let identity = bot_identity();
+        let lookup = MapChannelLookup {
+            channels: BTreeMap::new(),
+        };
+        let context = DiscordIngressContext {
+            config: &config,
+            policy: &policy,
+            identity: &identity,
+            lookup: &lookup,
+        };
+        let mut message = direct_message("hello shared bot");
+        message.author = discord_user("unknown-sender", false);
+        message.timestamp = None;
+        message.id = "not-a-snowflake".to_string();
+        assert_eq!(
+            build_websocket_inbound_event(&context, &message).unwrap_err(),
+            REJECT_INVALID_TIMESTAMP
+        );
+        message.id = "1000000000000000000".to_string();
+        assert_eq!(
+            build_websocket_inbound_event(&context, &message)
+                .unwrap()
+                .received_at,
+            discord_snowflake_timestamp("1000000000000000000").unwrap()
+        );
     }
 
     #[test]
@@ -5601,7 +5672,7 @@ mod tests {
         counters.record_frame(GatewayFrameKind::MessageCreate);
         counters.record_decoded();
         counters.record_accepted();
-        counters.record_emitted();
+        counters.record_delivered();
         counters.record_rejection(REJECT_NOT_ADDRESSED);
 
         let mut metadata = BTreeMap::new();
@@ -5620,7 +5691,7 @@ mod tests {
             Some("1")
         );
         assert_eq!(
-            metadata.get(META_NOTIFICATIONS_EMITTED).map(String::as_str),
+            metadata.get(META_EVENTS_DELIVERED).map(String::as_str),
             Some("1")
         );
         assert_eq!(
@@ -5642,7 +5713,7 @@ mod tests {
     }
 
     #[test]
-    fn event_path_stays_degraded_after_decode_error_until_a_notification_is_emitted() {
+    fn event_path_stays_degraded_after_decode_error_until_an_event_batch_is_delivered() {
         let mut counters = GatewayCounters::default();
         counters.record_decode_error();
         assert!(
@@ -5658,7 +5729,7 @@ mod tests {
 
         counters.record_accepted();
         assert!(counters.event_path_degraded);
-        counters.record_emitted();
+        counters.record_delivered();
         assert!(!counters.event_path_degraded);
     }
 
@@ -5670,7 +5741,7 @@ mod tests {
             .record_frame(GatewayFrameKind::MessageCreate);
         session.counters.record_decoded();
         session.counters.record_accepted();
-        session.counters.record_emitted();
+        session.counters.record_delivered();
 
         let state = session.to_state("reconnect");
         let resumed = DiscordGatewaySession::from_state(Some(&state));
@@ -5694,15 +5765,15 @@ mod tests {
             &mut session,
         );
 
-        assert_eq!(session.counters.notifications_emitted, 1);
+        assert_eq!(session.counters.events_delivered, 1);
         assert!(!session.counters.event_path_degraded);
-        let PluginResponse::IngressEventsReceived { events, state, .. } = response else {
+        let IngressCycle::Events { events, state, .. } = response else {
             panic!("expected an ingress events response");
         };
         assert_eq!(events.len(), 1);
         let metadata = state.expect("state").metadata;
         assert_eq!(
-            metadata.get(META_NOTIFICATIONS_EMITTED).map(String::as_str),
+            metadata.get(META_EVENTS_DELIVERED).map(String::as_str),
             Some("1")
         );
         assert_eq!(
@@ -5762,12 +5833,15 @@ mod tests {
         assert!(matches!(ready, Some(DiscordGatewayAction::Heartbeat)));
 
         let accepted = drive(
-            r#"{"op":0,"s":2,"t":"MESSAGE_CREATE","d":{"id":"msg-10","channel_id":"channel-marketing","content":"hello","guild_id":"guild-marketing","author":{"id":"member-1","username":"member"},"type":0,"mentions":[{"id":"bot-account-1","username":"dispatch","bot":true}]}}"#,
+            r#"{"op":0,"s":2,"t":"MESSAGE_CREATE","d":{"id":"msg-10","channel_id":"channel-marketing","content":"hello","timestamp":"2026-05-04T00:00:00Z","guild_id":"guild-marketing","author":{"id":"member-1","username":"member"},"type":0,"mentions":[{"id":"bot-account-1","username":"dispatch","bot":true}]}}"#,
         );
-        assert!(matches!(accepted, Some(DiscordGatewayAction::Event(_))));
+        let Some(DiscordGatewayAction::Event(event)) = accepted else {
+            panic!("the addressed message must produce an event");
+        };
+        assert_eq!(event.received_at, "2026-05-04T00:00:00Z");
 
         let unauthorized = drive(
-            r#"{"op":0,"s":3,"t":"MESSAGE_CREATE","d":{"id":"msg-11","channel_id":"channel-team-chat","content":"hello","guild_id":"guild-marketing","author":{"id":"member-1","username":"member"},"type":0,"mentions":[{"id":"bot-account-1","username":"dispatch","bot":true}]}}"#,
+            r#"{"op":0,"s":3,"t":"MESSAGE_CREATE","d":{"id":"msg-11","channel_id":"channel-team-chat","content":"hello","timestamp":"2026-05-04T00:00:00Z","guild_id":"guild-marketing","author":{"id":"member-1","username":"member"},"type":0,"mentions":[{"id":"bot-account-1","username":"dispatch","bot":true}]}}"#,
         );
         assert!(unauthorized.is_none());
 
@@ -5788,6 +5862,8 @@ mod tests {
             counters.rejections.get(REJECT_UNAUTHORIZED_CHANNEL),
             Some(&1)
         );
+        // The channel denial is the only rejection; no fixture fails on its timestamp.
+        assert_eq!(counters.rejections.len(), 1);
         assert!(counters.last_heartbeat_at.is_some());
         assert!(
             counters.event_path_degraded,
@@ -6708,6 +6784,32 @@ mod tests {
     }
 
     #[test]
+    fn interaction_redelivery_uses_snowflake_time_not_host_observation() {
+        let config = ChannelConfig {
+            dm_policy: Some(DM_POLICY_OPEN.to_string()),
+            ..scoped_config()
+        };
+        let mut interaction = bot_dm_interaction_body();
+        interaction["id"] = json!("1000000000000000000");
+        let mut payload = base_payload(&interaction.to_string());
+        let IngressCycle::Events { events, .. } = handle_ingress_event(&config, &payload).unwrap()
+        else {
+            panic!("expected interaction events");
+        };
+        let original = serde_json::to_vec(&events[0]).unwrap();
+        assert_eq!(
+            events[0].received_at,
+            discord_snowflake_timestamp("1000000000000000000").unwrap()
+        );
+        payload.received_at = Some("2026-04-12T21:00:00Z".to_string());
+        let IngressCycle::Events { events, .. } = handle_ingress_event(&config, &payload).unwrap()
+        else {
+            panic!("expected interaction events");
+        };
+        assert_eq!(serde_json::to_vec(&events[0]).unwrap(), original);
+    }
+
+    #[test]
     fn guild_interactions_require_matching_provider_coordinates() {
         for config in [scoped_config(), line_config()] {
             let mut body: Value =
@@ -6822,7 +6924,7 @@ mod tests {
         };
         assert!(interaction_events(&invalid_policy, &body.to_string()).is_empty());
         let ping = base_payload(r#"{"id":"ping","application_id":"app-1","type":1,"context":255}"#);
-        let PluginResponse::IngressEventsReceived {
+        let IngressCycle::Events {
             events,
             callback_reply,
             ..
@@ -8424,7 +8526,7 @@ mod tests {
         let response = handle_ingress_event(&scoped_config(), &payload).expect("handle ingress");
 
         match response {
-            PluginResponse::IngressEventsReceived {
+            IngressCycle::Events {
                 events,
                 callback_reply,
                 ..
@@ -8646,7 +8748,7 @@ mod tests {
         .expect("handle ingress");
 
         match response {
-            PluginResponse::IngressEventsReceived { events, .. } => assert!(events.is_empty()),
+            IngressCycle::Events { events, .. } => assert!(events.is_empty()),
             other => panic!("unexpected response: {other:?}"),
         }
     }

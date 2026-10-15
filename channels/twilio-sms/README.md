@@ -23,6 +23,8 @@ Behavior:
 - ingress verifies Twilio webhook signatures and parses inbound SMS webhooks
 - inbound status callbacks are acknowledged but not turned into Dispatch events
 
+Each `ingress_event` confirms a `channel.event` batch with the host, including an empty batch when a callback is ignored or rejected, and the plugin answers the request, including any HTTP callback reply, only after the exact durable host receipt. A callback that repeats the accepted batch resends that accepted original instead of journaling a new one. A request that fails before it produces a batch returns a plugin error and confirms nothing. An unconfirmed journaled batch remains pending and is replayed before the next batch. Whether Twilio retries a failed callback follows the provider's delivery policy; consumers must deduplicate by stable event ID.
+
 Not implemented:
 
 - attachment upload from inline data or staged storage keys

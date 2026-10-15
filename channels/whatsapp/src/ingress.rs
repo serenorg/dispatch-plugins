@@ -1,13 +1,22 @@
 use anyhow::{Context, Result, anyhow};
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use dispatch_channel_protocol::{ChannelEventBatch, MAX_CHANNEL_BATCH_EVENTS};
+use dispatch_channel_runtime::{
+    deliver_channel_event_batch_until, publish_channel_heartbeat, replay_pending_event_batch_until,
+};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use whatsapp_rust::Client;
 use whatsapp_rust::TokioRuntime;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::proto_helpers::MessageExt;
+use whatsapp_rust::types::durability_hook::{
+    InboundDurabilityHook, InboundMessage as WaInboundMessage,
+};
 use whatsapp_rust::types::events::Event;
 use whatsapp_rust::types::message::MessageInfo;
 use whatsapp_rust::waproto::whatsapp as wa;
@@ -23,11 +32,162 @@ use crate::protocol::{
 use crate::store::{resolve_store_path, to_sqlite_url};
 
 const PLATFORM_WHATSAPP: &str = "whatsapp";
+
+/// Byte budget for one chunk's events, below the channel batch bound.
+const CHUNK_EVENT_BYTES: usize = 1_500_000;
+/// Batches one `poll_ingress` request may submit. Of the host's 32-frame
+/// acceptance page, slots stay free for a replayed pending original, the
+/// re-send of a chunk whose receipt wait was stopped, and the final state batch.
+const POLL_BATCH_BUDGET: usize = 29;
+
+/// Delivery state shared by the durability hook, the event callback, and the
+/// receive loop that owns them.
+struct HookDelivery {
+    stdout_lock: Arc<Mutex<()>>,
+    policy: WhatsAppPolicy,
+    account_id: String,
+    stop: Arc<AtomicBool>,
+    /// Set when a batch was not durably accepted; its provider ACK is withheld
+    /// and the server redelivers it only after a reconnect.
+    failed: AtomicBool,
+    delivered: AtomicUsize,
+    poll_budget: Option<AtomicUsize>,
+}
+
+impl HookDelivery {
+    fn new(
+        stdout_lock: Arc<Mutex<()>>,
+        policy: WhatsAppPolicy,
+        account_id: String,
+        stop: Arc<AtomicBool>,
+        poll_mode: bool,
+    ) -> Self {
+        Self {
+            stdout_lock,
+            policy,
+            account_id,
+            stop,
+            failed: AtomicBool::new(false),
+            delivered: AtomicUsize::new(0),
+            poll_budget: poll_mode.then(|| AtomicUsize::new(POLL_BATCH_BUDGET)),
+        }
+    }
+
+    /// Durably deliver every chunk of one library batch, or fail the whole
+    /// batch so the library withholds all of its provider ACKs.
+    fn deliver(&self, messages: &[WaInboundMessage]) -> Result<()> {
+        let stopped = || self.stop.load(Ordering::Relaxed);
+        replay_pending_event_batch_until(&self.stdout_lock, &stopped)?;
+        let chunks = inbound_event_chunks(
+            messages
+                .iter()
+                .map(|item| (item.message.as_ref(), item.info.as_ref())),
+            &self.policy,
+            &self.account_id,
+        )?;
+        if let Some(budget) = &self.poll_budget
+            && budget
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(chunks.len())
+                })
+                .is_err()
+        {
+            // Refuse before any chunk is submitted; the next poll receives it.
+            self.stop.store(true, Ordering::Relaxed);
+            return Err(anyhow!(
+                "WhatsApp batch exceeds this poll's acceptance page and will be redelivered"
+            ));
+        }
+        accept_chunks(chunks, |batch| {
+            let count = batch.events.len();
+            deliver_channel_event_batch_until(&self.stdout_lock, batch, &stopped)?;
+            self.delivered.fetch_add(count, Ordering::Relaxed);
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
+fn accept_chunks(
+    chunks: Vec<Vec<InboundEventEnvelope>>,
+    mut accept: impl FnMut(ChannelEventBatch) -> Result<()>,
+) -> Result<()> {
+    for events in chunks {
+        accept(ChannelEventBatch {
+            events,
+            state: None,
+            poll_after_ms: None,
+        })?;
+    }
+    Ok(())
+}
+
+/// Journal writes and receipt waits block, so they run off the receive runtime.
+async fn deliver_off_runtime(
+    delivery: Arc<HookDelivery>,
+    messages: Vec<WaInboundMessage>,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || delivery.deliver(&messages))
+        .await
+        .map_err(|error| anyhow!("WhatsApp durable delivery task failed: {error}"))?
+}
+
+struct DurableIngressHook {
+    delivery: Arc<HookDelivery>,
+}
+
+#[whatsapp_rust::async_trait]
+impl InboundDurabilityHook for DurableIngressHook {
+    async fn on_messages(&self, _client: Arc<Client>, batch: &[WaInboundMessage]) -> Result<()> {
+        let result = deliver_off_runtime(Arc::clone(&self.delivery), batch.to_vec()).await;
+        if result.is_err() {
+            self.delivery.failed.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+/// Map one library batch to channel chunks of at most 32 events within the
+/// byte budget. A repeated provider identity in the batch is delivered once.
+fn inbound_event_chunks<'a>(
+    messages: impl IntoIterator<Item = (&'a wa::Message, &'a MessageInfo)>,
+    policy: &WhatsAppPolicy,
+    account_id: &str,
+) -> Result<Vec<Vec<InboundEventEnvelope>>> {
+    let mut chunks = Vec::new();
+    let mut events = Vec::new();
+    let mut bytes = 0;
+    let mut seen = BTreeSet::new();
+    for (message, info) in messages {
+        let Some(event) = build_inbound_event_from_message(message, info, policy, account_id)
+        else {
+            continue;
+        };
+        if !seen.insert(event.event_id.clone()) {
+            continue;
+        }
+        let event_bytes = serde_json::to_vec(&event)?.len() + 1;
+        if !events.is_empty()
+            && (events.len() == MAX_CHANNEL_BATCH_EVENTS || bytes + event_bytes > CHUNK_EVENT_BYTES)
+        {
+            chunks.push(std::mem::take(&mut events));
+            bytes = 0;
+        }
+        bytes += event_bytes;
+        events.push(event);
+    }
+    if !events.is_empty() {
+        chunks.push(events);
+    }
+    Ok(chunks)
+}
+
 const TRANSPORT_WEBSOCKET: &str = "websocket";
 const STOP_JOIN_GRACE: Duration = Duration::from_secs(3);
 const STOP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_POLL_TIMEOUT_SECS: u16 = 10;
 const POLL_IDLE_GRACE: Duration = Duration::from_millis(1500);
+const POLL_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 /// Send three liveness notifications within the shortest 90-second host grace.
 const LIVENESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const CONNECTION_GRACE: Duration = Duration::from_secs(60);
@@ -265,11 +425,15 @@ fn jitter_seed() -> u64 {
     seed ^ (seed >> 31)
 }
 
+/// Receive for one `poll_ingress` request. The durability hook delivers each
+/// batch to the host before WhatsApp is acknowledged; this call only decides
+/// when the request has received enough.
 pub fn poll_ingress_once(
     config: &ChannelConfig,
     policy: WhatsAppPolicy,
     account_id: String,
-) -> Result<Vec<InboundEventEnvelope>> {
+    stdout_lock: Arc<Mutex<()>>,
+) -> Result<()> {
     let timeout = Duration::from_secs(u64::from(
         config
             .poll_timeout_secs
@@ -277,56 +441,45 @@ pub fn poll_ingress_once(
             .unwrap_or(DEFAULT_POLL_TIMEOUT_SECS),
     ));
 
-    let (event_tx, event_rx) = channel::<InboundEventEnvelope>();
     let stop = Arc::new(AtomicBool::new(false));
-    let handle = spawn_receive_thread(
-        config,
+    let delivery = Arc::new(HookDelivery::new(
+        stdout_lock,
         policy,
         account_id,
-        event_tx,
         Arc::clone(&stop),
-        "channel-whatsapp-poll",
-    )
-    .context("failed to spawn channel-whatsapp poll thread")?;
+        true,
+    ));
+    let handle = spawn_receive_thread(config, Arc::clone(&delivery), "channel-whatsapp-poll")
+        .context("failed to spawn channel-whatsapp poll thread")?;
 
-    let started_at = Instant::now();
-    let deadline = started_at + timeout;
-    let mut events = Vec::new();
-
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
+    let deadline = Instant::now() + timeout;
+    let mut delivered = 0;
+    let mut idle_since = None;
+    while Instant::now() < deadline && !stop.load(Ordering::Relaxed) && !handle.is_finished() {
+        std::thread::sleep(POLL_CHECK_INTERVAL);
+        let now_delivered = delivery.delivered.load(Ordering::Relaxed);
+        if now_delivered != delivered {
+            delivered = now_delivered;
+            idle_since = Some(Instant::now());
         }
-
-        let wait_for = if events.is_empty() {
-            deadline.saturating_duration_since(now)
-        } else {
-            std::cmp::min(POLL_IDLE_GRACE, deadline.saturating_duration_since(now))
-        };
-
-        match event_rx.recv_timeout(wait_for) {
-            Ok(event) => events.push(event),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if !events.is_empty() {
-                    break;
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        if idle_since.is_some_and(|since: Instant| since.elapsed() >= POLL_IDLE_GRACE) {
+            break;
         }
     }
 
     stop.store(true, Ordering::Relaxed);
     join_receive_thread(handle);
-    Ok(events)
+    if delivery.failed.load(Ordering::Relaxed) && delivery.delivered.load(Ordering::Relaxed) == 0 {
+        return Err(anyhow!(
+            "WhatsApp messages were not durably accepted; they will be redelivered"
+        ));
+    }
+    Ok(())
 }
 
 fn spawn_receive_thread(
     config: &ChannelConfig,
-    policy: WhatsAppPolicy,
-    account_id: String,
-    event_tx: Sender<InboundEventEnvelope>,
-    stop_flag: Arc<AtomicBool>,
+    delivery: Arc<HookDelivery>,
     thread_name: &str,
 ) -> Result<JoinHandle<()>> {
     let store_path = resolve_store_path(config)?;
@@ -353,34 +506,22 @@ fn spawn_receive_thread(
                 }
             };
 
-            if let Err(error) = runtime.block_on(run_poll_receive_loop(
-                sqlite_url, policy, account_id, event_tx, &stop_flag,
-            )) {
+            if let Err(error) = runtime.block_on(run_poll_receive_loop(sqlite_url, delivery)) {
                 eprintln!("{thread_name} terminated: {error}");
             }
         })
         .context("failed to spawn channel-whatsapp background thread")
 }
 
-/// Collect inbound events into a channel for a single `poll_ingress` cycle.
-///
-/// The one-shot path answers a host request, so events travel back in the
-/// response rather than as notifications. Unlike the supervised worker, it has
-/// no reconnect: the host owns the retry by issuing the next poll.
-async fn run_poll_receive_loop(
-    sqlite_url: String,
-    policy: WhatsAppPolicy,
-    account_id: String,
-    event_tx: Sender<InboundEventEnvelope>,
-    stop_flag: &AtomicBool,
-) -> Result<()> {
+/// Hold one connection open for a single `poll_ingress` request. The host
+/// owns the retry by issuing the next poll.
+async fn run_poll_receive_loop(sqlite_url: String, delivery: Arc<HookDelivery>) -> Result<()> {
     let connection_status = Arc::new(AtomicU8::new(CONNECTION_CONNECTING));
-    let bot =
-        build_ingress_bot(&sqlite_url, policy, account_id, event_tx, connection_status).await?;
+    let bot = build_ingress_bot(&sqlite_url, Arc::clone(&delivery), connection_status).await?;
     let mut bot_handle = bot.spawn();
 
     loop {
-        if stop_flag.load(Ordering::Relaxed) {
+        if delivery.stop.load(Ordering::Relaxed) {
             bot_handle.shutdown().await;
             return Ok(());
         }
@@ -394,9 +535,7 @@ async fn run_poll_receive_loop(
 
 async fn build_ingress_bot(
     sqlite_url: &str,
-    policy: WhatsAppPolicy,
-    account_id: String,
-    event_tx: Sender<InboundEventEnvelope>,
+    delivery: Arc<HookDelivery>,
     connection_status: Arc<AtomicU8>,
 ) -> Result<Bot> {
     let backend = SqliteStore::new(sqlite_url)
@@ -404,20 +543,21 @@ async fn build_ingress_bot(
         .with_context(|| format!("failed to open WhatsApp session store at `{sqlite_url}`"))?;
 
     let builder = Bot::builder();
-    let builder = if policy.is_self_chat() {
+    let builder = if delivery.policy.is_self_chat() {
         builder.skip_history_sync()
     } else {
         builder
     };
     builder
         .with_backend(backend)
+        .with_inbound_durability_hook(DurableIngressHook {
+            delivery: Arc::clone(&delivery),
+        })
         .with_transport_factory(TokioWebSocketTransportFactory::new())
         .with_http_client(UreqHttpClient::new())
         .with_runtime(TokioRuntime)
         .on_event(move |event, _client| {
-            let sender = event_tx.clone();
-            let policy = policy.clone();
-            let account_id = account_id.clone();
+            let delivery = Arc::clone(&delivery);
             let connection_status = Arc::clone(&connection_status);
             async move {
                 match &*event {
@@ -430,17 +570,17 @@ async fn build_ingress_bot(
                     Event::LoggedOut(_) => {
                         connection_status.store(CONNECTION_LOGGED_OUT, Ordering::Relaxed);
                     }
-                    _ => {}
-                }
-                for message in event.messages() {
-                    if let Some(inbound) = build_inbound_event_from_message(
-                        &message.message,
-                        &message.info,
-                        &policy,
-                        &account_id,
-                    ) {
-                        let _ = sender.send(inbound);
+                    // The library acknowledges PDO recoveries and newsletters
+                    // on its own path, so this event is their only delivery.
+                    Event::Messages(batch) if !batch.hook_committed => {
+                        let messages = batch.messages.to_vec();
+                        if deliver_off_runtime(delivery, messages).await.is_err() {
+                            eprintln!(
+                                "channel-whatsapp could not durably deliver a message the provider already acknowledged"
+                            );
+                        }
                     }
+                    _ => {}
                 }
             }
         })
@@ -470,17 +610,22 @@ async fn run_receive_loop(
     policy: WhatsAppPolicy,
     account_id: String,
     stdout_lock: &Arc<Mutex<()>>,
-    stop_flag: &AtomicBool,
+    stop_flag: &Arc<AtomicBool>,
     connected_at: &mut Option<Instant>,
     stable_connection: &mut bool,
 ) -> Result<()> {
-    let (event_tx, event_rx) = channel::<InboundEventEnvelope>();
+    replay_pending_event_batch_until(stdout_lock, &|| stop_flag.load(Ordering::Relaxed))?;
+    let delivery = Arc::new(HookDelivery::new(
+        Arc::clone(stdout_lock),
+        policy,
+        account_id,
+        Arc::clone(stop_flag),
+        false,
+    ));
     let connection_status = Arc::new(AtomicU8::new(CONNECTION_CONNECTING));
     let bot = build_ingress_bot(
         &sqlite_url,
-        policy,
-        account_id,
-        event_tx,
+        Arc::clone(&delivery),
         Arc::clone(&connection_status),
     )
     .await?;
@@ -519,11 +664,12 @@ async fn run_receive_loop(
     let initial_status = promote_connecting_to_ready(&connection_status);
     let mut last_heartbeat = Instant::now();
     let mut disconnected_since = None;
+    let mut delivered = delivery.delivered.load(Ordering::Relaxed);
     match connection_action(initial_status, None) {
         ConnectionAction::Ready => {
             *connected_at = Some(Instant::now());
             // Publish the first heartbeat only after readiness is established.
-            emit_events(stdout_lock, Vec::new())?;
+            publish_channel_heartbeat(stdout_lock)?;
         }
         ConnectionAction::AwaitingReconnect => {
             *connected_at = None;
@@ -545,13 +691,22 @@ async fn run_receive_loop(
 
         tokio::select! {
             _ = &mut bot_handle => {
-                drain_and_emit(stdout_lock, &event_rx)?;
                 return Err(anyhow!("WhatsApp ingress task stopped without an error"));
             }
             _ = tokio::time::sleep(STOP_POLL_INTERVAL) => {}
         }
 
-        let emitted = drain_and_emit(stdout_lock, &event_rx)?;
+        if delivery.failed.load(Ordering::Relaxed) && !stop_flag.load(Ordering::Relaxed) {
+            // WhatsApp redelivers an unacknowledged batch only on a new connection.
+            client.disconnect().await;
+            bot_handle.abort();
+            return Err(anyhow!(
+                "inbound messages were not durably accepted; reconnecting for redelivery"
+            ));
+        }
+        let now_delivered = delivery.delivered.load(Ordering::Relaxed);
+        let emitted = now_delivered != delivered;
+        delivered = now_delivered;
         *stable_connection |= session_was_stable(connected_at.map(|started| started.elapsed()));
         let disconnected_for = disconnected_since.map(|since: Instant| since.elapsed());
         match connection_action(connection_status.load(Ordering::Relaxed), disconnected_for) {
@@ -565,7 +720,7 @@ async fn run_receive_loop(
                 if connected_at.is_none() {
                     *connected_at = Some(Instant::now());
                     if !emitted {
-                        emit_events(stdout_lock, Vec::new())?;
+                        publish_channel_heartbeat(stdout_lock)?;
                     }
                     last_heartbeat = Instant::now();
                 }
@@ -585,7 +740,7 @@ async fn run_receive_loop(
         }
         if emitted || last_heartbeat.elapsed() >= LIVENESS_HEARTBEAT_INTERVAL {
             if !emitted {
-                emit_events(stdout_lock, Vec::new())?;
+                publish_channel_heartbeat(stdout_lock)?;
             }
             last_heartbeat = Instant::now();
         }
@@ -593,26 +748,6 @@ async fn run_receive_loop(
 
     bot_handle.shutdown().await;
     Ok(())
-}
-
-/// Emit every queued inbound event, reporting whether anything was written.
-fn drain_and_emit(
-    stdout_lock: &Arc<Mutex<()>>,
-    event_rx: &Receiver<InboundEventEnvelope>,
-) -> Result<bool> {
-    let mut events = Vec::new();
-    while let Ok(event) = event_rx.try_recv() {
-        events.push(event);
-    }
-    if events.is_empty() {
-        return Ok(false);
-    }
-    emit_events(stdout_lock, events)?;
-    Ok(true)
-}
-
-fn emit_events(stdout_lock: &Arc<Mutex<()>>, events: Vec<InboundEventEnvelope>) -> Result<()> {
-    crate::emit_channel_event_notifications(stdout_lock, events)
 }
 
 fn build_inbound_event_from_message(
@@ -659,7 +794,9 @@ fn build_inbound_event_from_message(
     let mut event_metadata = BTreeMap::new();
     event_metadata.insert("platform".to_string(), PLATFORM_WHATSAPP.to_string());
     event_metadata.insert("transport".to_string(), TRANSPORT_WEBSOCKET.to_string());
-    event_metadata.insert("message_type".to_string(), info.r#type.clone());
+    if !info.r#type.trim().is_empty() {
+        event_metadata.insert("message_type".to_string(), info.r#type.clone());
+    }
     if !info.media_type.trim().is_empty() {
         event_metadata.insert("media_type".to_string(), info.media_type.clone());
     }
@@ -671,7 +808,7 @@ fn build_inbound_event_from_message(
     );
 
     Some(InboundEventEnvelope {
-        event_id: info.id.to_string(),
+        event_id: inbound_event_id(info),
         platform: PLATFORM_WHATSAPP.to_string(),
         event_type: "message.received".to_string(),
         received_at: info.timestamp.to_rfc3339(),
@@ -685,7 +822,7 @@ fn build_inbound_event_from_message(
         },
         actor: InboundActor {
             id: sender_id,
-            display_name: (!info.push_name.trim().is_empty()).then(|| info.push_name.clone()),
+            display_name: None,
             username: None,
             is_bot: false,
             metadata: BTreeMap::new(),
@@ -706,6 +843,20 @@ fn build_inbound_event_from_message(
         }),
         metadata: event_metadata,
     })
+}
+
+fn inbound_event_id(info: &MessageInfo) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"whatsapp-inbound-message");
+    for component in [
+        info.source.chat.to_string(),
+        info.source.sender.to_string(),
+        info.id.to_string(),
+    ] {
+        digest.update((component.len() as u64).to_be_bytes());
+        digest.update(component.as_bytes());
+    }
+    format!("wa:{}", URL_SAFE_NO_PAD.encode(digest.finalize()))
 }
 
 fn build_inbound_attachments(message: &wa::Message) -> Vec<InboundAttachment> {
@@ -865,6 +1016,170 @@ mod tests {
             ..ChannelConfig::default()
         })
         .unwrap()
+    }
+
+    #[test]
+    fn provider_message_identity_includes_chat_and_sender() {
+        let first = inbound_info();
+        let mut other_chat = first.clone();
+        other_chat.source.chat = "15550000000@s.whatsapp.net".parse().unwrap();
+        let mut other_sender = first.clone();
+        other_sender.source.sender = "15559999999@s.whatsapp.net".parse().unwrap();
+        assert_eq!(inbound_event_id(&first), inbound_event_id(&first.clone()));
+        assert_ne!(inbound_event_id(&first), inbound_event_id(&other_chat));
+        assert_ne!(inbound_event_id(&first), inbound_event_id(&other_sender));
+    }
+
+    #[test]
+    fn identical_library_input_rechunks_to_identical_originals() {
+        let message = wa::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
+        };
+        let infos: Vec<_> = (0..400)
+            .map(|index| {
+                let mut info = inbound_info();
+                info.id = format!("wamid.{index}");
+                info.ephemeral_expiration = Some(3600);
+                info
+            })
+            .collect();
+        let chunks = inbound_event_chunks(
+            infos.iter().map(|info| (&message, info)),
+            &policy(),
+            ACCOUNT_ID,
+        )
+        .unwrap();
+        assert_eq!(chunks.len(), 13);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.len() <= MAX_CHANNEL_BATCH_EVENTS)
+        );
+        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), 400);
+        for chunk in &chunks {
+            let batch = ChannelEventBatch {
+                events: chunk.clone(),
+                state: None,
+                poll_after_ms: None,
+            };
+            assert!(dispatch_channel_protocol::ChannelEventRequest::new(batch, None).is_ok());
+        }
+        // Fields the library derives only on first dispatch do not reach the
+        // event, so a redelivery re-parsed from the stanza maps identically.
+        let redelivered: Vec<_> = infos
+            .iter()
+            .cloned()
+            .map(|mut info| {
+                info.is_offline = true;
+                info.ephemeral_expiration = None;
+                info
+            })
+            .collect();
+        let replayed = inbound_event_chunks(
+            redelivered.iter().map(|info| (&message, info)),
+            &policy(),
+            ACCOUNT_ID,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&replayed).unwrap(),
+            serde_json::to_vec(&chunks).unwrap()
+        );
+    }
+
+    #[test]
+    fn partial_chunk_acceptance_requires_exact_replay_of_all_provider_messages() {
+        let message = wa::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
+        };
+        let infos: Vec<_> = (0..400)
+            .map(|index| {
+                let mut info = inbound_info();
+                info.id = format!("wamid.{index}");
+                info
+            })
+            .collect();
+        let original = inbound_event_chunks(
+            infos.iter().map(|info| (&message, info)),
+            &policy(),
+            ACCOUNT_ID,
+        )
+        .unwrap();
+        let mut accepted = Vec::new();
+        let failure = accept_chunks(original.clone(), |batch| {
+            if accepted.len() == 5 {
+                return Err(anyhow!("host refused sixth chunk"));
+            }
+            accepted.push(serde_json::to_vec(&batch).unwrap());
+            Ok(())
+        });
+        assert!(failure.unwrap_err().to_string().contains("sixth chunk"));
+        assert_eq!(accepted.len(), 5);
+
+        let replayed = inbound_event_chunks(
+            infos.iter().map(|info| (&message, info)),
+            &policy(),
+            ACCOUNT_ID,
+        )
+        .unwrap();
+        let mut replay_frames = Vec::new();
+        accept_chunks(replayed, |batch| {
+            replay_frames.push(serde_json::to_vec(&batch).unwrap());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(replay_frames.len(), 13);
+        assert_eq!(&replay_frames[..5], accepted.as_slice());
+        assert_eq!(
+            replay_frames
+                .iter()
+                .map(|frame| serde_json::from_slice::<ChannelEventBatch>(frame)
+                    .unwrap()
+                    .events
+                    .len())
+                .sum::<usize>(),
+            400
+        );
+    }
+
+    #[test]
+    fn redelivered_push_name_does_not_change_the_event() {
+        // A sender can rename their profile between provider redeliveries.
+        let message = wa::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
+        };
+        let first = inbound_info();
+        let mut renamed = first.clone();
+        renamed.push_name = "Renamed".to_string();
+        let original =
+            build_inbound_event_from_message(&message, &first, &policy(), ACCOUNT_ID).unwrap();
+        let replayed =
+            build_inbound_event_from_message(&message, &renamed, &policy(), ACCOUNT_ID).unwrap();
+        assert_eq!(original.event_id, replayed.event_id);
+        assert_eq!(
+            serde_json::to_vec(&original).unwrap(),
+            serde_json::to_vec(&replayed).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_repeated_provider_identity_in_one_batch_is_delivered_once() {
+        let message = wa::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
+        };
+        let info = inbound_info();
+        let chunks = inbound_event_chunks(
+            [(&message, &info), (&message, &info)],
+            &policy(),
+            ACCOUNT_ID,
+        )
+        .unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1);
     }
 
     /// A receive session that ends on its own has lost its connection. Treating

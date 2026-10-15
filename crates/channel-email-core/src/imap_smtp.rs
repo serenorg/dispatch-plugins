@@ -130,6 +130,7 @@ pub fn fetch_messages_since<P: EmailPreset>(
     if let Some(last_uid) = last_uid {
         uids.retain(|uid| *uid > last_uid);
     }
+    uids.truncate(32);
 
     let mut messages = Vec::new();
     for chunk in uids.chunks(50) {

@@ -35,6 +35,8 @@ Behavior:
 - ingress declares a public endpoint and optional shared-secret header
 - health validates config and can probe a configured health URL
 
+Each `ingress_event` confirms a `channel.event` batch with the host, including an empty batch when a callback is ignored or rejected, and the plugin answers the request, including any HTTP callback reply, only after the exact durable host receipt. A callback that repeats the accepted batch resends that accepted original instead of journaling a new one. A request that fails before it produces a batch returns a plugin error and confirms nothing. An unconfirmed journaled batch remains pending and is replayed before the next batch. Retry behavior belongs to the webhook sender; consumers must deduplicate by stable event ID.
+
 Not implemented:
 
 - retries and backoff

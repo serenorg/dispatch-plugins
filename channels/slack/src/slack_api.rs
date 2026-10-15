@@ -34,7 +34,7 @@ pub enum SlackSocketModeError {
     Configuration { code: String },
     ConnectionResponse { code: String },
     RateLimited { retry_after: Duration },
-    NotificationDelivery { message: String },
+    EventDelivery { message: String },
     Transport(anyhow::Error),
 }
 
@@ -58,8 +58,8 @@ impl fmt::Display for SlackSocketModeError {
                 "Slack Socket Mode connection was rate limited for {} seconds",
                 retry_after.as_secs()
             ),
-            Self::NotificationDelivery { message } => {
-                write!(formatter, "Slack notification delivery failed: {message}")
+            Self::EventDelivery { message } => {
+                write!(formatter, "Slack event delivery failed: {message}")
             }
             Self::Transport(error) => write!(formatter, "{error:#}"),
         }
@@ -79,18 +79,18 @@ pub enum SlackSocketReceiveOutcome {
 }
 
 #[derive(Debug)]
-struct SlackNotificationDeliveryError(String);
+struct SlackEventDeliveryError(String);
 
-impl fmt::Display for SlackNotificationDeliveryError {
+impl fmt::Display for SlackEventDeliveryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
 }
 
-impl std::error::Error for SlackNotificationDeliveryError {}
+impl std::error::Error for SlackEventDeliveryError {}
 
-pub fn notification_delivery_error(error: impl fmt::Display) -> anyhow::Error {
-    anyhow::Error::new(SlackNotificationDeliveryError(error.to_string()))
+pub fn event_delivery_error(error: impl fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(SlackEventDeliveryError(error.to_string()))
 }
 
 /// Invokes the delivery callback for one `events_api` envelope before acknowledgement.
@@ -733,8 +733,8 @@ impl SlackSocketModeClient {
 }
 
 fn classify_socket_message_error(error: anyhow::Error) -> SlackSocketModeError {
-    match error.downcast::<SlackNotificationDeliveryError>() {
-        Ok(error) => SlackSocketModeError::NotificationDelivery { message: error.0 },
+    match error.downcast::<SlackEventDeliveryError>() {
+        Ok(error) => SlackSocketModeError::EventDelivery { message: error.0 },
         Err(error) => SlackSocketModeError::Transport(error),
     }
 }

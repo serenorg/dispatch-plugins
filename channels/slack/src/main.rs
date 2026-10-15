@@ -2,9 +2,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use dispatch_channel_runtime::{
-    IngressPollContext, IngressWorker, RuntimeError, no_after_cycle,
-    restart_ingress_worker as restart_runtime_ingress_worker, stop_ingress_worker,
-    write_stdout_line,
+    IngressCycle, IngressPollContext, IngressWorker, RuntimeError, no_after_cycle,
+    restart_ingress_worker as restart_runtime_ingress_worker, spawn_plugin_input_reader,
+    stop_ingress_worker, write_stdout_line,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use jiff::Timestamp;
@@ -12,13 +12,13 @@ use serde::Deserialize;
 use sha2::Sha256;
 use std::{
     collections::BTreeMap,
-    io::{self, BufRead},
     sync::{Arc, Mutex},
 };
 
 mod protocol;
 mod slack_api;
 
+use dispatch_channel_protocol::parse_plugin_input;
 use protocol::{
     CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ChannelPolicy, ConfiguredChannel,
     DeliveryReceipt, FetchedMessage, FetchedMessageAuthor, HealthReport, InboundActivation,
@@ -26,7 +26,7 @@ use protocol::{
     IngressCallbackReply, IngressMode, IngressPayload, IngressState, MessagePermalink, MessageRef,
     OutboundMessage, PluginRequest, PluginRequestEnvelope, PluginResponse, SlackActivationPolicy,
     SlackDirectMessagePolicy, StatusAcceptance, StatusFrame, StatusKind, capabilities,
-    parse_jsonrpc_request, plugin_error, response_to_jsonrpc,
+    plugin_error, response_to_jsonrpc,
 };
 use slack_api::{SlackClient, SlackUpload, send_incoming_webhook};
 use slack_api::{
@@ -100,18 +100,14 @@ fn channel_target_denied(reason: impl Into<String>) -> anyhow::Error {
 }
 
 fn main() -> Result<()> {
-    let stdin = io::stdin().lock();
     let stdout_lock = Arc::new(Mutex::new(()));
     let mut ingress_worker: Option<IngressWorker> = None;
 
-    for line in stdin.lines() {
-        let line = line.context("failed to read stdin")?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let (request_id, envelope) = parse_jsonrpc_request(&line)
-            .map_err(|error| anyhow!("failed to parse channel request: {error}"))?;
+    for request in spawn_plugin_input_reader(
+        Arc::clone(&stdout_lock),
+        parse_plugin_input::<ChannelConfig, OutboundMessage>,
+    ) {
+        let (request_id, envelope) = request?;
         let should_exit = matches!(envelope.request, PluginRequest::Shutdown);
 
         let response = match handle_request(&envelope, &stdout_lock, &mut ingress_worker) {
@@ -165,7 +161,7 @@ fn handle_request(
             "supervised_ingress_required",
             "Slack Socket Mode requires start_ingress supervision for delivery-before-acknowledgement",
         )),
-        PluginRequest::StartIngress { config, state } => {
+        PluginRequest::StartIngress { config, state, .. } => {
             let started = start_ingress(config)?;
             let started = match (&started.mode, state.clone()) {
                 (IngressMode::Polling, Some(state)) if state.mode == IngressMode::Polling => state,
@@ -201,7 +197,10 @@ fn handle_request(
             config,
             state,
             payload,
-        } => handle_ingress_event(config, state.as_ref(), payload),
+            ..
+        } => handle_ingress_event(config, state.as_ref(), payload)?
+            .publish(stdout_lock)
+            .map_err(Into::into),
         PluginRequest::Status { config, update } => Ok(PluginResponse::StatusAccepted {
             status: send_status(config, update)?,
         }),
@@ -233,7 +232,7 @@ fn slack_poll_ingress(
     config: &ChannelConfig,
     state: Option<IngressState>,
     context: &IngressPollContext<'_>,
-) -> Result<PluginResponse> {
+) -> Result<IngressCycle> {
     handle_poll_ingress(config, state.as_ref(), context)
 }
 
@@ -685,7 +684,7 @@ fn handle_ingress_event(
     config: &ChannelConfig,
     state: Option<&IngressState>,
     payload: &IngressPayload,
-) -> Result<PluginResponse> {
+) -> Result<IngressCycle> {
     if !payload.method.eq_ignore_ascii_case("POST") {
         return Ok(ingress_rejection(
             405,
@@ -694,7 +693,7 @@ fn handle_ingress_event(
     }
 
     if let Some(reply) = validate_ingress_signature(config, payload)? {
-        return Ok(PluginResponse::IngressEventsReceived {
+        return Ok(IngressCycle::Events {
             events: Vec::new(),
             callback_reply: Some(reply),
             state: None,
@@ -715,7 +714,7 @@ fn handle_ingress_event(
                     "slack url_verification payload missing challenge",
                 ));
             };
-            Ok(PluginResponse::IngressEventsReceived {
+            Ok(IngressCycle::Events {
                 events: Vec::new(),
                 callback_reply: Some(IngressCallbackReply {
                     status: 200,
@@ -728,7 +727,7 @@ fn handle_ingress_event(
         }
         "event_callback" => {
             if !team_is_allowed(config, envelope.team_id.as_deref()) {
-                return Ok(PluginResponse::IngressEventsReceived {
+                return Ok(IngressCycle::Events {
                     events: Vec::new(),
                     callback_reply: None,
                     state: None,
@@ -751,7 +750,7 @@ fn handle_ingress_event(
                 TRANSPORT_EVENTS_WEBHOOK,
             )?
             else {
-                return Ok(PluginResponse::IngressEventsReceived {
+                return Ok(IngressCycle::Events {
                     events: Vec::new(),
                     callback_reply: None,
                     state: None,
@@ -759,14 +758,14 @@ fn handle_ingress_event(
                 });
             };
 
-            Ok(PluginResponse::IngressEventsReceived {
+            Ok(IngressCycle::Events {
                 events: vec![inbound_event],
                 callback_reply: None,
                 state: None,
                 poll_after_ms: None,
             })
         }
-        _ => Ok(PluginResponse::IngressEventsReceived {
+        _ => Ok(IngressCycle::Events {
             events: Vec::new(),
             callback_reply: None,
             state: None,
@@ -779,12 +778,12 @@ fn handle_poll_ingress(
     config: &ChannelConfig,
     state: Option<&IngressState>,
     context: &IngressPollContext<'_>,
-) -> Result<PluginResponse> {
+) -> Result<IngressCycle> {
     if !has_optional_env(app_token_env(config)) {
-        return Ok(plugin_error(
+        return Ok(IngressCycle::Control(plugin_error(
             "polling_not_supported",
             "slack poll_ingress requires Slack Socket Mode with SLACK_APP_TOKEN",
-        ));
+        )));
     }
 
     let client = SlackSocketModeClient::from_env(app_token_env(config))?;
@@ -803,7 +802,7 @@ fn handle_poll_ingress(
             let event_id = inbound_event.event_id.clone();
             context
                 .deliver(vec![inbound_event], next_state.clone(), Some(1000))
-                .map_err(slack_api::notification_delivery_error)?;
+                .map_err(slack_api::event_delivery_error)?;
             record_socket_mode_event_delivered(&event_id);
             Ok(SlackEnvelopeDisposition::Delivered)
         }
@@ -817,7 +816,7 @@ fn handle_poll_ingress(
     ) {
         Ok(SlackSocketReceiveOutcome::Delivered) => {
             // Refresh state after in-cycle delivery and acknowledgement.
-            return Ok(PluginResponse::IngressEventsReceived {
+            return Ok(IngressCycle::Events {
                 events: Vec::new(),
                 callback_reply: None,
                 state: next_state,
@@ -831,51 +830,51 @@ fn handle_poll_ingress(
         }
         Ok(SlackSocketReceiveOutcome::Disconnected) => {
             if publish_socket_reconnecting(context, &next_state).is_err() {
-                return Ok(socket_notification_delivery_error());
+                return Ok(IngressCycle::Control(socket_event_delivery_error()));
             }
             bail!("Slack Socket Mode disconnected before the poll deadline")
         }
         Err(SlackSocketModeError::Authentication { code }) => {
-            return Ok(plugin_error(
+            return Ok(IngressCycle::Control(plugin_error(
                 "slack_authentication_failed",
                 format!("Slack rejected the configured Socket Mode credentials: {code}"),
-            ));
+            )));
         }
         Err(SlackSocketModeError::Configuration { code }) => {
-            return Ok(plugin_error(
+            return Ok(IngressCycle::Control(plugin_error(
                 "slack_socket_protocol_error",
                 format!("Slack rejected the configured Socket Mode connection: {code}"),
-            ));
+            )));
         }
         Err(SlackSocketModeError::ConnectionResponse { code }) => {
             if publish_socket_reconnecting(context, &next_state).is_err() {
-                return Ok(socket_notification_delivery_error());
+                return Ok(IngressCycle::Control(socket_event_delivery_error()));
             }
             bail!("Slack Socket Mode connection response failed: {code}")
         }
         Err(SlackSocketModeError::RateLimited { retry_after }) => {
             if publish_socket_reconnecting(context, &next_state).is_err() {
-                return Ok(socket_notification_delivery_error());
+                return Ok(IngressCycle::Control(socket_event_delivery_error()));
             }
             context.sleep_until_stopped(retry_after);
             bail!("Slack rate limited the Socket Mode connection request")
         }
-        Err(SlackSocketModeError::NotificationDelivery { .. }) => {
-            return Ok(plugin_error(
-                "notification_delivery_failed",
-                "Slack could not flush the inbound event notification",
-            ));
+        Err(SlackSocketModeError::EventDelivery { .. }) => {
+            return Ok(IngressCycle::Control(plugin_error(
+                "event_delivery_failed",
+                "Slack inbound event was not durably accepted by the host",
+            )));
         }
         Err(SlackSocketModeError::Transport(error)) => {
             if publish_socket_reconnecting(context, &next_state).is_err() {
-                return Ok(socket_notification_delivery_error());
+                return Ok(IngressCycle::Control(socket_event_delivery_error()));
             }
             return Err(error);
         }
     };
 
     let Some(socket_envelope) = socket_envelope else {
-        return Ok(PluginResponse::IngressEventsReceived {
+        return Ok(IngressCycle::Events {
             events: Vec::new(),
             callback_reply: None,
             state: next_state,
@@ -884,7 +883,7 @@ fn handle_poll_ingress(
     };
 
     let Some(inbound_event) = build_socket_mode_event(config, state, &socket_envelope)? else {
-        return Ok(PluginResponse::IngressEventsReceived {
+        return Ok(IngressCycle::Events {
             events: Vec::new(),
             callback_reply: None,
             state: next_state,
@@ -892,7 +891,7 @@ fn handle_poll_ingress(
         });
     };
 
-    Ok(PluginResponse::IngressEventsReceived {
+    Ok(IngressCycle::Events {
         events: vec![inbound_event],
         callback_reply: None,
         state: next_state,
@@ -911,10 +910,10 @@ fn publish_socket_reconnecting(
     context.deliver(Vec::new(), reconnecting_state, Some(1000))
 }
 
-fn socket_notification_delivery_error() -> PluginResponse {
+fn socket_event_delivery_error() -> PluginResponse {
     plugin_error(
-        "notification_delivery_failed",
-        "Slack could not flush the recovery notification",
+        "event_delivery_failed",
+        "Slack reconnect state was not durably accepted by the host",
     )
 }
 
@@ -1038,7 +1037,7 @@ fn build_inbound_event(
         return Ok(None);
     };
     let message_id = message_ts.to_string();
-    let received_at = received_at(payload.received_at.as_deref(), envelope.event_time)?;
+    let received_at = received_at(envelope.event_time, message_ts)?;
     let thread_ts = match event.thread_ts.as_deref() {
         None => None,
         Some(thread_ts) => {
@@ -1370,12 +1369,15 @@ fn current_unix_timestamp() -> Result<i64> {
     Ok(Timestamp::now().as_second())
 }
 
-fn received_at(host_received_at: Option<&str>, event_time: Option<i64>) -> Result<String> {
-    if let Some(host_received_at) = host_received_at {
-        return Ok(host_received_at.to_string());
-    }
-
-    let timestamp = event_time.unwrap_or(current_unix_timestamp()?);
+fn received_at(event_time: Option<i64>, message_ts: &str) -> Result<String> {
+    let timestamp = match event_time {
+        Some(timestamp) => timestamp,
+        None => message_ts
+            .split_once('.')
+            .map_or(message_ts, |(seconds, _)| seconds)
+            .parse()
+            .context("slack message timestamp is invalid")?,
+    };
     Ok(Timestamp::from_second(timestamp)
         .context("slack event timestamp is out of range")?
         .to_string())
@@ -1476,8 +1478,8 @@ fn render_status_message(update: &StatusFrame) -> String {
     }
 }
 
-fn ingress_rejection(status: u16, message: &str) -> PluginResponse {
-    PluginResponse::IngressEventsReceived {
+fn ingress_rejection(status: u16, message: &str) -> IngressCycle {
+    IngressCycle::Events {
         events: Vec::new(),
         callback_reply: Some(callback_reply(status, message)),
         state: None,
@@ -1850,7 +1852,7 @@ mod tests {
     use super::*;
     use crate::protocol::OutboundAttachment;
     use std::cell::Cell;
-    use std::io::{Read, Write};
+    use std::io::{self, Read, Write};
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
@@ -1898,7 +1900,7 @@ mod tests {
             handle_ingress_event(&config, Some(&ingress_state), &payload).expect("handle ingress");
 
         match response {
-            PluginResponse::IngressEventsReceived {
+            IngressCycle::Events {
                 events,
                 callback_reply,
                 ..
@@ -1933,7 +1935,7 @@ mod tests {
         let response = handle_ingress_event(&config, None, &payload).expect("handle ingress");
 
         match response {
-            PluginResponse::IngressEventsReceived { callback_reply, .. } => {
+            IngressCycle::Events { callback_reply, .. } => {
                 let reply = callback_reply.expect("challenge reply");
                 assert_eq!(reply.status, 200);
                 assert_eq!(reply.body, "challenge-token");
@@ -1972,7 +1974,7 @@ mod tests {
             handle_ingress_event(&config, Some(&ingress_state), &payload).expect("handle ingress");
 
         match response {
-            PluginResponse::IngressEventsReceived {
+            IngressCycle::Events {
                 events,
                 callback_reply,
                 ..
@@ -1983,6 +1985,19 @@ mod tests {
                 assert_eq!(event.event_id, "Ev123");
                 assert_eq!(event.platform, "slack");
                 assert_eq!(event.event_type, "app_mention");
+                assert_eq!(
+                    event.received_at,
+                    Timestamp::from_second(1_712_860_000).unwrap().to_string()
+                );
+                let original = serde_json::to_vec(event).unwrap();
+                let mut redelivered = payload.clone();
+                redelivered.received_at = Some("2026-04-12T18:00:00Z".to_string());
+                let IngressCycle::Events { events, .. } =
+                    handle_ingress_event(&config, Some(&ingress_state), &redelivered).unwrap()
+                else {
+                    panic!("unexpected response variant");
+                };
+                assert_eq!(serde_json::to_vec(&events[0]).unwrap(), original);
                 assert_eq!(event.account_id.as_deref(), Some("UBOT123"));
                 assert_eq!(event.conversation.id, "C123");
                 assert_eq!(event.conversation.kind, "channel");
@@ -2026,6 +2041,15 @@ mod tests {
     }
 
     #[test]
+    fn event_without_event_time_uses_provider_message_timestamp() {
+        assert_eq!(
+            received_at(None, "1712860000.100200").unwrap(),
+            Timestamp::from_second(1_712_860_000).unwrap().to_string()
+        );
+        assert!(received_at(None, "invalid").is_err());
+    }
+
+    #[test]
     fn root_app_mention_uses_ts_as_message_id_and_thread_target() {
         let payload = base_payload(
             r#"{
@@ -2052,7 +2076,7 @@ mod tests {
             handle_ingress_event(&config, Some(&ingress_state), &payload).expect("handle ingress");
 
         match response {
-            PluginResponse::IngressEventsReceived { events, .. } => {
+            IngressCycle::Events { events, .. } => {
                 assert_eq!(events.len(), 1);
                 let event = &events[0];
                 assert_eq!(event.event_id, "slack:C123:1712860000.100201");
@@ -2102,7 +2126,7 @@ mod tests {
             handle_ingress_event(&config, Some(&ingress_state), &payload).expect("handle ingress");
 
         match response {
-            PluginResponse::IngressEventsReceived { events, .. } => {
+            IngressCycle::Events { events, .. } => {
                 assert_eq!(events.len(), 1);
                 let event = &events[0];
                 assert_eq!(event.message.id, "1712860000.100300");
@@ -2153,7 +2177,7 @@ mod tests {
             handle_ingress_event(&config, Some(&ingress_state), &payload).expect("handle ingress");
 
         match response {
-            PluginResponse::IngressEventsReceived { events, .. } => {
+            IngressCycle::Events { events, .. } => {
                 assert_eq!(events.len(), 1);
                 let event = &events[0];
                 assert_eq!(event.message.id, "1712860000.100400");
@@ -2482,7 +2506,7 @@ mod tests {
                 .expect("handle ingress");
 
             match response {
-                PluginResponse::IngressEventsReceived { events, .. } => {
+                IngressCycle::Events { events, .. } => {
                     assert!(events.is_empty(), "{case}")
                 }
                 other => panic!("unexpected response for {case}: {other:?}"),
@@ -2513,7 +2537,7 @@ mod tests {
             handle_ingress_event(&config, Some(&ingress_state), &payload).expect("handle ingress");
 
         match response {
-            PluginResponse::IngressEventsReceived { events, .. } => assert!(events.is_empty()),
+            IngressCycle::Events { events, .. } => assert!(events.is_empty()),
             other => panic!("unexpected response: {other:?}"),
         }
     }
@@ -2559,7 +2583,7 @@ mod tests {
             handle_ingress_event(&config, Some(&ingress_state), &payload).expect("handle ingress");
 
         match response {
-            PluginResponse::IngressEventsReceived { events, .. } => {
+            IngressCycle::Events { events, .. } => {
                 assert_eq!(events.len(), 1);
                 let event = &events[0];
                 assert_eq!(
@@ -2653,7 +2677,7 @@ mod tests {
             .expect("handle ingress");
 
         match response {
-            PluginResponse::IngressEventsReceived { events, .. } => assert!(events.is_empty()),
+            IngressCycle::Events { events, .. } => assert!(events.is_empty()),
             other => panic!("unexpected response: {other:?}"),
         }
     }
@@ -2710,7 +2734,7 @@ mod tests {
         .expect("handle ingress");
 
         match response {
-            PluginResponse::IngressEventsReceived { events, .. } => assert!(events.is_empty()),
+            IngressCycle::Events { events, .. } => assert!(events.is_empty()),
             other => panic!("unexpected response: {other:?}"),
         }
     }

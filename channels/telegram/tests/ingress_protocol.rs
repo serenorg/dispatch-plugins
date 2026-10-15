@@ -1,5 +1,7 @@
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
 
@@ -39,13 +41,60 @@ fn wrap_request(request: Value) -> Value {
     })
 }
 
-fn run_request(request: Value) -> Value {
-    run_request_with_env(request, &[])
+fn private_journal_directory() -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "channel-telegram-ingress-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    dispatch_channel_runtime::create_event_journal_directory(&path)
+        .expect("create private journal directory");
+    path
 }
 
-fn run_request_with_env(request: Value, envs: &[(&str, &str)]) -> Value {
+/// Exact durable receipt for one `channel.event` request.
+fn receipt_for(message: &Value) -> Value {
+    let params = &message["params"];
+    let event_ids: Vec<Value> = params["batch"]["events"]
+        .as_array()
+        .expect("batch events")
+        .iter()
+        .map(|event| event["event_id"].clone())
+        .collect();
+    json!({
+        "jsonrpc": "2.0",
+        "id": message["id"].clone(),
+        "result": {
+            "kind": "accepted",
+            "batch_digest": params["batch_digest"].clone(),
+            "event_ids": event_ids,
+            "sequence": params["previous_acceptance"]["sequence"]
+                .as_u64()
+                .map_or(1, |sequence| sequence + 1)
+        }
+    })
+}
+
+fn run_ingress(request: Value) -> (Value, Vec<Value>) {
+    run_ingress_with_env(request, &[])
+}
+
+/// Play the host for one ingress request: supply private journal storage,
+/// answer each batch with its exact receipt, and return the control result
+/// together with every confirmed batch.
+fn run_ingress_with_env(request: Value, envs: &[(&str, &str)]) -> (Value, Vec<Value>) {
     let binary =
         std::env::var("CARGO_BIN_EXE_channel-telegram").expect("channel-telegram binary path");
+    let directory = private_journal_directory();
+    let mut wrapped = wrap_request(request);
+    wrapped["params"]["storage"] = json!({
+        "journal_path": directory.join("producer.journal").to_string_lossy()
+    });
     let mut child = Command::new(binary)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -54,24 +103,29 @@ fn run_request_with_env(request: Value, envs: &[(&str, &str)]) -> Value {
         .expect("spawn channel-telegram");
 
     let mut stdin = child.stdin.take().expect("child stdin");
-    writeln!(stdin, "{}", wrap_request(request)).expect("write request");
+    writeln!(stdin, "{wrapped}").expect("write request");
+    let stdout = BufReader::new(child.stdout.take().expect("child stdout"));
+    let mut batches = Vec::new();
+    let mut result = None;
+    for line in stdout.lines() {
+        let line = line.expect("read plugin output");
+        if line.trim().is_empty() {
+            continue;
+        }
+        let message: Value = serde_json::from_str(&line).expect("parse plugin output");
+        if message["method"] == "channel.event" {
+            writeln!(stdin, "{}", receipt_for(&message)).expect("write receipt");
+            batches.push(message["params"]["batch"].clone());
+        } else if message["id"] == 1 {
+            result = Some(message["result"].clone());
+            break;
+        }
+    }
     drop(stdin);
-
-    let output = child.wait_with_output().expect("wait for child");
-    assert!(
-        output.status.success(),
-        "channel-telegram failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
-    let line = stdout
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .expect("response line");
-    let response: Value = serde_json::from_str(line).expect("parse response");
-    response["result"].clone()
+    let status = child.wait().expect("wait for child");
+    assert!(status.success(), "channel-telegram failed: {status}");
+    std::fs::remove_dir_all(directory).expect("remove journal directory");
+    (result.expect("control response"), batches)
 }
 
 #[test]
@@ -101,8 +155,8 @@ fn ingress_event_round_trips_telegram_message_webhook() {
     })
     .to_string();
 
-    let response = run_request(json!({
-        "protocol_version": 1,
+    let (response, batches) = run_ingress(json!({
+        "protocol_version": 2,
         "request": {
             "kind": "ingress_event",
             "config": {},
@@ -121,7 +175,16 @@ fn ingress_event_round_trips_telegram_message_webhook() {
 
     assert_eq!(response["kind"], "ingress_events_received");
     assert!(response["callback_reply"].is_null());
-    let events = response["events"].as_array().expect("events array");
+    assert!(
+        response.get("events").is_none(),
+        "control responses carry no content"
+    );
+    assert_eq!(
+        batches.len(),
+        1,
+        "the callback answers only after one confirmed batch"
+    );
+    let events = batches[0]["events"].as_array().expect("events array");
     assert_eq!(events.len(), 1);
 
     let event = &events[0];
@@ -140,10 +203,10 @@ fn ingress_event_round_trips_telegram_message_webhook() {
 }
 
 #[test]
-fn ingress_event_rejects_secret_mismatch_without_emitting_events() {
-    let response = run_request_with_env(
+fn ingress_event_rejects_secret_mismatch_with_an_empty_confirmed_batch() {
+    let (response, batches) = run_ingress_with_env(
         json!({
-            "protocol_version": 1,
+            "protocol_version": 2,
             "request": {
                 "kind": "ingress_event",
                 "config": {
@@ -165,7 +228,8 @@ fn ingress_event_rejects_secret_mismatch_without_emitting_events() {
     );
 
     assert_eq!(response["kind"], "ingress_events_received");
-    assert_eq!(response["events"], json!([]));
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0]["events"], json!([]));
     assert_eq!(response["callback_reply"]["status"], 403);
     assert!(
         response["callback_reply"]["body"]
@@ -214,8 +278,8 @@ fn ingress_event_round_trips_telegram_media_attachment_webhook() {
     })
     .to_string();
 
-    let response = run_request(json!({
-        "protocol_version": 1,
+    let (response, batches) = run_ingress(json!({
+        "protocol_version": 2,
         "request": {
             "kind": "ingress_event",
             "config": {},
@@ -233,7 +297,8 @@ fn ingress_event_round_trips_telegram_media_attachment_webhook() {
     }));
 
     assert_eq!(response["kind"], "ingress_events_received");
-    let events = response["events"].as_array().expect("events array");
+    assert_eq!(batches.len(), 1);
+    let events = batches[0]["events"].as_array().expect("events array");
     assert_eq!(events.len(), 1);
 
     let event = &events[0];

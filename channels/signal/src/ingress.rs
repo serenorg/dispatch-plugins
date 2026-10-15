@@ -1,34 +1,36 @@
 //! Persistent ingress worker for the native presage-backed Signal plugin.
 //!
-//! `presage::Manager::receive_messages` returns an async `Stream` that
-//! borrows the Manager exclusively. We run the whole receive loop on a
-//! single background tokio task inside the plugin-wide runtime. The worker
-//! writes `channel.event` notifications under the shared stdout lock and sends
-//! empty liveness notifications while the receive stream remains open.
-//!
-//! Outbound calls (deliver, push, status) load a fresh Manager from
-//! the shared SQLite store each time. The store is an `Arc<SqlitePool>`
-//! internally so cloning it is cheap and SQLite's own locking
-//! serializes the writes.
+//! One worker owns the registered Manager and its websocket tasks. Outbound
+//! commands use a clone sharing the receive Manager's cached sockets, while
+//! the receive future independently waits for host receipts or reconnects.
 
 use anyhow::{Context, Result, anyhow};
+use dispatch_channel_protocol::ChannelEventBatch;
+use dispatch_channel_runtime::{
+    deliver_channel_event_batch_until, publish_channel_heartbeat, replay_pending_event_batch_until,
+};
 use futures::StreamExt;
 use jiff::Timestamp;
 use presage::libsignal_service::content::{Content, ContentBody, DataMessage};
 use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
+use presage::{Manager, manager::Registered};
 use presage_store_sqlite::SqliteStore;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tokio::runtime::Builder;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::task::LocalSet;
 
 use crate::content_store::SignalStore;
 use crate::protocol::{
-    ChannelConfig, InboundActivation, InboundActor, InboundAttachment, InboundConversationRef,
-    InboundEventEnvelope, InboundMessage, SignalChannelPolicy,
+    ChannelConfig, DeliveryReceipt, InboundActivation, InboundActor, InboundAttachment,
+    InboundConversationRef, InboundEventEnvelope, InboundMessage, OutboundMessage,
+    SignalChannelPolicy, StatusAcceptance, StatusFrame,
 };
 use crate::store::{resolve_passphrase, resolve_store_path, to_sqlite_url};
 
@@ -56,9 +58,91 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 pub struct IngressWorker {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    commands: mpsc::UnboundedSender<WorkerCommand>,
+    config: ChannelConfig,
+    policy: SignalChannelPolicy,
+}
+
+enum WorkerCommand {
+    Deliver {
+        config: ChannelConfig,
+        message: OutboundMessage,
+        policy: SignalChannelPolicy,
+        reply: std::sync::mpsc::Sender<Result<DeliveryReceipt>>,
+    },
+    Status {
+        frame: StatusFrame,
+        policy: SignalChannelPolicy,
+        reply: std::sync::mpsc::Sender<Result<StatusAcceptance>>,
+    },
 }
 
 impl IngressWorker {
+    fn authorize_command(
+        &self,
+        config: &ChannelConfig,
+        policy: &SignalChannelPolicy,
+    ) -> Result<()> {
+        if config != &self.config || policy != &self.policy {
+            return Err(anyhow!(
+                "Signal configuration changed; restart ingress before sending"
+            ));
+        }
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(anyhow!("Signal receive worker is stopping"));
+        }
+        Ok(())
+    }
+
+    pub fn deliver(
+        &self,
+        config: &ChannelConfig,
+        message: &OutboundMessage,
+        policy: &SignalChannelPolicy,
+    ) -> Result<DeliveryReceipt> {
+        self.authorize_command(config, policy)?;
+        let (reply, result) = std::sync::mpsc::channel();
+        self.commands
+            .send(WorkerCommand::Deliver {
+                config: config.clone(),
+                message: message.clone(),
+                policy: policy.clone(),
+                reply,
+            })
+            .map_err(|_| {
+                anyhow!("Signal receive worker is unavailable; message was not submitted")
+            })?;
+        result.recv().map_err(|_| {
+            anyhow!(
+                "Signal receive worker stopped before delivery completed; send outcome is unknown"
+            )
+        })?
+    }
+
+    pub fn status(
+        &self,
+        config: &ChannelConfig,
+        frame: &StatusFrame,
+        policy: &SignalChannelPolicy,
+    ) -> Result<StatusAcceptance> {
+        self.authorize_command(config, policy)?;
+        let (reply, result) = std::sync::mpsc::channel();
+        self.commands
+            .send(WorkerCommand::Status {
+                frame: frame.clone(),
+                policy: policy.clone(),
+                reply,
+            })
+            .map_err(|_| {
+                anyhow!("Signal receive worker is unavailable; status was not submitted")
+            })?;
+        result.recv().map_err(|_| {
+            anyhow!(
+                "Signal receive worker stopped before status completed; send outcome is unknown"
+            )
+        })?
+    }
+
     /// Signal the background task to stop and wait briefly for it to
     /// exit.
     ///
@@ -104,75 +188,190 @@ pub fn start_ingress_worker(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_flag = Arc::clone(&stop);
+    let (commands, receiver) = mpsc::unbounded_channel();
+    let worker_policy = policy.clone();
 
     let handle = std::thread::Builder::new()
         .name("channel-signal-receive".to_string())
         .stack_size(SIGNAL_THREAD_STACK_SIZE)
         .spawn(move || {
-            supervise_receive_loop(url, passphrase, stdout_lock, stop_flag, policy, account_id)
+            let outcome = run_signal_driver(run_worker(
+                url,
+                passphrase,
+                stdout_lock,
+                stop_flag,
+                worker_policy,
+                account_id,
+                receiver,
+            ));
+            if let Err(error) = outcome {
+                terminate_worker("worker", &format!("{error:#}"), 0);
+            }
         })
         .context("failed to spawn channel-signal receive thread")?;
 
     Ok(IngressWorker {
         stop,
         handle: Some(handle),
+        commands,
+        config: config.clone(),
+        policy,
     })
 }
 
-/// Reconnect transient failures and exit after a terminal failure so the host can replace the plugin.
-fn supervise_receive_loop(
+/// Presage's receive stream spawns local sync tasks on the owning runtime.
+fn run_signal_driver<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build Signal tokio runtime")?;
+    runtime.block_on(LocalSet::new().run_until(future))
+}
+
+async fn run_worker(
     url: String,
     passphrase: Option<String>,
     stdout_lock: Arc<Mutex<()>>,
     stop: Arc<AtomicBool>,
     policy: SignalChannelPolicy,
     account_id: String,
-) {
-    let mut consecutive_failures = 0_u32;
+    commands: mpsc::UnboundedReceiver<WorkerCommand>,
+) -> Result<()> {
+    let mut consecutive_failures = 0;
     let mut backoff = INITIAL_RECONNECT_BACKOFF;
-
-    while !stop.load(Ordering::Relaxed) {
-        let runtime = match Builder::new_current_thread().enable_all().build() {
-            Ok(runtime) => runtime,
+    let manager = loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let loaded = async {
+            let store = SqliteStore::open_with_passphrase(
+                &url,
+                passphrase.as_deref(),
+                OnNewIdentity::Trust,
+            )
+            .await
+            .with_context(|| format!("failed to open Signal session store at `{url}`"))?;
+            SignalStore::load_registered(store, &policy).await
+        }
+        .await;
+        match loaded {
+            Ok(manager) => break manager,
             Err(error) => {
-                terminate_worker(
-                    "runtime",
-                    &format!("failed to build tokio runtime: {error}"),
-                    0,
-                );
+                record_session_failure(&format!("{error:#}"), &mut consecutive_failures, backoff);
+                sleep_until_stopped(&stop, reconnect_backoff(backoff)).await;
+                backoff = std::cmp::min(backoff * 2, MAX_RECONNECT_BACKOFF);
             }
-        };
+        }
+    };
 
-        let mut connected_at = None;
-        let outcome = runtime.block_on(run_receive_loop(
-            url.clone(),
-            passphrase.clone(),
+    let connection_gate = AsyncMutex::new(());
+    drive_worker_tasks(
+        supervise_receive_loop(
+            manager.clone(),
             &stdout_lock,
             &stop,
-            &mut connected_at,
             &policy,
             &account_id,
-        ));
+            (consecutive_failures, backoff),
+            &connection_gate,
+        ),
+        run_commands(manager, commands, &connection_gate),
+    )
+    .await
+}
+
+async fn drive_worker_tasks(
+    receive: impl Future<Output = Result<()>>,
+    commands: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    tokio::select! {
+        result = receive => result,
+        result = commands => result,
+    }
+}
+
+async fn run_commands(
+    mut manager: Manager<SignalStore, Registered>,
+    mut commands: mpsc::UnboundedReceiver<WorkerCommand>,
+    connection_gate: &AsyncMutex<()>,
+) -> Result<()> {
+    while let Some(command) = commands.recv().await {
+        // Reconnecting must not replace a socket during an outbound send.
+        let _connection = connection_gate.lock().await;
+        match command {
+            WorkerCommand::Deliver {
+                config,
+                message,
+                policy,
+                reply,
+            } => {
+                let result =
+                    crate::deliver::deliver_with_manager(&mut manager, &config, &message, &policy)
+                        .await;
+                let _ = reply.send(result);
+            }
+            WorkerCommand::Status {
+                frame,
+                policy,
+                reply,
+            } => {
+                let result =
+                    crate::status::status_with_manager(&mut manager, &frame, &policy).await;
+                let _ = reply.send(result);
+            }
+        }
+    }
+    Err(anyhow!("Signal worker command channel closed"))
+}
+
+/// Reconnect transient failures and exit after a terminal failure so the host can replace the plugin.
+async fn supervise_receive_loop(
+    mut manager: Manager<SignalStore, Registered>,
+    stdout_lock: &Arc<Mutex<()>>,
+    stop: &Arc<AtomicBool>,
+    policy: &SignalChannelPolicy,
+    account_id: &str,
+    retry_state: (u32, Duration),
+    connection_gate: &AsyncMutex<()>,
+) -> Result<()> {
+    let (mut consecutive_failures, mut backoff) = retry_state;
+    while !stop.load(Ordering::Relaxed) {
+        let mut connected_at = None;
+        let outcome = run_receive_loop(
+            &mut manager,
+            stdout_lock,
+            stop,
+            &mut connected_at,
+            policy,
+            account_id,
+            connection_gate,
+        )
+        .await;
         if session_was_stable(connected_at.map(|started| started.elapsed())) {
             consecutive_failures = 0;
             backoff = INITIAL_RECONNECT_BACKOFF;
         }
 
         let reason = match classify_session_end(outcome, stop.load(Ordering::Relaxed)) {
-            SessionEnd::Stopped => return,
+            SessionEnd::Stopped => return Ok(()),
             SessionEnd::Failed(reason) => reason,
         };
-        consecutive_failures += 1;
-        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-            terminate_worker("transport", &reason, consecutive_failures);
-        }
-        eprintln!(
-            "channel-signal receive worker reconnecting: reason=transport retry_count={consecutive_failures} backoff_ms={} message={reason}",
-            backoff.as_millis()
-        );
-        sleep_until_stopped(&stop, reconnect_backoff(backoff));
+        record_session_failure(&reason, &mut consecutive_failures, backoff);
+        sleep_until_stopped(stop, reconnect_backoff(backoff)).await;
         backoff = std::cmp::min(backoff * 2, MAX_RECONNECT_BACKOFF);
     }
+    Ok(())
+}
+
+fn record_session_failure(reason: &str, consecutive_failures: &mut u32, backoff: Duration) {
+    *consecutive_failures += 1;
+    if *consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+        terminate_worker("transport", reason, *consecutive_failures);
+    }
+    eprintln!(
+        "channel-signal receive worker reconnecting: reason=transport retry_count={consecutive_failures} backoff_ms={} message={reason}",
+        backoff.as_millis()
+    );
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -199,11 +398,11 @@ fn terminate_worker(reason: &str, message: &str, retry_count: u32) -> ! {
     std::process::exit(1);
 }
 
-fn sleep_until_stopped(stop: &AtomicBool, total: Duration) {
+async fn sleep_until_stopped(stop: &AtomicBool, total: Duration) {
     let mut slept = Duration::ZERO;
     while slept < total && !stop.load(Ordering::Relaxed) {
         let step = std::cmp::min(Duration::from_millis(250), total - slept);
-        std::thread::sleep(step);
+        tokio::time::sleep(step).await;
         slept += step;
     }
 }
@@ -256,15 +455,20 @@ fn jitter_seed() -> u64 {
 /// drain in the same cycle. Tunable via
 /// `ChannelConfig::poll_timeout_secs`.
 const DEFAULT_POLL_TIMEOUT_SECS: u16 = 10;
+/// Batches one `poll_ingress` request may submit. Of the host's 32-frame
+/// acceptance page, slots stay free for a replayed pending original and the
+/// final state batch.
+const POLL_BATCH_BUDGET: usize = 30;
 
-/// Run a single `poll_ingress` cycle and return all inbound events
-/// that presage delivers before the first `QueueEmpty` marker or the
-/// configured timeout elapses, whichever comes first.
+/// Run a single `poll_ingress` cycle, durably delivering inbound events that
+/// presage yields before the first `QueueEmpty` marker, the configured
+/// timeout, or the batch budget, and return how many were accepted.
 pub fn poll_ingress_once(
     config: &ChannelConfig,
     policy: &SignalChannelPolicy,
     account_id: &str,
-) -> Result<Vec<InboundEventEnvelope>> {
+    stdout_lock: Arc<Mutex<()>>,
+) -> Result<usize> {
     let store_path = resolve_store_path(config)?;
     if !store_path.exists() {
         return Err(anyhow!(
@@ -285,12 +489,15 @@ pub fn poll_ingress_once(
     let handle = std::thread::Builder::new()
         .name("channel-signal-poll".to_string())
         .stack_size(SIGNAL_THREAD_STACK_SIZE)
-        .spawn(move || -> Result<Vec<InboundEventEnvelope>> {
-            let runtime = Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("failed to build poll-thread tokio runtime")?;
-            runtime.block_on(run_poll_once(url, passphrase, timeout, policy, account_id))
+        .spawn(move || -> Result<usize> {
+            run_signal_driver(run_poll_once(
+                url,
+                passphrase,
+                timeout,
+                policy,
+                account_id,
+                &stdout_lock,
+            ))
         })
         .context("failed to spawn channel-signal poll thread")?;
 
@@ -299,13 +506,30 @@ pub fn poll_ingress_once(
         .map_err(|_| anyhow!("channel-signal poll thread panicked"))?
 }
 
+async fn deliver_content_event<D, DF>(
+    event: Option<InboundEventEnvelope>,
+    deliver: D,
+) -> Result<bool>
+where
+    D: FnOnce(Vec<InboundEventEnvelope>) -> DF,
+    DF: Future<Output = Result<()>>,
+{
+    let admitted = event.is_some();
+    if let Some(event) = event {
+        deliver(vec![event]).await?;
+    }
+    Ok(admitted)
+}
+
 async fn run_poll_once(
     url: String,
     passphrase: Option<String>,
     timeout: std::time::Duration,
     policy: SignalChannelPolicy,
     account_id: String,
-) -> Result<Vec<InboundEventEnvelope>> {
+    stdout_lock: &Arc<Mutex<()>>,
+) -> Result<usize> {
+    replay_pending_event_batch_until(stdout_lock, &|| false)?;
     let store =
         SqliteStore::open_with_passphrase(&url, passphrase.as_deref(), OnNewIdentity::Trust)
             .await
@@ -317,11 +541,10 @@ async fn run_poll_once(
         .map_err(|error| anyhow!("failed to open Signal receive stream: {error}"))?;
     let mut messages = std::pin::pin!(messages);
 
-    // Drain messages until we see QueueEmpty, the stream ends, or the
-    // deadline elapses. Events accumulated before a timeout are
-    // preserved and returned to the caller.
+    // Upstream acknowledges before yielding content. The host journal is the
+    // first durable event-delivery boundary that this plugin controls.
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut events: Vec<InboundEventEnvelope> = Vec::new();
+    let mut accepted = 0;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -329,10 +552,16 @@ async fn run_poll_once(
         }
         match tokio::time::timeout(remaining, messages.next()).await {
             Ok(Some(Received::Content(content))) => {
-                if let Some(event) =
-                    build_inbound_event_from_content(&content, &policy, &account_id)
+                if deliver_content_event(
+                    build_inbound_event_from_content(&content, &policy, &account_id),
+                    |events| emit_events(stdout_lock, None, events),
+                )
+                .await?
                 {
-                    events.push(event);
+                    accepted += 1;
+                }
+                if accepted == POLL_BATCH_BUDGET {
+                    break;
                 }
             }
             Ok(Some(Received::QueueEmpty)) => break,
@@ -344,23 +573,20 @@ async fn run_poll_once(
             Err(_) => break,
         }
     }
-    Ok(events)
+    Ok(accepted)
 }
 
 async fn run_receive_loop(
-    url: String,
-    passphrase: Option<String>,
+    manager: &mut Manager<SignalStore, Registered>,
     stdout_lock: &Arc<Mutex<()>>,
-    stop_flag: &AtomicBool,
+    stop_flag: &Arc<AtomicBool>,
     connected_at: &mut Option<Instant>,
     policy: &SignalChannelPolicy,
     account_id: &str,
+    connection_gate: &AsyncMutex<()>,
 ) -> Result<()> {
-    let store =
-        SqliteStore::open_with_passphrase(&url, passphrase.as_deref(), OnNewIdentity::Trust)
-            .await
-            .with_context(|| format!("failed to open Signal session store at `{url}`"))?;
-    let mut manager = SignalStore::load_registered(store, policy).await?;
+    replay_events(stdout_lock, stop_flag).await?;
+    let connection = connection_gate.lock().await;
     let messages = track_connection(
         async {
             manager
@@ -371,10 +597,11 @@ async fn run_receive_loop(
         connected_at,
     )
     .await?;
+    drop(connection);
     let mut messages = std::pin::pin!(messages);
 
     // Publish the first heartbeat only after the receive stream opens.
-    emit_events(stdout_lock, Vec::new())?;
+    publish_channel_heartbeat(stdout_lock)?;
     let mut last_heartbeat = Instant::now();
 
     loop {
@@ -390,36 +617,71 @@ async fn run_receive_loop(
             Err(_) => None,
         };
 
-        if stop_flag.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let content = match received {
-            Some(Received::Content(content)) => Some(content),
+        // Upstream acknowledged this envelope before yielding it, so content
+        // is journaled even when stop was requested; the receipt wait then
+        // observes the stop and leaves the batch for replay.
+        let mut emitted = false;
+        match received {
+            Some(Received::Content(content)) => {
+                emitted = deliver_content_event(
+                    build_inbound_event_from_content(&content, policy, account_id),
+                    |events| emit_events(stdout_lock, Some(stop_flag), events),
+                )
+                .await?;
+            }
             Some(Received::DecryptionError(_)) => {
                 eprintln!("channel-signal message skipped: reason=decryption_error");
-                None
             }
-            _ => None,
-        };
-        let mut emitted = false;
-        if let Some(content) = content
-            && let Some(event) = build_inbound_event_from_content(&content, policy, account_id)
-        {
-            emit_events(stdout_lock, vec![event])?;
-            emitted = true;
+            Some(Received::Contacts | Received::QueueEmpty) | None => {}
         }
 
         if emitted || last_heartbeat.elapsed() >= LIVENESS_HEARTBEAT_INTERVAL {
             if !emitted {
-                emit_events(stdout_lock, Vec::new())?;
+                publish_channel_heartbeat(stdout_lock)?;
             }
             last_heartbeat = Instant::now();
         }
     }
 }
 
-fn emit_events(stdout_lock: &Arc<Mutex<()>>, events: Vec<InboundEventEnvelope>) -> Result<()> {
-    crate::emit_channel_event_notifications(stdout_lock, events)
+/// Receipt waits must not block the runtime that also serves outbound commands.
+async fn replay_events(stdout_lock: &Arc<Mutex<()>>, stop_flag: &Arc<AtomicBool>) -> Result<()> {
+    let stdout_lock = Arc::clone(stdout_lock);
+    let stop_flag = Arc::clone(stop_flag);
+    tokio::task::spawn_blocking(move || {
+        replay_pending_event_batch_until(&stdout_lock, &|| stop_flag.load(Ordering::Relaxed))
+    })
+    .await
+    .map_err(|error| anyhow!("Signal durable replay task failed: {error}"))??;
+    Ok(())
+}
+
+/// Journal a batch and await its host receipt off the receive runtime.
+async fn emit_events(
+    stdout_lock: &Arc<Mutex<()>>,
+    stop_flag: Option<&Arc<AtomicBool>>,
+    events: Vec<InboundEventEnvelope>,
+) -> Result<()> {
+    let stdout_lock = Arc::clone(stdout_lock);
+    let stop_flag = stop_flag.cloned();
+    tokio::task::spawn_blocking(move || {
+        deliver_channel_event_batch_until(
+            &stdout_lock,
+            ChannelEventBatch {
+                events,
+                state: None,
+                poll_after_ms: None,
+            },
+            &|| {
+                stop_flag
+                    .as_ref()
+                    .is_some_and(|stop| stop.load(Ordering::Relaxed))
+            },
+        )
+    })
+    .await
+    .map_err(|error| anyhow!("Signal durable delivery task failed: {error}"))??;
+    Ok(())
 }
 
 /// Convert a Signal `Content` into the Dispatch inbound event shape.
@@ -505,8 +767,14 @@ fn inbound_event(
         attachments.len().to_string(),
     );
 
+    // A replayed envelope must map to identical bytes, so an out-of-range
+    // sender timestamp clamps deterministically instead of using the clock.
     let received_at = Timestamp::from_millisecond(timestamp_ms)
-        .unwrap_or_else(|_| Timestamp::now())
+        .unwrap_or(if timestamp_ms < 0 {
+            Timestamp::MIN
+        } else {
+            Timestamp::MAX
+        })
         .to_string();
 
     let content_text = if text.is_empty() {
@@ -605,9 +873,368 @@ mod tests {
     use super::*;
     use crate::protocol::{DmPolicy, SignalChannelPolicy};
     use presage::libsignal_service::content::GroupContextV2;
+    use tokio::sync::oneshot;
 
     fn service_id(value: u8) -> String {
         format!("00000000-0000-0000-0000-0000000000{value:02}")
+    }
+
+    #[test]
+    fn signal_driver_runs_local_tasks_and_preserves_errors() {
+        let value = run_signal_driver(async {
+            let value = std::rc::Rc::new(std::cell::Cell::new(0));
+            let task_value = value.clone();
+            tokio::task::spawn_local(async move {
+                tokio::task::yield_now().await;
+                task_value.set(42);
+            })
+            .await?;
+            Ok(value.get())
+        })
+        .unwrap();
+        assert_eq!(value, 42);
+
+        let error = run_signal_driver(async {
+            tokio::task::spawn_local(async { Err::<(), _>(anyhow!("local operation failed")) })
+                .await?
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "local operation failed");
+    }
+
+    fn worker_command_harness() -> (IngressWorker, mpsc::UnboundedReceiver<WorkerCommand>) {
+        let config = ChannelConfig {
+            dm_policy: DmPolicy::Open,
+            sqlite_store_path: Some("/nonexistent/signal-worker/store.db".to_string()),
+            ..ChannelConfig::default()
+        };
+        let policy = SignalChannelPolicy::from_config(&config).unwrap();
+        let (commands, receiver) = mpsc::unbounded_channel();
+        (
+            IngressWorker {
+                stop: Arc::new(AtomicBool::new(false)),
+                handle: None,
+                commands,
+                config,
+                policy,
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn worker_delivery_preserves_policy_and_returns_transport_errors_without_retry() {
+        let (worker, mut commands) = worker_command_harness();
+        let expected_config = worker.config.clone();
+        let expected_policy = worker.policy.clone();
+        let message = OutboundMessage {
+            content: "hello".to_string(),
+            content_type: None,
+            attachments: Vec::new(),
+            metadata: BTreeMap::from([("conversation_id".to_string(), service_id(1))]),
+        };
+        let expected_message = message.clone();
+        let handle = std::thread::spawn(move || {
+            let WorkerCommand::Deliver {
+                config,
+                message,
+                policy,
+                reply,
+            } = commands.blocking_recv().unwrap()
+            else {
+                panic!("expected delivery command");
+            };
+            assert_eq!(config, expected_config);
+            assert_eq!(policy, expected_policy);
+            assert_eq!(message, expected_message);
+            reply
+                .send(Err(anyhow!("transport rejected the message")))
+                .unwrap();
+            commands
+        });
+        let error = worker
+            .deliver(&worker.config, &message, &worker.policy)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "transport rejected the message");
+        // The caller has returned the failure without submitting it again.
+        let mut commands = handle.join().unwrap();
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn active_worker_rejects_changed_configuration_and_competing_poll() {
+        let (worker, mut commands) = worker_command_harness();
+        let message = OutboundMessage {
+            content: "hello".to_string(),
+            content_type: None,
+            attachments: Vec::new(),
+            metadata: BTreeMap::from([("conversation_id".to_string(), service_id(1))]),
+        };
+        let mut changed = worker.config.clone();
+        changed.account = Some("another-account".to_string());
+        let error = worker
+            .deliver(&changed, &message, &worker.policy)
+            .unwrap_err();
+        assert!(error.to_string().contains("configuration changed"));
+        assert!(commands.try_recv().is_err());
+
+        let request = crate::protocol::PluginRequestEnvelope {
+            protocol_version: crate::protocol::CHANNEL_PLUGIN_PROTOCOL_VERSION,
+            request: crate::protocol::PluginRequest::PollIngress {
+                config: worker.config.clone(),
+                state: None,
+                storage: dispatch_channel_protocol::ChannelIngressStorage {
+                    journal_path: "/nonexistent/signal-worker/producer.journal".to_string(),
+                    recovery: None,
+                },
+            },
+        };
+        let mut worker = Some(worker);
+        let response = crate::handle_request(&request, &Arc::new(Mutex::new(())), &mut worker);
+        let crate::protocol::PluginResponse::Error { error } = response else {
+            panic!("expected poll rejection");
+        };
+        assert_eq!(error.code, "poll_ingress_failed");
+        assert!(error.message.contains("stop ingress before polling"));
+        assert!(worker.is_some());
+        assert!(commands.try_recv().is_err());
+
+        // A stopping worker refuses new sends instead of queueing them.
+        let worker = worker.unwrap();
+        worker.stop.store(true, Ordering::Relaxed);
+        let error = worker
+            .deliver(&worker.config, &message, &worker.policy)
+            .unwrap_err();
+        assert!(error.to_string().contains("stopping"));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn event_delivery_waits_for_the_host_receipt_and_propagates_failure() {
+        let sender = service_id(1);
+        let policy = SignalChannelPolicy::from_config(&ChannelConfig {
+            dm_policy: DmPolicy::Allowlist,
+            allowed_dm_sender_ids: vec![sender.clone()],
+            ..ChannelConfig::default()
+        })
+        .unwrap();
+        let event =
+            inbound_event(sender, 42, "hello", Vec::new(), &policy, &service_id(9)).unwrap();
+        let (delivery_started, started) = oneshot::channel();
+        let (receipt, accepted) = oneshot::channel();
+        let expected_event = event.clone();
+        let task = tokio::spawn(deliver_content_event(
+            Some(event.clone()),
+            move |events| async move {
+                assert_eq!(
+                    serde_json::to_value(&events).unwrap(),
+                    serde_json::to_value([expected_event]).unwrap()
+                );
+                delivery_started.send(()).unwrap();
+                accepted.await.map_err(anyhow::Error::from)
+            },
+        ));
+        started.await.unwrap();
+        assert!(!task.is_finished());
+        receipt.send(()).unwrap();
+        assert!(task.await.unwrap().unwrap());
+
+        let error = deliver_content_event(Some(event), |_| async {
+            Err(anyhow!("host did not persist the event"))
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("host did not persist"));
+    }
+
+    fn allowed_event() -> InboundEventEnvelope {
+        let sender = service_id(1);
+        let policy = SignalChannelPolicy::from_config(&ChannelConfig {
+            dm_policy: DmPolicy::Allowlist,
+            allowed_dm_sender_ids: vec![sender.clone()],
+            ..ChannelConfig::default()
+        })
+        .unwrap();
+        inbound_event(sender, 42, "hello", Vec::new(), &policy, &service_id(9)).unwrap()
+    }
+
+    /// Configure a private host journal like the host would.
+    fn host_journal(stdout_lock: &Arc<Mutex<()>>, name: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "channel-signal-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        dispatch_channel_runtime::create_event_journal_directory(&directory).unwrap();
+        let journal = directory.join("producer.journal");
+        dispatch_channel_runtime::configure_event_storage(
+            stdout_lock,
+            &dispatch_channel_protocol::ChannelIngressStorage {
+                journal_path: journal.to_string_lossy().into_owned(),
+                recovery: None,
+            },
+        )
+        .unwrap();
+        journal
+    }
+
+    fn journaled_request(
+        journal: &std::path::Path,
+    ) -> Option<dispatch_channel_protocol::ChannelEventRequest> {
+        let line = std::fs::read_to_string(journal).ok()?;
+        match dispatch_channel_protocol::parse_jsonrpc_message(&line).ok()? {
+            dispatch_channel_protocol::PluginMessage::EventRequest { request, .. } => Some(request),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn worker_commands_progress_during_delivery_and_replay_receipt_waits() {
+        run_signal_driver(async {
+            for replay in [false, true] {
+                let stdout_lock = Arc::new(Mutex::new(()));
+                let journal = host_journal(&stdout_lock, "worker-receipt");
+                let stop = Arc::new(AtomicBool::new(replay));
+                if replay {
+                    emit_events(&stdout_lock, Some(&stop), vec![allowed_event()])
+                        .await
+                        .unwrap_err();
+                    stop.store(false, Ordering::Relaxed);
+                }
+                // A receipt wait that blocked this runtime would also block the
+                // command that routes the receipt; stop turns that into a failure.
+                let watchdog = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(15));
+                    watchdog.store(true, Ordering::Relaxed);
+                });
+                let command_completed = AtomicBool::new(false);
+                let outcome = drive_worker_tasks(
+                    async {
+                        if replay {
+                            replay_events(&stdout_lock, &stop).await?;
+                        } else {
+                            emit_events(&stdout_lock, Some(&stop), vec![allowed_event()]).await?;
+                        }
+                        assert!(command_completed.load(Ordering::Relaxed));
+                        Ok(())
+                    },
+                    async {
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                        loop {
+                            if tokio::time::Instant::now() >= deadline {
+                                dispatch_channel_runtime::close_event_input(&stdout_lock);
+                                return Err(anyhow!(
+                                    "worker receipt wait blocked command processing"
+                                ));
+                            }
+                            if let Some(request) = journaled_request(&journal) {
+                                tokio::task::spawn_local(async { tokio::task::yield_now().await })
+                                    .await?;
+                                command_completed.store(true, Ordering::Relaxed);
+                                dispatch_channel_runtime::route_event_acceptance(
+                                    &stdout_lock,
+                                    request.request_id(),
+                                    request.acceptance().unwrap(),
+                                )?;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    },
+                )
+                .await;
+                dispatch_channel_runtime::close_event_input(&stdout_lock);
+                outcome?;
+                assert!(journaled_request(&journal).is_none());
+                std::fs::remove_dir_all(journal.parent().unwrap())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn journaled_event_completes_only_with_its_exact_host_receipt() {
+        let stdout_lock = Arc::new(Mutex::new(()));
+        let journal = host_journal(&stdout_lock, "receipt");
+        let event = allowed_event();
+        let event_id = event.event_id.clone();
+        let task = tokio::spawn({
+            let stdout_lock = Arc::clone(&stdout_lock);
+            async move { emit_events(&stdout_lock, None, vec![event]).await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let request = loop {
+            if let Some(request) = journaled_request(&journal) {
+                break request;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                dispatch_channel_runtime::close_event_input(&stdout_lock);
+                let _ = task.await;
+                panic!("event was not journaled before the deadline");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(request.batch.events[0].event_id, event_id);
+        assert!(!task.is_finished(), "delivery waits for the host receipt");
+        while !task.is_finished() {
+            if tokio::time::Instant::now() >= deadline {
+                dispatch_channel_runtime::close_event_input(&stdout_lock);
+                let _ = task.await;
+                panic!("event receipt was not completed before the deadline");
+            }
+            dispatch_channel_runtime::route_event_acceptance(
+                &stdout_lock,
+                request.request_id(),
+                request.acceptance().unwrap(),
+            )
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.await.unwrap().unwrap();
+        assert!(
+            journaled_request(&journal).is_none(),
+            "the receipt clears the pending batch"
+        );
+        std::fs::remove_dir_all(journal.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn content_received_during_stop_stays_journaled_for_replay() {
+        let stdout_lock = Arc::new(Mutex::new(()));
+        let journal = host_journal(&stdout_lock, "stop");
+        let event = allowed_event();
+        let stop = Arc::new(AtomicBool::new(true));
+        let error = emit_events(&stdout_lock, Some(&stop), vec![event.clone()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("stopped"));
+        let pending = journaled_request(&journal).expect("the batch is journaled");
+        assert_eq!(
+            serde_json::to_value(&pending.batch.events).unwrap(),
+            serde_json::to_value([event]).unwrap()
+        );
+        std::fs::remove_dir_all(journal.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn filtered_content_does_not_submit_a_host_batch() {
+        let submitted = AtomicBool::new(false);
+        assert!(
+            !deliver_content_event(None, |_| async {
+                submitted.store(true, Ordering::Relaxed);
+                Ok(())
+            })
+            .await
+            .unwrap()
+        );
+        assert!(!submitted.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -777,10 +1404,9 @@ mod tests {
             worker_finished.store(true, Ordering::Relaxed);
         });
 
-        let worker = IngressWorker {
-            stop,
-            handle: Some(handle),
-        };
+        let (mut worker, _commands) = worker_command_harness();
+        worker.stop = stop;
+        worker.handle = Some(handle);
 
         worker.stop();
         assert!(finished.load(Ordering::Relaxed));

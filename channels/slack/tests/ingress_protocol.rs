@@ -1,8 +1,11 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, ExitStatus, Stdio};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -48,10 +51,6 @@ fn wrap_request(request: Value) -> Value {
     })
 }
 
-fn run_request(request: Value) -> Value {
-    run_request_with_env(request, BTreeMap::new())
-}
-
 fn authenticated_ingress_state() -> Value {
     json!({
         "mode": "events_webhook",
@@ -64,50 +63,184 @@ fn authenticated_ingress_state() -> Value {
 }
 
 fn run_request_with_env(request: Value, envs: BTreeMap<String, String>) -> Value {
-    run_request_with_env_and_stderr(request, envs).0
+    run_ingress_with_env_and_stderr(request, envs).0
 }
 
-fn run_request_with_env_and_stderr(
+fn run_ingress(request: Value) -> (Value, Vec<Value>) {
+    run_ingress_with_env(request, BTreeMap::new())
+}
+
+fn run_ingress_with_env(request: Value, envs: BTreeMap<String, String>) -> (Value, Vec<Value>) {
+    let (result, events, _) = run_ingress_with_env_and_stderr(request, envs);
+    (result, events)
+}
+
+/// Send one request to a hosted plugin and return its control result, the
+/// events of every batch the host confirmed before that result, and stderr.
+fn run_ingress_with_env_and_stderr(
     request: Value,
     envs: BTreeMap<String, String>,
-) -> (Value, String) {
-    let binary = std::env::var("CARGO_BIN_EXE_channel-slack").expect("channel-slack binary path");
-    let mut child = Command::new(binary)
-        .env_remove("SLACK_BOT_TOKEN")
-        .env_remove("SLACK_API_BASE_URL")
-        .envs(envs)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn channel-slack");
-
-    let mut stdin = child.stdin.take().expect("child stdin");
-    writeln!(stdin, "{}", wrap_request(request)).expect("write request");
-    drop(stdin);
-
-    let output = child.wait_with_output().expect("wait for child");
+) -> (Value, Vec<Value>, String) {
+    let plugin = HostedPlugin::spawn(envs, |_| {});
+    plugin.send(request);
+    let mut events = Vec::new();
+    let response = loop {
+        let message = plugin.next_message();
+        if message["method"] == "channel.event" {
+            events.extend(confirmed_events(&message));
+        } else if message["id"] == 1 {
+            break message;
+        }
+    };
+    let (status, _, stderr) = plugin.finish();
     assert!(
-        output.status.success(),
-        "channel-slack failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        status.success(),
+        "channel-slack failed: {status}\nstderr:\n{stderr}"
     );
-
-    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
-    let line = stdout
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .expect("response line");
-    let response: Value = serde_json::from_str(line).expect("parse response");
     let payload = response
         .get("result")
         .cloned()
         .unwrap_or_else(|| response["error"]["data"]["dispatch_error"].clone());
-    (
-        payload,
-        String::from_utf8(output.stderr).expect("stderr utf-8"),
-    )
+    (payload, events, stderr)
+}
+
+fn confirmed_events(message: &Value) -> Vec<Value> {
+    message["params"]["batch"]["events"]
+        .as_array()
+        .expect("batch events")
+        .clone()
+}
+
+/// Exact durable receipt for one `channel.event` request.
+fn receipt_for(message: &Value) -> Value {
+    let params = &message["params"];
+    let event_ids: Vec<Value> = params["batch"]["events"]
+        .as_array()
+        .expect("batch events")
+        .iter()
+        .map(|event| event["event_id"].clone())
+        .collect();
+    json!({
+        "jsonrpc": "2.0",
+        "id": message["id"].clone(),
+        "result": {
+            "kind": "accepted",
+            "batch_digest": params["batch_digest"].clone(),
+            "event_ids": event_ids,
+            "sequence": params["previous_acceptance"]["sequence"]
+                .as_u64()
+                .map_or(1, |sequence| sequence + 1)
+        }
+    })
+}
+
+/// A plugin process driven like a host: ingress requests carry private
+/// journal storage, and a reader thread answers every `channel.event`
+/// request with its exact receipt after `before_receipt` returns.
+struct HostedPlugin {
+    child: Child,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    messages: Receiver<Value>,
+    reader: thread::JoinHandle<()>,
+    directory: PathBuf,
+}
+
+impl HostedPlugin {
+    fn spawn(
+        envs: BTreeMap<String, String>,
+        before_receipt: impl Fn(&Value) + Send + 'static,
+    ) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "channel-slack-ingress-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        dispatch_channel_runtime::create_event_journal_directory(&directory)
+            .expect("create private journal directory");
+        let binary =
+            std::env::var("CARGO_BIN_EXE_channel-slack").expect("channel-slack binary path");
+        let mut child = Command::new(binary)
+            .env_remove("SLACK_BOT_TOKEN")
+            .env_remove("SLACK_API_BASE_URL")
+            .envs(envs)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn channel-slack");
+        let stdin = Arc::new(Mutex::new(Some(child.stdin.take().expect("child stdin"))));
+        let stdout = child.stdout.take().expect("child stdout");
+        let (send, messages) = mpsc::channel();
+        let receipts = Arc::clone(&stdin);
+        let reader = thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let message: Value = serde_json::from_str(&line).expect("parse plugin json");
+                if message["method"] == "channel.event" {
+                    before_receipt(&message);
+                    if let Some(stdin) = receipts.lock().unwrap().as_mut() {
+                        let _ = writeln!(stdin, "{}", receipt_for(&message));
+                    }
+                }
+                let _ = send.send(message);
+            }
+        });
+        Self {
+            child,
+            stdin,
+            messages,
+            reader,
+            directory,
+        }
+    }
+
+    fn send(&self, request: Value) {
+        let mut wrapped = wrap_request(request);
+        if matches!(
+            wrapped["params"]["kind"].as_str(),
+            Some("start_ingress" | "poll_ingress" | "ingress_event")
+        ) {
+            wrapped["params"]["storage"] = json!({
+                "journal_path": self.directory.join("producer.journal").to_string_lossy()
+            });
+        }
+        let mut stdin = self.stdin.lock().unwrap();
+        writeln!(stdin.as_mut().expect("open stdin"), "{wrapped}").expect("write request");
+    }
+
+    fn try_exit(&mut self) -> Option<ExitStatus> {
+        self.child.try_wait().expect("poll child")
+    }
+
+    fn next_message(&self) -> Value {
+        self.messages
+            .recv_timeout(Duration::from_secs(20))
+            .expect("plugin output before timeout")
+    }
+
+    fn finish(mut self) -> (ExitStatus, Vec<Value>, String) {
+        self.stdin.lock().unwrap().take();
+        let status = self.child.wait().expect("wait for child");
+        self.reader.join().expect("plugin output reader");
+        let remaining = self.messages.try_iter().collect();
+        let mut stderr = String::new();
+        self.child
+            .stderr
+            .take()
+            .expect("child stderr")
+            .read_to_string(&mut stderr)
+            .expect("read child stderr");
+        std::fs::remove_dir_all(&self.directory).expect("remove journal directory");
+        (status, remaining, stderr)
+    }
 }
 
 #[derive(Debug)]
@@ -194,82 +327,59 @@ fn read_api_request(stream: &mut std::net::TcpStream) -> CapturedApiRequest {
     }
 }
 
-fn read_message(reader: &mut BufReader<std::process::ChildStdout>) -> Value {
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let bytes = reader.read_line(&mut line).expect("read child stdout");
-        assert!(
-            bytes > 0,
-            "slack child exited before emitting expected output"
-        );
-        if !line.trim().is_empty() {
-            return serde_json::from_str(line.trim()).expect("parse plugin json");
+/// Start Socket Mode ingress and return the start result with the first
+/// event-bearing `channel.event` request. Before each event receipt the host
+/// proves the provider envelope is still unacknowledged.
+fn run_start_ingress_cycle(
+    config: Value,
+    envs: BTreeMap<String, String>,
+    acknowledged: Receiver<()>,
+) -> (Value, Value) {
+    let acknowledged = Mutex::new(acknowledged);
+    let plugin = HostedPlugin::spawn(envs, move |message| {
+        if !confirmed_events(message).is_empty() {
+            let acknowledged = acknowledged.lock().unwrap();
+            assert!(
+                acknowledged
+                    .recv_timeout(Duration::from_millis(200))
+                    .is_err(),
+                "Slack envelope was acknowledged before the host receipt"
+            );
         }
-    }
-}
+    });
+    plugin.send(json!({
+        "protocol_version": 2,
+        "request": {
+            "kind": "start_ingress",
+            "config": config,
+            "state": null
+        }
+    }));
 
-fn run_start_ingress_cycle(config: Value, envs: BTreeMap<String, String>) -> (Value, Value) {
-    let binary = std::env::var("CARGO_BIN_EXE_channel-slack").expect("channel-slack binary path");
-    let mut child = Command::new(binary)
-        .env_remove("SLACK_BOT_TOKEN")
-        .env_remove("SLACK_API_BASE_URL")
-        .envs(envs)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn channel-slack");
-
-    let mut stdin = child.stdin.take().expect("child stdin");
-    writeln!(
-        stdin,
-        "{}",
-        wrap_request(json!({
-            "protocol_version": 1,
-            "request": {
-                "kind": "start_ingress",
-                "config": config,
-                "state": null
-            }
-        }))
-    )
-    .expect("write start_ingress request");
-
-    let stdout = child.stdout.take().expect("child stdout");
-    let mut reader = BufReader::new(stdout);
     let mut response = None;
-    let mut notification = None;
-    for _ in 0..4 {
-        let message = read_message(&mut reader);
-        if let Some(result) = message.get("result") {
-            response = Some(result.clone());
-        } else if message["method"] == "channel.event" {
-            notification = Some(message["params"].clone());
-        }
-        if response.is_some() && notification.is_some() {
-            break;
+    let mut event_request = None;
+    while response.is_none() || event_request.is_none() {
+        let message = plugin.next_message();
+        if message["id"] == 1 {
+            response = Some(message["result"].clone());
+        } else if message["method"] == "channel.event" && !confirmed_events(&message).is_empty() {
+            event_request = Some(message["params"].clone());
         }
     }
 
-    writeln!(
-        stdin,
-        "{}",
-        wrap_request(json!({
-            "protocol_version": 1,
-            "request": { "kind": "shutdown" }
-        }))
-    )
-    .expect("write shutdown request");
-    drop(stdin);
-    let status = child.wait().expect("wait for child");
+    plugin.send(json!({
+        "protocol_version": 2,
+        "request": { "kind": "shutdown" }
+    }));
+    let (status, _, stderr) = plugin.finish();
     assert!(
         status.success(),
-        "channel-slack exited unsuccessfully: {status}"
+        "channel-slack exited unsuccessfully: {status}\nstderr:\n{stderr}"
     );
 
     (
         response.expect("start_ingress response"),
-        notification.expect("channel.event notification"),
+        event_request.expect("channel.event request"),
     )
 }
 
@@ -278,11 +388,12 @@ fn serve_slack_socket_mode_once(
     event_payload: Value,
     expected_app_token: &str,
     expected_bot_token: &str,
-) -> String {
+) -> (String, Receiver<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind slack socket test listener");
     let addr = listener.local_addr().expect("listener addr");
     let expected_app_token = expected_app_token.to_string();
     let expected_bot_token = expected_bot_token.to_string();
+    let (acknowledged_tx, acknowledged_rx) = mpsc::channel();
 
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept auth request");
@@ -374,11 +485,12 @@ fn serve_slack_socket_mode_once(
         };
         let ack_json: Value = serde_json::from_str(ack_text.as_str()).expect("parse socket ack");
         assert_eq!(ack_json["envelope_id"], "socket-env-1");
+        let _ = acknowledged_tx.send(());
 
         websocket.close(None).expect("close websocket");
     });
 
-    format!("http://{addr}/api")
+    (format!("http://{addr}/api"), acknowledged_rx)
 }
 
 fn write_api_json_response(stream: &mut std::net::TcpStream, body: Value) {
@@ -556,102 +668,60 @@ fn serve_slack_socket_mode_recovery(
     (format!("http://{address}/api"), recovered_rx, server)
 }
 
+/// Run supervised Socket Mode through the recovery server and return the start
+/// result, every confirmed batch, and stderr.
 fn run_start_ingress_recovery_cycle(
     config: Value,
     envs: BTreeMap<String, String>,
     recovered: Receiver<()>,
 ) -> (Value, Vec<Value>, String) {
-    let binary = std::env::var("CARGO_BIN_EXE_channel-slack").expect("channel-slack binary path");
-    let mut child = Command::new(binary)
-        .env_remove("SLACK_BOT_TOKEN")
-        .env_remove("SLACK_API_BASE_URL")
-        .envs(envs)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn channel-slack");
+    let plugin = HostedPlugin::spawn(envs, |_| {});
+    plugin.send(json!({
+        "protocol_version": 2,
+        "request": {
+            "kind": "start_ingress",
+            "config": config,
+            "state": null
+        }
+    }));
 
-    let mut stdin = child.stdin.take().expect("child stdin");
-    writeln!(
-        stdin,
-        "{}",
-        wrap_request(json!({
-            "protocol_version": 1,
-            "request": {
-                "kind": "start_ingress",
-                "config": config,
-                "state": null
-            }
-        }))
-    )
-    .expect("write start_ingress request");
-
-    let stdout = child.stdout.take().expect("child stdout");
-    let mut reader = BufReader::new(stdout);
     let mut response = None;
-    let mut notifications = Vec::new();
+    let mut batches: Vec<Value> = Vec::new();
     while response.is_none()
-        || !notifications.iter().any(|notification: &Value| {
-            notification["events"]
+        || !batches.iter().any(|batch| {
+            batch["events"]
                 .as_array()
                 .is_some_and(|events| !events.is_empty())
         })
     {
-        let message = read_message(&mut reader);
-        if let Some(result) = message.get("result") {
-            response = Some(result.clone());
+        let message = plugin.next_message();
+        if message["id"] == 1 {
+            response = Some(message["result"].clone());
         } else if message["method"] == "channel.event" {
-            notifications.push(message["params"].clone());
+            batches.push(message["params"]["batch"].clone());
         }
     }
 
     recovered
         .recv_timeout(Duration::from_secs(20))
         .expect("Slack worker must process the redelivery without exiting");
-    writeln!(
-        stdin,
-        "{}",
-        wrap_request(json!({
-            "protocol_version": 1,
-            "request": { "kind": "shutdown" }
-        }))
-    )
-    .expect("write shutdown request");
-    drop(stdin);
-
-    let mut remaining_stdout = String::new();
-    reader
-        .read_to_string(&mut remaining_stdout)
-        .expect("read remaining child stdout");
-    for line in remaining_stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-    {
-        let message: Value = serde_json::from_str(line).expect("parse remaining plugin json");
-        if message["method"] == "channel.event" {
-            notifications.push(message["params"].clone());
-        }
-    }
-
-    let status = child.wait().expect("wait for child");
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .expect("child stderr")
-        .read_to_string(&mut stderr)
-        .expect("read child stderr");
+    plugin.send(json!({
+        "protocol_version": 2,
+        "request": { "kind": "shutdown" }
+    }));
+    let (status, remaining, stderr) = plugin.finish();
+    batches.extend(
+        remaining
+            .into_iter()
+            .filter(|message| message["method"] == "channel.event")
+            .map(|message| message["params"]["batch"].clone()),
+    );
     assert!(
         status.success(),
         "channel-slack exited unsuccessfully: {status}\nstderr:\n{stderr}"
     );
 
-    (
-        response.expect("start_ingress response"),
-        notifications,
-        stderr,
-    )
+    (response.expect("start_ingress response"), batches, stderr)
 }
 
 fn serve_slack_socket_mode_open_error(
@@ -700,42 +770,29 @@ fn run_start_ingress_expect_terminal(
     config: Value,
     envs: BTreeMap<String, String>,
 ) -> (String, ExitStatus) {
-    let binary = std::env::var("CARGO_BIN_EXE_channel-slack").expect("channel-slack binary path");
-    let mut child = Command::new(binary)
-        .env_remove("SLACK_BOT_TOKEN")
-        .env_remove("SLACK_API_BASE_URL")
-        .envs(envs)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn channel-slack");
-
-    let mut stdin = child.stdin.take().expect("child stdin");
-    writeln!(
-        stdin,
-        "{}",
-        wrap_request(json!({
-            "protocol_version": 1,
-            "request": {
-                "kind": "start_ingress",
-                "config": config,
-                "state": null
-            }
-        }))
-    )
-    .expect("write start_ingress request");
-
-    let status = child.wait().expect("wait for child");
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .expect("child stderr")
-        .read_to_string(&mut stderr)
-        .expect("read child stderr");
-    drop(stdin);
-
+    let mut plugin = HostedPlugin::spawn(envs, |_| {});
+    plugin.send(json!({
+        "protocol_version": 2,
+        "request": {
+            "kind": "start_ingress",
+            "config": config,
+            "state": null
+        }
+    }));
+    // The worker exits on its own; keep host input open until it does.
+    let mut child_exit = None;
+    for _ in 0..200 {
+        if let Some(status) = plugin.try_exit() {
+            child_exit = Some(status);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        child_exit.is_some(),
+        "terminal Socket Mode failure must exit the plugin"
+    );
+    let (status, _, stderr) = plugin.finish();
     (stderr, status)
 }
 
@@ -781,7 +838,7 @@ fn assert_event_push_route(
     })]);
     let push = run_request_with_env(
         json!({
-            "protocol_version": 1,
+            "protocol_version": 2,
             "request": {
                 "kind": "push",
                 "config": {
@@ -850,8 +907,8 @@ fn root_app_mention_round_trips_to_threaded_push() {
     })
     .to_string();
 
-    let response = run_request(json!({
-        "protocol_version": 1,
+    let (response, events) = run_ingress(json!({
+        "protocol_version": 2,
         "request": {
             "kind": "ingress_event",
             "config": {
@@ -874,7 +931,6 @@ fn root_app_mention_round_trips_to_threaded_push() {
 
     assert_eq!(response["kind"], "ingress_events_received");
     assert!(response["callback_reply"].is_null());
-    let events = response["events"].as_array().expect("events array");
     assert_eq!(events.len(), 1);
 
     let event = &events[0];
@@ -910,7 +966,7 @@ fn root_app_mention_round_trips_to_threaded_push() {
     })]);
     let push = run_request_with_env(
         json!({
-            "protocol_version": 1,
+            "protocol_version": 2,
             "request": {
                 "kind": "push",
                 "config": {
@@ -973,8 +1029,8 @@ fn root_direct_message_round_trips_to_top_level_push() {
     })
     .to_string();
 
-    let response = run_request(json!({
-        "protocol_version": 1,
+    let (response, events) = run_ingress(json!({
+        "protocol_version": 2,
         "request": {
             "kind": "ingress_event",
             "config": {
@@ -996,7 +1052,6 @@ fn root_direct_message_round_trips_to_top_level_push() {
     }));
 
     assert_eq!(response["kind"], "ingress_events_received");
-    let events = response["events"].as_array().expect("events array");
     assert_eq!(events.len(), 1);
     let event = &events[0];
     assert_eq!(event["event_id"], "EvRootDm");
@@ -1040,8 +1095,8 @@ fn threaded_direct_message_round_trips_to_threaded_push() {
     })
     .to_string();
 
-    let response = run_request(json!({
-        "protocol_version": 1,
+    let (response, events) = run_ingress(json!({
+        "protocol_version": 2,
         "request": {
             "kind": "ingress_event",
             "config": {
@@ -1063,7 +1118,6 @@ fn threaded_direct_message_round_trips_to_threaded_push() {
     }));
 
     assert_eq!(response["kind"], "ingress_events_received");
-    let events = response["events"].as_array().expect("events array");
     assert_eq!(events.len(), 1);
     let event = &events[0];
     assert_eq!(event["event_id"], "EvThreadedDm");
@@ -1092,7 +1146,7 @@ fn threaded_direct_message_round_trips_to_threaded_push() {
 fn denied_bot_token_push_returns_stable_code_before_network() {
     let response = run_request_with_env(
         json!({
-            "protocol_version": 1,
+            "protocol_version": 2,
             "request": {
                 "kind": "push",
                 "config": {
@@ -1153,7 +1207,7 @@ fn accepted_ingress_reacts_after_policy_checks_with_slack_timestamp() {
     };
     let request = |body: String| {
         json!({
-            "protocol_version": 1,
+            "protocol_version": 2,
             "request": {
                 "kind": "ingress_event",
                 "config": {
@@ -1176,19 +1230,14 @@ fn accepted_ingress_reacts_after_policy_checks_with_slack_timestamp() {
         })
     };
 
-    let rejected = run_request_with_env(request(event_body("C999")), envs.clone());
-    assert!(
-        rejected["events"]
-            .as_array()
-            .expect("events array")
-            .is_empty()
-    );
+    let (_, rejected) = run_ingress_with_env(request(event_body("C999")), envs.clone());
+    assert!(rejected.is_empty());
     assert!(request_rx.recv_timeout(Duration::from_millis(100)).is_err());
 
     for _ in 0..2 {
-        let (accepted, stderr) =
-            run_request_with_env_and_stderr(request(event_body("C123")), envs.clone());
-        let event = &accepted["events"][0];
+        let (_, accepted, stderr) =
+            run_ingress_with_env_and_stderr(request(event_body("C123")), envs.clone());
+        let event = &accepted[0];
         assert_eq!(event["message"]["id"], "1712860000.100200");
         assert_eq!(event["conversation"]["thread_id"], "1712860000.100200");
         assert!(event["conversation"]["parent_message_id"].is_null());
@@ -1236,9 +1285,9 @@ fn reaction_failure_is_fail_open_and_diagnostic_is_content_free() {
         }
     })
     .to_string();
-    let (response, stderr) = run_request_with_env_and_stderr(
+    let (_, events, stderr) = run_ingress_with_env_and_stderr(
         json!({
-            "protocol_version": 1,
+            "protocol_version": 2,
             "request": {
                 "kind": "ingress_event",
                 "config": {
@@ -1265,10 +1314,7 @@ fn reaction_failure_is_fail_open_and_diagnostic_is_content_free() {
         ]),
     );
 
-    assert_eq!(
-        response["events"].as_array().expect("events array").len(),
-        1
-    );
+    assert_eq!(events.len(), 1);
     request_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("reactions.add request");
@@ -1290,7 +1336,7 @@ fn root_app_mention_socket_mode_round_trips_to_threaded_push() {
     let app_token = "xapp-test-token";
     let bot_token_env = "SLACK_TEST_BOT_TOKEN_SOCKET";
     let bot_token = "xoxb-test-token";
-    let base_url = serve_slack_socket_mode_once(
+    let (base_url, acknowledged) = serve_slack_socket_mode_once(
         json!({
             "type": "event_callback",
             "team_id": "T123",
@@ -1313,7 +1359,7 @@ fn root_app_mention_socket_mode_round_trips_to_threaded_push() {
         bot_token,
     );
 
-    let (response, notification) = run_start_ingress_cycle(
+    let (response, event_request) = run_start_ingress_cycle(
         json!({
             "app_token_env": app_token_env,
             "bot_token_env": bot_token_env,
@@ -1330,13 +1376,16 @@ fn root_app_mention_socket_mode_round_trips_to_threaded_push() {
             (bot_token_env.to_string(), bot_token.to_string()),
             ("SLACK_API_BASE_URL".to_string(), base_url),
         ]),
+        acknowledged,
     );
 
     assert_eq!(response["kind"], "ingress_started");
     assert_eq!(response["state"]["mode"], "polling");
     assert_eq!(response["state"]["metadata"]["mode"], "socket_mode");
-    assert_eq!(notification["protocol_version"], 1);
-    let events = notification["events"].as_array().expect("events array");
+    assert_eq!(event_request["protocol_version"], 2);
+    let events = event_request["batch"]["events"]
+        .as_array()
+        .expect("events array");
     assert_eq!(events.len(), 1);
 
     let event = &events[0];
@@ -1373,7 +1422,7 @@ fn root_direct_message_socket_mode_round_trips_to_top_level_push() {
     let app_token = "xapp-test-root-dm-token";
     let bot_token_env = "SLACK_TEST_BOT_TOKEN_SOCKET_ROOT_DM";
     let bot_token = "xoxb-test-root-dm-token";
-    let base_url = serve_slack_socket_mode_once(
+    let (base_url, acknowledged) = serve_slack_socket_mode_once(
         json!({
             "type": "event_callback",
             "team_id": "T123",
@@ -1397,17 +1446,20 @@ fn root_direct_message_socket_mode_round_trips_to_top_level_push() {
     let mut config = socket_mode_config(app_token_env, bot_token_env);
     config["dm_policy"] = json!("open");
 
-    let (response, notification) = run_start_ingress_cycle(
+    let (response, event_request) = run_start_ingress_cycle(
         config,
         BTreeMap::from([
             (app_token_env.to_string(), app_token.to_string()),
             (bot_token_env.to_string(), bot_token.to_string()),
             ("SLACK_API_BASE_URL".to_string(), base_url),
         ]),
+        acknowledged,
     );
 
     assert_eq!(response["kind"], "ingress_started");
-    let events = notification["events"].as_array().expect("events array");
+    let events = event_request["batch"]["events"]
+        .as_array()
+        .expect("events array");
     assert_eq!(events.len(), 1);
     let event = &events[0];
     assert_eq!(event["event_id"], "EvSocketRootDm");
@@ -1435,7 +1487,7 @@ fn threaded_direct_message_socket_mode_round_trips_to_threaded_push() {
     let app_token = "xapp-test-threaded-dm-token";
     let bot_token_env = "SLACK_TEST_BOT_TOKEN_SOCKET_THREADED_DM";
     let bot_token = "xoxb-test-threaded-dm-token";
-    let base_url = serve_slack_socket_mode_once(
+    let (base_url, acknowledged) = serve_slack_socket_mode_once(
         json!({
             "type": "event_callback",
             "team_id": "T123",
@@ -1460,17 +1512,20 @@ fn threaded_direct_message_socket_mode_round_trips_to_threaded_push() {
     let mut config = socket_mode_config(app_token_env, bot_token_env);
     config["dm_policy"] = json!("open");
 
-    let (response, notification) = run_start_ingress_cycle(
+    let (response, event_request) = run_start_ingress_cycle(
         config,
         BTreeMap::from([
             (app_token_env.to_string(), app_token.to_string()),
             (bot_token_env.to_string(), bot_token.to_string()),
             ("SLACK_API_BASE_URL".to_string(), base_url),
         ]),
+        acknowledged,
     );
 
     assert_eq!(response["kind"], "ingress_started");
-    let events = notification["events"].as_array().expect("events array");
+    let events = event_request["batch"]["events"]
+        .as_array()
+        .expect("events array");
     assert_eq!(events.len(), 1);
     let event = &events[0];
     assert_eq!(event["event_id"], "EvSocketThreadedDm");
@@ -1521,7 +1576,7 @@ fn supervised_socket_mode_recovers_without_duplicate_delivery() {
     let (base_url, recovered, server) =
         serve_slack_socket_mode_recovery(event, app_token, bot_token);
 
-    let (response, notifications, stderr) = run_start_ingress_recovery_cycle(
+    let (response, batches, stderr) = run_start_ingress_recovery_cycle(
         socket_mode_config(app_token_env, bot_token_env),
         BTreeMap::from([
             (app_token_env.to_string(), app_token.to_string()),
@@ -1532,14 +1587,14 @@ fn supervised_socket_mode_recovers_without_duplicate_delivery() {
     );
 
     assert_eq!(response["kind"], "ingress_started");
-    let reconnecting = notifications
+    let reconnecting = batches
         .iter()
-        .filter(|notification| notification["state"]["status"] == "reconnecting")
+        .filter(|batch| batch["state"]["status"] == "reconnecting")
         .count();
     assert_eq!(reconnecting, 4);
-    let delivered: Vec<&Value> = notifications
+    let delivered: Vec<&Value> = batches
         .iter()
-        .flat_map(|notification| notification["events"].as_array().into_iter().flatten())
+        .flat_map(|batch| batch["events"].as_array().into_iter().flatten())
         .collect();
     assert_eq!(delivered.len(), 1);
     assert_eq!(delivered[0]["event_id"], "EvSocketRecovery");
@@ -1552,14 +1607,14 @@ fn supervised_socket_mode_recovers_without_duplicate_delivery() {
         delivered[0]["metadata"]["client_msg_id"],
         "recovery-client-generated-id"
     );
-    let delivery = notifications
+    let delivery = batches
         .iter()
-        .find(|notification| {
-            notification["events"]
+        .find(|batch| {
+            batch["events"]
                 .as_array()
                 .is_some_and(|events| !events.is_empty())
         })
-        .expect("recovered delivery notification");
+        .expect("recovered delivery batch");
     assert_eq!(delivery["state"]["status"], "running");
     assert!(stderr.contains("missing_ok"));
     assert!(stderr.contains("retryable=true"));

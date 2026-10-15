@@ -116,7 +116,7 @@ impl TelegramClient {
 
     pub fn get_updates(&self, offset: Option<i64>, timeout_secs: u16) -> Result<Vec<Value>> {
         let mut payload = json!({
-            "limit": 100,
+            "limit": 32,
             "timeout": timeout_secs,
         });
         if let Some(offset) = offset {

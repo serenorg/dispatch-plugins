@@ -139,21 +139,15 @@ The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Operators normally go 
 ## Ingress model
 
 - `poll_ingress` opens a WhatsApp session, drains queued inbound messages until the idle window or timeout is reached, then exits. This is the one-shot path used by `dispatch channel poll --once`.
-- `start_ingress` / `stop_ingress` run a background receive worker on a dedicated OS thread with its own current-thread tokio runtime. The worker sends inbound messages to the host as `channel.event` notifications without waiting for another JSON-RPC request.
+- `start_ingress` / `stop_ingress` run a background receive worker on a dedicated OS thread with its own current-thread tokio runtime. The worker submits inbound messages to the host as ID-bearing `channel.event` batches without waiting for another JSON-RPC request.
 
 ## Delivery guarantee
 
-Inbound delivery is best effort. Messages can be lost or processed more than once. Do not rely on this plugin for messages that must never be lost or duplicated.
+Inbound delivery is at-least-once while WhatsApp still retains a message. The plugin registers a `whatsapp-rust` inbound durability hook, so the library buffers each decrypted batch and withholds its provider acknowledgement until the hook returns. The hook maps the batch into `channel.event` batches of at most 32 events, journals each one in the host-supplied ingress storage, and returns only after the host has durably accepted every one. If any batch is not accepted, the hook fails the whole library batch, no message in it is acknowledged, and the worker reconnects because WhatsApp redelivers unacknowledged messages only on a new connection. A `poll_ingress` request refuses a library batch that would exceed the host's per-request acceptance page and leaves it for the next poll.
 
-`whatsapp-rust` acknowledges a message to WhatsApp after it dispatches its event handlers, and it dispatches them as detached tasks. The plugin handler only places the message on an in-memory channel and returns, so the acknowledgement is not tied to the message reaching the host. The receive worker then writes a `channel.event` notification to stdout. A crash or a failed stdout write after the provider acknowledgement and before that write drops the message: WhatsApp considers it delivered, and the plugin has no local outbox and no replay path.
+The library does not route every message through the hook. Recovered placeholder messages and newsletter messages are acknowledged on the library's own path before the plugin sees them, so the plugin delivers them durably only on a best-effort basis. The library also prunes its buffered copies after seven days and, when it cannot write its buffer, can degrade a message to at-most-once; see the `whatsapp-rust` durability hook documentation.
 
-Redelivery is equally unprotected in the other direction: the host allocates a new execution identifier for every notification and does not claim the provider event id, so a message that did arrive twice would produce two runs and two replies.
-
-Reliable delivery without duplicate runs needs all three of the following, none of which exist yet:
-
-- a host-side claim on `(organization, deployment, binding, platform account, provider event id)` taken before a run is created, so redelivery is collapsed into one run and one reply;
-- an explicit host-acceptance acknowledgement in the channel protocol, so the plugin learns when a notification is durably held rather than merely written;
-- a plugin-side outbox that retains an event until that acknowledgement arrives.
+Each event's `event_id` is a domain-separated SHA-256 of the provider identity `(chat, sender, message id)`; `message.id` keeps the provider message ID. The library re-parses some metadata, such as the sender's push name, from a redelivered stanza, so events omit the push name (`actor.display_name` is absent) and carry only fields that a redelivery reproduces exactly. A redelivered message therefore maps to the same event. Consumers deduplicate by `event_id`.
 
 Inbound media is surfaced as attachment metadata:
 

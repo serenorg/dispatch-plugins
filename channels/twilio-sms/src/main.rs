@@ -2,12 +2,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use dispatch_channel_protocol::MessageRef;
+use dispatch_channel_protocol::parse_plugin_input;
+use dispatch_channel_runtime::{IngressCycle, spawn_plugin_input_reader, write_stdout_line};
 use hmac::{Hmac, KeyInit, Mac};
 use jiff::Timestamp;
 use sha1::Sha1;
 use std::{
     collections::BTreeMap,
-    io::{self, BufRead, Write},
+    sync::{Arc, Mutex},
 };
 use url::form_urlencoded;
 
@@ -19,7 +21,7 @@ use protocol::{
     HealthReport, InboundActor, InboundAttachment, InboundConversationRef, InboundEventEnvelope,
     InboundMessage, IngressCallbackReply, IngressMode, IngressPayload, IngressState,
     OutboundAttachment, OutboundMessage, PluginRequest, PluginRequestEnvelope, PluginResponse,
-    StatusAcceptance, capabilities, parse_jsonrpc_request, plugin_error, response_to_jsonrpc,
+    StatusAcceptance, capabilities, plugin_error, response_to_jsonrpc,
 };
 use twilio_api::{TwilioAuthMode, TwilioClient};
 
@@ -68,32 +70,28 @@ const AUTH_MODE_ACCOUNT_TOKEN: &str = "account_token";
 const AUTH_MODE_API_KEY: &str = "api_key";
 
 fn main() -> Result<()> {
-    let stdin = io::stdin().lock();
-    let mut stdout = io::stdout().lock();
-
-    for line in stdin.lines() {
-        let line = line.context("failed to read stdin")?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let (request_id, envelope) = parse_jsonrpc_request(&line)
-            .map_err(|error| anyhow!("failed to parse channel request: {error}"))?;
-
-        let response = match handle_request(&envelope) {
+    let stdout_lock = Arc::new(Mutex::new(()));
+    for request in spawn_plugin_input_reader(
+        Arc::clone(&stdout_lock),
+        parse_plugin_input::<ChannelConfig, OutboundMessage>,
+    ) {
+        let (request_id, envelope) = request?;
+        let response = match handle_request(&envelope, &stdout_lock) {
             Ok(response) => response,
             Err(error) => plugin_error("internal_error", error.to_string()),
         };
 
         let json = response_to_jsonrpc(&request_id, &response).map_err(|error| anyhow!(error))?;
-        writeln!(stdout, "{json}")?;
-        stdout.flush()?;
+        write_stdout_line(&stdout_lock, &json)?;
     }
 
     Ok(())
 }
 
-fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
+fn handle_request(
+    envelope: &PluginRequestEnvelope,
+    stdout_lock: &Arc<Mutex<()>>,
+) -> Result<PluginResponse> {
     if envelope.protocol_version != CHANNEL_PLUGIN_PROTOCOL_VERSION {
         return Ok(plugin_error(
             "unsupported_protocol_version",
@@ -136,7 +134,9 @@ fn handle_request(envelope: &PluginRequestEnvelope) -> Result<PluginResponse> {
         )),
         PluginRequest::IngressEvent {
             config, payload, ..
-        } => handle_ingress_event(config, payload),
+        } => handle_ingress_event(config, payload)?
+            .publish(stdout_lock)
+            .map_err(Into::into),
         PluginRequest::Status { .. } => Ok(PluginResponse::StatusAccepted {
             status: StatusAcceptance {
                 accepted: false,
@@ -363,10 +363,7 @@ fn deliver(config: &ChannelConfig, message: &OutboundMessage) -> Result<Delivery
     })
 }
 
-fn handle_ingress_event(
-    config: &ChannelConfig,
-    payload: &IngressPayload,
-) -> Result<PluginResponse> {
+fn handle_ingress_event(config: &ChannelConfig, payload: &IngressPayload) -> Result<IngressCycle> {
     if !payload.method.eq_ignore_ascii_case("POST") && !payload.method.eq_ignore_ascii_case("GET") {
         return Ok(ingress_reply(
             405,
@@ -375,7 +372,7 @@ fn handle_ingress_event(
     }
 
     if let Some(reply) = validate_ingress_signature(config, payload)? {
-        return Ok(PluginResponse::IngressEventsReceived {
+        return Ok(IngressCycle::Events {
             events: Vec::new(),
             callback_reply: Some(reply),
             state: None,
@@ -385,7 +382,7 @@ fn handle_ingress_event(
 
     let params = incoming_params(payload);
     let Some(event) = build_inbound_event(config, payload, &params)? else {
-        return Ok(PluginResponse::IngressEventsReceived {
+        return Ok(IngressCycle::Events {
             events: Vec::new(),
             callback_reply: Some(twiml_empty_reply()),
             state: None,
@@ -393,7 +390,7 @@ fn handle_ingress_event(
         });
     };
 
-    Ok(PluginResponse::IngressEventsReceived {
+    Ok(IngressCycle::Events {
         events: vec![event],
         callback_reply: Some(twiml_empty_reply()),
         state: None,
@@ -798,8 +795,8 @@ fn received_at(host_received_at: Option<&str>) -> String {
         .unwrap_or_else(|| Timestamp::now().to_string())
 }
 
-fn ingress_reply(status: u16, message: &str) -> PluginResponse {
-    PluginResponse::IngressEventsReceived {
+fn ingress_reply(status: u16, message: &str) -> IngressCycle {
+    IngressCycle::Events {
         events: Vec::new(),
         callback_reply: Some(callback_reply(status, message)),
         state: None,
@@ -868,7 +865,7 @@ mod tests {
             handle_ingress_event(&ChannelConfig::default(), &payload).expect("handle ingress");
 
         match response {
-            PluginResponse::IngressEventsReceived {
+            IngressCycle::Events {
                 events,
                 callback_reply,
                 ..
@@ -902,6 +899,47 @@ mod tests {
     }
 
     #[test]
+    fn inbound_replay_preserves_profile_content_and_ignores_only_host_observation() {
+        let mut original = base_payload("POST");
+        original.body =
+            "MessageSid=SM123&From=%2B15550001111&To=%2B15550002222&Body=hello&ProfileName=First"
+                .into();
+        let IngressCycle::Events { events: first, .. } =
+            handle_ingress_event(&ChannelConfig::default(), &original).unwrap()
+        else {
+            panic!("expected event batch");
+        };
+        let mut replay = original.clone();
+        replay.received_at = Some("2026-04-12T22:00:00Z".into());
+        let IngressCycle::Events { events: second, .. } =
+            handle_ingress_event(&ChannelConfig::default(), &replay).unwrap()
+        else {
+            panic!("expected replayed event batch");
+        };
+        assert_eq!(first[0].event_id, second[0].event_id);
+        assert_eq!(first[0].actor.display_name.as_deref(), Some("First"));
+        assert_eq!(first[0].message.metadata[META_PROFILE_NAME], "First");
+        assert_eq!(
+            dispatch_channel_protocol::canonical_channel_event_content_bytes(&first[0]).unwrap(),
+            dispatch_channel_protocol::canonical_channel_event_content_bytes(&second[0]).unwrap()
+        );
+        replay.body =
+            "MessageSid=SM123&From=%2B15550001111&To=%2B15550002222&Body=hello&ProfileName=Renamed"
+                .into();
+        let IngressCycle::Events {
+            events: changed, ..
+        } = handle_ingress_event(&ChannelConfig::default(), &replay).unwrap()
+        else {
+            panic!("expected changed event batch");
+        };
+        assert_eq!(first[0].event_id, changed[0].event_id);
+        assert_ne!(
+            dispatch_channel_protocol::canonical_channel_event_content_bytes(&first[0]).unwrap(),
+            dispatch_channel_protocol::canonical_channel_event_content_bytes(&changed[0]).unwrap()
+        );
+    }
+
+    #[test]
     fn status_callback_is_ignored_but_acknowledged() {
         let mut payload = base_payload("POST");
         payload.body =
@@ -912,7 +950,7 @@ mod tests {
             handle_ingress_event(&ChannelConfig::default(), &payload).expect("handle ingress");
 
         match response {
-            PluginResponse::IngressEventsReceived {
+            IngressCycle::Events {
                 events,
                 callback_reply,
                 ..

@@ -6,13 +6,14 @@
 //! with Dispatch's line-oriented process model while satisfying
 //! presage's `!Send` store and stream types.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use dispatch_channel_protocol::{
-    ChannelEventNotification, HealthReport, InboundEventEnvelope, IngressMode, IngressState,
-    PluginNotificationEnvelope, notification_to_jsonrpc,
+    ChannelEventBatch, HealthReport, IngressMode, IngressState, parse_plugin_input,
+};
+use dispatch_channel_runtime::{
+    deliver_channel_event_batch, spawn_plugin_input_reader, write_stdout_line,
 };
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, Write};
 use std::sync::{Arc, Mutex};
 
 mod content_store;
@@ -28,7 +29,7 @@ use ingress::{IngressWorker, poll_ingress_once, start_ingress_worker};
 use protocol::{
     CHANNEL_PLUGIN_PROTOCOL_VERSION, ChannelConfig, ConfiguredChannel, OutboundMessage,
     PluginRequest, PluginRequestEnvelope, PluginResponse, SignalChannelPolicy, capabilities,
-    parse_jsonrpc_request, plugin_error, response_to_jsonrpc,
+    plugin_error, response_to_jsonrpc,
 };
 use session::{SessionState, load_session};
 
@@ -51,18 +52,14 @@ fn main() -> Result<()> {
         ));
     }
 
-    let stdin = io::stdin().lock();
     let stdout_lock = Arc::new(Mutex::new(()));
     let mut ingress_worker: Option<IngressWorker> = None;
 
-    for line in stdin.lines() {
-        let line = line.context("failed to read stdin")?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let (request_id, envelope) = parse_jsonrpc_request(&line)
-            .map_err(|error| anyhow!("failed to parse channel request: {error}"))?;
+    for request in spawn_plugin_input_reader(
+        Arc::clone(&stdout_lock),
+        parse_plugin_input::<ChannelConfig, OutboundMessage>,
+    ) {
+        let (request_id, envelope) = request?;
         let should_exit = matches!(envelope.request, PluginRequest::Shutdown);
 
         let response = handle_request(&envelope, &stdout_lock, &mut ingress_worker);
@@ -108,18 +105,29 @@ fn handle_request(
         }
         PluginRequest::Configure { config } => configure(config),
         PluginRequest::Health { config } => health(config),
-        PluginRequest::PollIngress { config, state } => poll_ingress(config, state.as_ref()),
-        PluginRequest::StartIngress { config, state } => {
+        PluginRequest::PollIngress { config, state, .. } => {
+            if ingress_worker.is_some() {
+                return plugin_error(
+                    "poll_ingress_failed",
+                    "Signal background ingress is running; stop ingress before polling",
+                );
+            }
+            poll_ingress(config, state.as_ref(), stdout_lock)
+        }
+        PluginRequest::StartIngress { config, state, .. } => {
             start_ingress(config, state.as_ref(), stdout_lock, ingress_worker)
         }
         PluginRequest::StopIngress { config, state } => {
             stop_ingress(config, state.as_ref(), ingress_worker)
         }
-        PluginRequest::Deliver { config, message } => {
-            send_signal_message(config, message, DeliveryKind::Deliver)
-        }
+        PluginRequest::Deliver { config, message } => send_signal_message(
+            config,
+            message,
+            DeliveryKind::Deliver,
+            ingress_worker.as_ref(),
+        ),
         PluginRequest::Push { config, message } => {
-            send_signal_message(config, message, DeliveryKind::Push)
+            send_signal_message(config, message, DeliveryKind::Push, ingress_worker.as_ref())
         }
         PluginRequest::GetMessage { .. } | PluginRequest::GetPermalink { .. } => plugin_error(
             "unsupported_request",
@@ -131,7 +139,11 @@ fn handle_request(
                 Ok(policy) => policy,
                 Err(error) => return plugin_error("status_failed", error.to_string()),
             };
-            match status::handle_status(config, update, &policy) {
+            let result = match ingress_worker.as_ref() {
+                Some(worker) => worker.status(config, update, &policy),
+                None => status::handle_status(config, update, &policy),
+            };
+            match result {
                 Ok(acceptance) => PluginResponse::StatusAccepted { status: acceptance },
                 Err(error) => plugin_error("status_failed", error.to_string()),
             }
@@ -164,7 +176,11 @@ fn health(config: &ChannelConfig) -> PluginResponse {
     }
 }
 
-fn poll_ingress(config: &ChannelConfig, _state: Option<&IngressState>) -> PluginResponse {
+fn poll_ingress(
+    config: &ChannelConfig,
+    _state: Option<&IngressState>,
+    stdout_lock: &Arc<Mutex<()>>,
+) -> PluginResponse {
     let policy = match SignalChannelPolicy::from_config(config).and_then(|policy| {
         policy.require_persistent_ingress()?;
         Ok(policy)
@@ -176,14 +192,26 @@ fn poll_ingress(config: &ChannelConfig, _state: Option<&IngressState>) -> Plugin
         Ok(account_id) => account_id,
         Err(error) => return plugin_error("poll_ingress_failed", error.to_string()),
     };
-    match poll_ingress_once(config, &policy, &account_id) {
-        Ok(events) => PluginResponse::IngressEventsReceived {
-            events,
-            callback_reply: None,
-            state: Some(running_ingress_state(config, IngressMode::Polling)),
+    if let Err(error) = poll_ingress_once(config, &policy, &account_id, Arc::clone(stdout_lock)) {
+        return plugin_error("poll_ingress_failed", error.to_string());
+    }
+    // Every poll ends with a confirmed state batch; an unchanged one replays
+    // the accepted original.
+    let state = Some(running_ingress_state(config, IngressMode::Polling));
+    match deliver_channel_event_batch(
+        stdout_lock,
+        ChannelEventBatch {
+            events: Vec::new(),
+            state: state.clone(),
             poll_after_ms: None,
         },
-        Err(error) => plugin_error("poll_ingress_failed", error.to_string()),
+    ) {
+        Ok(()) => PluginResponse::IngressEventsReceived {
+            callback_reply: None,
+            state,
+            poll_after_ms: None,
+        },
+        Err(error) => plugin_error("event_delivery_failed", error.to_string()),
     }
 }
 
@@ -229,12 +257,17 @@ fn send_signal_message(
     config: &ChannelConfig,
     message: &OutboundMessage,
     kind: DeliveryKind,
+    worker: Option<&IngressWorker>,
 ) -> PluginResponse {
     let policy = match SignalChannelPolicy::from_config(config) {
         Ok(policy) => policy,
         Err(error) => return plugin_error("deliver_failed", error.to_string()),
     };
-    match deliver::deliver_text_message(config, message, &policy) {
+    let result = match worker {
+        Some(worker) => worker.deliver(config, message, &policy),
+        None => deliver::deliver_text_message(config, message, &policy),
+    };
+    match result {
         Ok(delivery) => match kind {
             DeliveryKind::Deliver => PluginResponse::Delivered { delivery },
             DeliveryKind::Push => PluginResponse::Pushed { delivery },
@@ -366,32 +399,6 @@ fn not_implemented(operation: &str) -> PluginResponse {
     )
 }
 
-pub(crate) fn emit_channel_event_notifications(
-    stdout_lock: &Arc<Mutex<()>>,
-    events: Vec<InboundEventEnvelope>,
-) -> Result<()> {
-    let envelope = PluginNotificationEnvelope {
-        protocol_version: CHANNEL_PLUGIN_PROTOCOL_VERSION,
-        notification: ChannelEventNotification {
-            events,
-            state: None,
-            poll_after_ms: None,
-        },
-    };
-    let json = notification_to_jsonrpc(&envelope).map_err(|error| anyhow!(error.to_string()))?;
-    write_stdout_line(stdout_lock, &json)
-}
-
-pub(crate) fn write_stdout_line(stdout_lock: &Arc<Mutex<()>>, line: &str) -> Result<()> {
-    let _guard = stdout_lock
-        .lock()
-        .map_err(|_| anyhow!("stdout lock poisoned"))?;
-    let mut stdout = io::stdout().lock();
-    writeln!(stdout, "{line}")?;
-    stdout.flush()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,7 +432,7 @@ mod tests {
     fn denied_policy_stops_ingress_before_the_signal_session_is_opened() {
         let config = ChannelConfig::default();
         assert_eq!(
-            error_code(poll_ingress(&config, None)),
+            error_code(poll_ingress(&config, None, &Arc::new(Mutex::new(())))),
             "poll_ingress_failed"
         );
 
@@ -452,7 +459,8 @@ mod tests {
             error_code(send_signal_message(
                 &config,
                 &message,
-                DeliveryKind::Deliver
+                DeliveryKind::Deliver,
+                None,
             )),
             "deliver_failed"
         );

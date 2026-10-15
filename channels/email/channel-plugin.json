@@ -4,7 +4,7 @@
   "name": "channel-email",
   "version": "0.7.0",
   "protocol": "jsonl",
-  "protocol_version": 1,
+  "protocol_version": 2,
   "description": "Email channel plugin for Dispatch using IMAP ingress and SMTP delivery.",
   "entrypoint": {
     "command": "../../target/release/channel-email",

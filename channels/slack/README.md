@@ -198,7 +198,7 @@ The plugin transport is JSON-RPC 2.0 over JSONL on stdio. Events API and Socket 
 
 - if `SLACK_APP_TOKEN` is configured and `webhook_public_url` is not set, `start_ingress` chooses Socket Mode background-session behavior
 - otherwise `start_ingress` chooses Events API webhook mode and reports the public route that the host should expose
-- Socket Mode keeps a background worker alive, acknowledges each `envelope_id`, and emits normalized inbound notifications to Dispatch
+- Socket Mode keeps a background worker alive and acknowledges each `envelope_id` only after the host durably accepts the normalized `channel.event` batch; an unacknowledged envelope is redelivered by Slack within its own retry window
 - Socket Mode reports `reconnecting` while a transient connection response, disconnect, close frame, rate limit, or transport failure is within the supervised retry budget; it returns to `running` only after the next successful receive
 
 Common failure modes:

@@ -43,7 +43,8 @@ Not implemented:
 Inbound:
 
 - one-shot polling and background ingress are available anywhere the plugin can reach Gmail IMAP
-- Dispatch keeps the plugin subprocess alive while polling is active, and the plugin emits `channel.event` notifications as new mail arrives
+- Dispatch keeps the plugin subprocess alive while polling is active, and the plugin delivers new mail as durable `channel.event` batches; the IMAP UID cursor advances only with a batch the host has durably accepted
+- one batch carries at most 32 messages within the channel batch byte bound; a single message too large for a batch fails that poll without advancing its mailbox cursor, so operators must resolve the oversized source message before later messages can be delivered
 
 Outbound:
 

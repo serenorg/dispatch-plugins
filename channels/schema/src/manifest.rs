@@ -191,7 +191,7 @@ mod tests {
             name: "channel-telegram".to_string(),
             version: "0.1.0".to_string(),
             protocol: "jsonl".to_string(),
-            protocol_version: 1,
+            protocol_version: 2,
             description: "Telegram channel plugin for Dispatch.".to_string(),
             entrypoint: ExtensionEntrypoint {
                 command: "../../target/release/channel-telegram".to_string(),
