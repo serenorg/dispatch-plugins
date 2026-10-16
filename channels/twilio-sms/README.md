@@ -25,6 +25,10 @@ Behavior:
 
 Each `ingress_event` confirms a `channel.event` batch with the host, including an empty batch when a callback is ignored or rejected, and the plugin answers the request, including any HTTP callback reply, only after the exact durable host receipt. A callback that repeats the accepted batch resends that accepted original instead of journaling a new one. A request that fails before it produces a batch returns a plugin error and confirms nothing. An unconfirmed journaled batch remains pending and is replayed before the next batch. Whether Twilio retries a failed callback follows the provider's delivery policy; consumers must deduplicate by stable event ID.
 
+For authenticated inbound webhooks, Twilio Advanced Opt-Out's `OptOutType=STOP`, `START`, or `HELP` becomes message metadata `opt_out_type=stop`, `start`, or `help`. Missing or unknown values produce no metadata field. Message text alone never determines this metadata. Consumers can use it to avoid replying to keywords that Twilio has already answered.
+
+When Twilio refuses a REST request with HTTP 4xx and a positive JSON integer `code` that fits in an unsigned 32-bit integer, the plugin returns that code in the existing typed error payload as `twilio_<decimal>`, such as `twilio_21610`. The error message is sanitized and contains no provider response text, message body, recipient, SID, or URL. HTTP 5xx and transport failures remain generic plugin errors without a Twilio refusal code; consumers must not classify errors by matching message text.
+
 Not implemented:
 
 - attachment upload from inline data or staged storage keys

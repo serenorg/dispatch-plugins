@@ -23,7 +23,7 @@ use protocol::{
     OutboundAttachment, OutboundMessage, PluginRequest, PluginRequestEnvelope, PluginResponse,
     StatusAcceptance, capabilities, plugin_error, response_to_jsonrpc,
 };
-use twilio_api::{TwilioAuthMode, TwilioClient};
+use twilio_api::{TwilioAuthMode, TwilioClient, TwilioRefusal};
 
 const META_REASON: &str = "reason";
 const META_PLATFORM: &str = "platform";
@@ -58,6 +58,7 @@ const META_PROFILE_NAME: &str = "profile_name";
 const META_CHANNEL: &str = "channel";
 const META_EVENT_DIRECTION: &str = "event_direction";
 const META_REASON_CODE: &str = "reason_code";
+const META_OPT_OUT_TYPE: &str = "opt_out_type";
 
 const PLATFORM_TWILIO_SMS: &str = "twilio_sms";
 const HEADER_X_TWILIO_SIGNATURE: &str = "X-Twilio-Signature";
@@ -69,6 +70,39 @@ const EVENT_TYPE_INCOMING_MESSAGE: &str = "incoming_message";
 const AUTH_MODE_ACCOUNT_TOKEN: &str = "account_token";
 const AUTH_MODE_API_KEY: &str = "api_key";
 
+#[derive(Clone, Copy)]
+enum OptOutType {
+    Stop,
+    Start,
+    Help,
+}
+
+impl OptOutType {
+    fn from_twilio(value: &str) -> Option<Self> {
+        match value {
+            "STOP" => Some(Self::Stop),
+            "START" => Some(Self::Start),
+            "HELP" => Some(Self::Help),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Start => "start",
+            Self::Help => "help",
+        }
+    }
+}
+
+fn request_error_response(error: &anyhow::Error) -> PluginResponse {
+    match error.downcast_ref::<TwilioRefusal>() {
+        Some(refusal) => plugin_error(&format!("twilio_{}", refusal.code), refusal.to_string()),
+        None => plugin_error("internal_error", error.to_string()),
+    }
+}
+
 fn main() -> Result<()> {
     let stdout_lock = Arc::new(Mutex::new(()));
     for request in spawn_plugin_input_reader(
@@ -78,7 +112,7 @@ fn main() -> Result<()> {
         let (request_id, envelope) = request?;
         let response = match handle_request(&envelope, &stdout_lock) {
             Ok(response) => response,
-            Err(error) => plugin_error("internal_error", error.to_string()),
+            Err(error) => request_error_response(&error),
         };
 
         let json = response_to_jsonrpc(&request_id, &response).map_err(|error| anyhow!(error))?;
@@ -443,6 +477,9 @@ fn build_inbound_event(
     }
     if let Some(api_version) = param(params, "ApiVersion") {
         message_metadata.insert(META_API_VERSION.to_string(), api_version.to_string());
+    }
+    if let Some(keyword) = param(params, "OptOutType").and_then(OptOutType::from_twilio) {
+        message_metadata.insert(META_OPT_OUT_TYPE.to_string(), keyword.as_str().to_string());
     }
 
     let mut event_metadata = BTreeMap::new();
@@ -896,6 +933,115 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn host_verified_opt_out_keywords_become_typed_message_metadata() {
+        for (keyword, expected) in [("STOP", "stop"), ("START", "start"), ("HELP", "help")] {
+            let mut payload = base_payload("POST");
+            payload.body = format!(
+                "MessageSid=SMkeyword&From=%2B15550001111&To=%2B15550002222&Body=provider+keyword&OptOutType={keyword}"
+            );
+            let IngressCycle::Events {
+                events,
+                callback_reply,
+                ..
+            } = handle_ingress_event(&ChannelConfig::default(), &payload).unwrap()
+            else {
+                panic!("expected event batch");
+            };
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].message.metadata[META_OPT_OUT_TYPE], expected);
+            assert_eq!(events[0].message.content, "provider keyword");
+            assert_eq!(callback_reply.unwrap().body, TWIML_EMPTY_RESPONSE);
+            let serialized = serde_json::to_value(&events[0]).unwrap();
+            assert_eq!(serialized["message"]["metadata"]["opt_out_type"], expected);
+        }
+    }
+
+    #[test]
+    fn absent_or_unknown_opt_out_type_is_never_inferred_from_the_body() {
+        for suffix in [
+            "",
+            "&OptOutType=UNKNOWN",
+            "&OptOutType=stop",
+            "&OptOutType=",
+        ] {
+            let mut payload = base_payload("POST");
+            payload.body = format!(
+                "MessageSid=SMkeyword&From=%2B15550001111&To=%2B15550002222&Body=STOP{suffix}"
+            );
+            let IngressCycle::Events { events, .. } =
+                handle_ingress_event(&ChannelConfig::default(), &payload).unwrap()
+            else {
+                panic!("expected event batch");
+            };
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].message.content, "STOP");
+            assert!(!events[0].message.metadata.contains_key(META_OPT_OUT_TYPE));
+        }
+    }
+
+    #[test]
+    fn keyword_metadata_requires_authenticated_ingress() {
+        let mut payload = base_payload("POST");
+        payload.trust_verified = false;
+        payload.body =
+            "MessageSid=SMkeyword&From=%2B15550001111&To=%2B15550002222&Body=STOP&OptOutType=STOP"
+                .to_string();
+        let config = ChannelConfig {
+            auth_token_env: Some(String::new()),
+            webhook_auth_token_env: Some(String::new()),
+            ..ChannelConfig::default()
+        };
+        let IngressCycle::Events {
+            events,
+            callback_reply,
+            ..
+        } = handle_ingress_event(&config, &payload).unwrap()
+        else {
+            panic!("expected rejected event batch");
+        };
+        assert!(events.is_empty());
+        assert_eq!(callback_reply.unwrap().status, 403);
+    }
+
+    #[test]
+    fn opt_out_metadata_is_bound_to_the_signed_form() {
+        let mut payload = base_payload("POST");
+        payload.trust_verified = false;
+        payload.body =
+            "MessageSid=SMkeyword&From=%2B15550001111&To=%2B15550002222&Body=stop&OptOutType=STOP"
+                .to_string();
+        let request_url = "https://example.com/twilio/sms".to_string();
+        let params = incoming_params(&payload);
+        let mut signing_input = request_url.clone();
+        for (name, value) in &params {
+            signing_input.push_str(name);
+            signing_input.push_str(value);
+        }
+        let mut mac = Hmac::<Sha1>::new_from_slice(b"secret").unwrap();
+        mac.update(signing_input.as_bytes());
+        payload.headers.insert(
+            HEADER_X_TWILIO_SIGNATURE.to_string(),
+            BASE64_STANDARD.encode(mac.finalize().into_bytes()),
+        );
+        assert!(
+            validate_twilio_signature("secret", &payload, &params, request_url.clone())
+                .unwrap()
+                .is_none()
+        );
+        let event = build_inbound_event(&ChannelConfig::default(), &payload, &params)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.message.metadata[META_OPT_OUT_TYPE], "stop");
+
+        payload.body = payload.body.replace("OptOutType=STOP", "OptOutType=START");
+        let rejected =
+            validate_twilio_signature("secret", &payload, &incoming_params(&payload), request_url)
+                .unwrap()
+                .unwrap();
+        assert_eq!(rejected.status, 403);
     }
 
     #[test]

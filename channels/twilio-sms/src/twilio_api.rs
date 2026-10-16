@@ -1,10 +1,23 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::Value;
-use std::io::Read;
+use std::{fmt, io::Read, num::NonZeroU32};
 use urlencoding::encode;
 
 const DEFAULT_API_BASE: &str = "https://api.twilio.com/2010-04-01";
+
+#[derive(Debug)]
+pub struct TwilioRefusal {
+    pub code: NonZeroU32,
+}
+
+impl fmt::Display for TwilioRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Twilio rejected the request")
+    }
+}
+
+impl std::error::Error for TwilioRefusal {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TwilioAuthMode {
@@ -156,12 +169,15 @@ impl TwilioClient {
 
     fn get_json(&self, url: &str, context: &str) -> Result<Value> {
         let mut response = ureq::get(url)
+            .config()
+            .http_status_as_error(false)
+            .build()
             .header(
                 "Authorization",
                 &basic_auth_header(&self.auth_username, &self.auth_password),
             )
             .call()
-            .map_err(|error| anyhow!("{context}: {error}"))?;
+            .map_err(|_| anyhow!("{context}: transport failure"))?;
         read_json_body(&mut response, context)
     }
 
@@ -172,13 +188,16 @@ impl TwilioClient {
             .collect::<Vec<_>>()
             .join("&");
         let mut response = ureq::post(url)
+            .config()
+            .http_status_as_error(false)
+            .build()
             .header(
                 "Authorization",
                 &basic_auth_header(&self.auth_username, &self.auth_password),
             )
             .header("Content-Type", "application/x-www-form-urlencoded")
             .send(body)
-            .map_err(|error| anyhow!("{context}: {error}"))?;
+            .map_err(|_| anyhow!("{context}: transport failure"))?;
         read_json_body(&mut response, context)
     }
 }
@@ -231,17 +250,194 @@ fn read_json_body(response: &mut ureq::http::Response<ureq::Body>, context: &str
         .reader();
     let mut text = String::new();
     body.read_to_string(&mut text)
-        .with_context(|| format!("{context}: failed to read response body"))?;
+        .map_err(|_| anyhow!("{context}: failed to read response body"))?;
     if !status.is_success() {
-        bail!("{context}: HTTP {}: {}", status.as_u16(), text);
+        // Only a client refusal carries a provider code; outages stay retryable.
+        if status.is_client_error()
+            && let Some(code) = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|body| body.get("code").and_then(Value::as_u64))
+                .and_then(|code| u32::try_from(code).ok())
+                .and_then(NonZeroU32::new)
+        {
+            return Err(TwilioRefusal { code }.into());
+        }
+        bail!("{context}: HTTP {}", status.as_u16());
     }
     serde_json::from_str(&text)
-        .with_context(|| format!("{context}: failed to parse response body as JSON"))
+        .map_err(|_| anyhow!("{context}: failed to parse response body as JSON"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dispatch_channel_protocol::{PluginRequestId, parse_jsonrpc_response, response_to_jsonrpc};
+    use std::{io::Write, net::TcpListener, time::Duration};
+
+    fn mocked_send(status: Option<u16>, response_body: &str) -> Result<TwilioMessage> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let response_body = response_body.to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "request ended before its body");
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                    let length: usize = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .unwrap()
+                        .1
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    if request.len() >= header_end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            if let Some(status) = status {
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let client = TwilioClient {
+            account_sid: "ACprivate".to_string(),
+            auth_username: "ACprivate".to_string(),
+            auth_password: "private-token".to_string(),
+            auth_mode: TwilioAuthMode::AccountToken,
+            base_url,
+        };
+        let result = client.send_message(
+            "+15550001111",
+            "private message body",
+            Some("+15550002222"),
+            None,
+            &[],
+        );
+        server.join().unwrap();
+        result
+    }
+
+    fn assert_wire_error(error: &anyhow::Error, code: &str) {
+        let response = crate::request_error_response(error);
+        let crate::protocol::PluginResponse::Error { error: payload } = &response else {
+            panic!("expected typed plugin error");
+        };
+        assert_eq!(payload.code, code);
+        assert_eq!(payload.message, error.to_string());
+        let id = PluginRequestId::integer(17);
+        let wire = response_to_jsonrpc(&id, &response).unwrap();
+        let json: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(json["error"]["data"]["dispatch_error"]["code"], code);
+        assert_eq!(
+            json["error"]["data"]["dispatch_error"]["message"],
+            payload.message
+        );
+        let (decoded_id, decoded) = parse_jsonrpc_response(&wire).unwrap();
+        assert_eq!(decoded_id, id);
+        assert_eq!(decoded, response);
+        for private in [
+            "private message body",
+            "+15550001111",
+            "ACprivate",
+            "SMprivate",
+            "private-token",
+            "http://",
+            "https://",
+        ] {
+            assert!(!wire.contains(private), "private data reached the wire");
+            assert!(!format!("{error:#}").contains(private));
+        }
+    }
+
+    #[test]
+    fn client_refusals_preserve_numeric_codes_in_typed_and_jsonrpc_errors() {
+        for status in [400, 422] {
+            for code in [21610, 21617, 21211, 21614, 99999, u32::MAX] {
+                let body = serde_json::json!({
+                    "code": code,
+                    "message": "private message body +15550001111 ACprivate SMprivate",
+                    "more_info": "https://private.example.test",
+                });
+                let error = mocked_send(Some(status), &body.to_string()).unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<TwilioRefusal>().unwrap().code.get(),
+                    code
+                );
+                assert_eq!(error.to_string(), "Twilio rejected the request");
+                assert_wire_error(&error, &format!("twilio_{code}"));
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_nonpositive_refusal_codes_remain_generic_errors() {
+        for code in [
+            Value::Null,
+            serde_json::json!("21610"),
+            serde_json::json!(0),
+            serde_json::json!(-21610),
+            serde_json::json!(21610.5),
+            serde_json::json!(u64::MAX),
+        ] {
+            let body = serde_json::json!({"code": code, "message": "private message body"});
+            let error = mocked_send(Some(400), &body.to_string()).unwrap_err();
+            assert!(error.downcast_ref::<TwilioRefusal>().is_none());
+            assert_wire_error(&error, "internal_error");
+        }
+        let error = mocked_send(Some(400), "private message body").unwrap_err();
+        assert_wire_error(&error, "internal_error");
+    }
+
+    #[test]
+    fn outages_and_transport_failures_never_carry_a_twilio_refusal_code() {
+        for (status, body) in [
+            (
+                Some(500),
+                r#"{"code":21610,"message":"private message body"}"#,
+            ),
+            (None, ""),
+        ] {
+            let error = mocked_send(status, body).unwrap_err();
+            assert!(error.downcast_ref::<TwilioRefusal>().is_none());
+            assert_wire_error(&error, "internal_error");
+        }
+    }
+
+    #[test]
+    fn successful_sends_still_return_the_provider_receipt() {
+        let sent = mocked_send(
+            Some(201),
+            r#"{"sid":"SMsent","to":"+15550001111","from":"+15550002222","status":"queued"}"#,
+        )
+        .unwrap();
+        assert_eq!(sent.sid, "SMsent");
+        assert_eq!(sent.to, "+15550001111");
+        assert_eq!(sent.from.as_deref(), Some("+15550002222"));
+        assert_eq!(sent.status.as_deref(), Some("queued"));
+    }
+
+    #[test]
+    fn invalid_json_in_a_success_response_does_not_echo_its_body() {
+        let error = mocked_send(Some(201), "private message body").unwrap_err();
+        assert_wire_error(&error, "internal_error");
+    }
 
     #[test]
     fn account_auth_is_used_when_api_key_is_absent() {
