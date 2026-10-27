@@ -1765,3 +1765,101 @@ fn app_uninstalled_with_a_configured_bot_token_makes_no_slack_api_call() {
         std::io::ErrorKind::WouldBlock
     );
 }
+
+#[test]
+fn a_dedicated_apps_signed_root_mention_round_trips_to_threaded_deliver() {
+    let secret = "connection-owned-signing-secret";
+    let config = json!({
+        "api_app_id": "A1",
+        "allowed_team_ids": ["T123"],
+        "allowed_channel_ids": ["C123"],
+        "webhook_path": "/webhooks/slack/apps/R1"
+    });
+    let body = json!({
+        "type": "event_callback",
+        "team_id": "T123",
+        "api_app_id": "A1",
+        "event_id": "EvDedicatedMention",
+        "event_time": 1712860000,
+        "event": {
+            "type": "app_mention",
+            "channel": "C123",
+            "user": "U123",
+            "text": "hello dedicated app",
+            "ts": "1712860000.100200"
+        }
+    });
+    let envs = BTreeMap::from([("SLACK_SIGNING_SECRET".to_string(), secret.to_string())]);
+    let (response, events) = run_ingress_with_env(
+        signed_dedicated_app_request(
+            config.clone(),
+            authenticated_ingress_state(),
+            body.clone(),
+            secret,
+        ),
+        envs.clone(),
+    );
+    assert_eq!(response["kind"], "ingress_events_received");
+    assert!(response["callback_reply"].is_null());
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event["conversation"]["thread_id"], "1712860000.100200");
+    assert_eq!(event["conversation"]["kind"], "channel");
+    assert_eq!(event["metadata"]["api_app_id"], "A1");
+    assert_eq!(event["message"]["id"], "1712860000.100200");
+
+    let (response, events) = run_ingress_with_env(
+        signed_dedicated_app_request(
+            config.clone(),
+            authenticated_ingress_state(),
+            body,
+            "another-app-secret",
+        ),
+        envs,
+    );
+    assert_eq!(response["callback_reply"]["status"], 403);
+    assert!(events.is_empty());
+
+    let (base_url, request_rx, server) = serve_slack_api(vec![json!({
+        "ok": true, "channel": "C123", "ts": "1712860001.100200"
+    })]);
+    let delivery = run_request_with_env(
+        json!({
+            "protocol_version": 2,
+            "request": {
+                "kind": "deliver",
+                "config": config,
+                "message": {
+                    "content": "reply from the dedicated app",
+                    "metadata": {
+                        "conversation_id": event["conversation"]["id"],
+                        "thread_id": event["conversation"]["thread_id"]
+                    }
+                }
+            }
+        }),
+        BTreeMap::from([
+            (
+                "SLACK_BOT_TOKEN".to_string(),
+                "xoxb-dedicated-test".to_string(),
+            ),
+            ("SLACK_API_BASE_URL".to_string(), base_url),
+        ]),
+    );
+    assert_eq!(delivery["kind"], "delivered");
+    assert_eq!(delivery["delivery"]["thread_id"], "1712860000.100200");
+    let api_request = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("threaded reply");
+    assert_eq!(
+        api_request.request_line,
+        "POST /api/chat.postMessage HTTP/1.1"
+    );
+    assert_eq!(
+        api_request.authorization.as_deref(),
+        Some("Bearer xoxb-dedicated-test")
+    );
+    assert_eq!(api_request.body["channel"], "C123");
+    assert_eq!(api_request.body["thread_ts"], "1712860000.100200");
+    server.join().expect("Slack API server");
+}

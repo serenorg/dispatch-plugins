@@ -703,6 +703,14 @@ fn handle_ingress_event(
         ));
     }
 
+    if config.api_app_id.is_some()
+        && let Some(path) = config.webhook_path.as_deref()
+        && path.strip_prefix('/').unwrap_or(path)
+            != payload.path.strip_prefix('/').unwrap_or(&payload.path)
+    {
+        return Ok(ingress_rejection(404, "slack ingress path not found"));
+    }
+
     if let Some(reply) = validate_ingress_signature(config, payload)? {
         return Ok(IngressCycle::Events {
             events: Vec::new(),
@@ -2357,6 +2365,89 @@ mod tests {
                 serde_json::to_value(webhook).unwrap(),
                 serde_json::to_value(socket).unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn a_path_mismatch_is_refused_only_for_a_dedicated_app() {
+        let state = authenticated_ingress_state();
+        for configured_path in ["/webhooks/slack/apps/R1", "webhooks/slack/apps/R1"] {
+            for path in [
+                "/webhooks/slack/apps/R1",
+                "webhooks/slack/apps/R1",
+                "/webhooks/slack/apps/R2",
+                "",
+            ] {
+                for dedicated in [true, false] {
+                    let config = ChannelConfig {
+                        api_app_id: dedicated.then(|| "A123".to_string()),
+                        webhook_path: Some(configured_path.to_string()),
+                        ..dedicated_app_config()
+                    };
+                    let mut payload = base_payload(&app_mention_body().to_string());
+                    payload.path = path.to_string();
+                    let IngressCycle::Events {
+                        events,
+                        callback_reply,
+                        ..
+                    } = handle_ingress_event(&config, Some(&state), &payload)
+                        .expect("path response")
+                    else {
+                        panic!("expected webhook events");
+                    };
+                    if dedicated && !path.ends_with("/R1") {
+                        assert!(events.is_empty());
+                        assert_eq!(callback_reply.expect("path refusal").status, 404);
+                        // The path refusal precedes signature verification.
+                        payload.trust_verified = false;
+                        let IngressCycle::Events {
+                            events,
+                            callback_reply,
+                            ..
+                        } = handle_ingress_event(&config, None, &payload).unwrap()
+                        else {
+                            panic!("expected path refusal");
+                        };
+                        assert!(events.is_empty());
+                        assert_eq!(callback_reply.unwrap().status, 404);
+                    } else {
+                        assert_eq!(events.len(), 1);
+                        assert!(callback_reply.is_none());
+                    }
+                }
+            }
+        }
+        let mut payload = base_payload(&app_mention_body().to_string());
+        payload.path = "/host-routed-path".to_string();
+        let IngressCycle::Events {
+            events,
+            callback_reply,
+            ..
+        } = handle_ingress_event(&dedicated_app_config(), Some(&state), &payload).unwrap()
+        else {
+            panic!("expected event without a configured path");
+        };
+        assert_eq!(events.len(), 1);
+        assert!(callback_reply.is_none());
+    }
+
+    #[test]
+    fn mentions_without_channel_type_report_channel_and_direct_messages_report_dm() {
+        let state = authenticated_ingress_state();
+        for app_id in [None, Some("A123".to_string())] {
+            let config = ChannelConfig {
+                api_app_id: app_id,
+                dm_policy: SlackDirectMessagePolicy::Open,
+                ..dedicated_app_config()
+            };
+            let mut body = app_mention_body();
+            let mention = webhook_event(&config, Some(&state), &body).expect("mention event");
+            assert_eq!(mention.conversation.kind, "channel");
+            body["event"]["type"] = serde_json::json!("message");
+            body["event"]["channel"] = serde_json::json!("D123");
+            body["event"]["channel_type"] = serde_json::json!("im");
+            let dm = webhook_event(&config, Some(&state), &body).expect("direct message event");
+            assert_eq!(dm.conversation.kind, "dm");
         }
     }
 
