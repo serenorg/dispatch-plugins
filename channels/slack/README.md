@@ -67,6 +67,7 @@ Useful config fields:
 - `incoming_webhook_url` - inline incoming webhook URL when env vars are not desirable
 - `webhook_public_url` - public base URL used for Events API ingress
 - `webhook_path` - ingress route path, default `/slack/events`
+- `api_app_id` - optional dedicated Slack app ID; non-empty, upper-case ASCII letters and digits
 - `default_channel_id` - default target channel for bot-token delivery
 - `allowed_channel_ids` - explicit Slack conversation IDs permitted for outbound delivery; an empty list denies outbound mutations
 - `unrestricted_channel_access` - explicitly permits outbound delivery to any Slack conversation; it cannot be combined with `allowed_channel_ids`
@@ -109,6 +110,8 @@ Recommended event subscriptions:
 - `message.groups`
 - `message.im`
 - `message.mpim`
+- `app_uninstalled` - reported only when `api_app_id` is set
+- `tokens_revoked` - reported only when `api_app_id` is set and bot tokens were revoked
 
 Common scope sets:
 
@@ -175,6 +178,25 @@ export SLACK_BOT_TOKEN="xoxb-..."
 export SLACK_APP_TOKEN="xapp-..."
 export SLACK_SIGNING_SECRET="..."
 ```
+
+## Dedicated app
+
+Set `api_app_id` when a connection serves one dedicated Slack app. Events must name that exact app and an allowed team over both the webhook and Socket Mode. A missing or different app ID is acknowledged without emitting an event. With no `api_app_id`, the shared Seren app's behavior is unchanged.
+
+Give each connection its own app's `SLACK_SIGNING_SECRET` (or the env var named by `signing_secret_env`). Signature verification still precedes Slack's URL-verification challenge, which does not contain an app ID. When both `api_app_id` and `webhook_path` are configured, webhook requests on a different path receive 404 before signature verification. Paths with or without the leading `/` compare equally; Socket Mode does not use this path check.
+
+Any `webhook_path` works when the host routes it to this connection. Dispatch's own ingress router delivers only the manifest's `allowed_paths` (`/slack/events`); a host such as the connector gateway can route a per-app path instead.
+
+```toml
+api_app_id = "A123"
+allowed_team_ids = ["T123"]
+webhook_public_url = "https://example.com"
+webhook_path = "/webhooks/slack/apps/R1"
+```
+
+Subscribe dedicated apps to `app_uninstalled` and `tokens_revoked`. Matching notices carry `message.metadata.lifecycle_event`, `conversation.workspace_id`, and event `metadata.api_app_id`. They need no bot user ID or working bot token to map, have no activation, and add no reaction. User-only token revocations are ignored. Without `api_app_id`, both notice types remain ignored.
+
+Slack sends no `channel_type` with `app_mention`, so those events report `conversation.kind` as `channel`, including mentions in private channels. Direct messages (`message.im`) report `dm`.
 
 ## Dispatch usage
 

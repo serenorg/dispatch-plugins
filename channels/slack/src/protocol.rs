@@ -54,6 +54,8 @@ pub struct ChannelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_token_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_app_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_secret_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incoming_webhook_url_env: Option<String>,

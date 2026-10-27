@@ -58,6 +58,7 @@ const META_THREAD_TS: &str = "thread_ts";
 const META_DESTINATION_URL: &str = "destination_url";
 const META_ATTACHMENT_COUNT: &str = "attachment_count";
 const META_EVENT_TYPE: &str = "event_type";
+const META_LIFECYCLE_EVENT: &str = "lifecycle_event";
 const META_EVENT_SUBTYPE: &str = "event_subtype";
 const META_TRANSPORT: &str = "transport";
 const META_ENDPOINT_ID: &str = "endpoint_id";
@@ -239,6 +240,16 @@ fn slack_poll_ingress(
 fn configure(config: &ChannelConfig) -> Result<ConfiguredChannel> {
     validate_outbound_config(config)?;
     let mut metadata = BTreeMap::new();
+    if let Some(api_app_id) = &config.api_app_id {
+        if api_app_id.is_empty()
+            || !api_app_id
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        {
+            bail!("api_app_id must contain only upper-case ASCII letters and digits");
+        }
+        metadata.insert(META_API_APP_ID.to_string(), api_app_id.clone());
+    }
 
     if has_optional_env(bot_token_env(config)) {
         metadata.insert(
@@ -692,6 +703,14 @@ fn handle_ingress_event(
         ));
     }
 
+    if config.api_app_id.is_some()
+        && let Some(path) = config.webhook_path.as_deref()
+        && path.strip_prefix('/').unwrap_or(path)
+            != payload.path.strip_prefix('/').unwrap_or(&payload.path)
+    {
+        return Ok(ingress_rejection(404, "slack ingress path not found"));
+    }
+
     if let Some(reply) = validate_ingress_signature(config, payload)? {
         return Ok(IngressCycle::Events {
             events: Vec::new(),
@@ -726,7 +745,9 @@ fn handle_ingress_event(
             })
         }
         "event_callback" => {
-            if !team_is_allowed(config, envelope.team_id.as_deref()) {
+            if !team_is_allowed(config, envelope.team_id.as_deref())
+                || !app_is_allowed(config, envelope.api_app_id.as_deref())
+            {
                 return Ok(IngressCycle::Events {
                     events: Vec::new(),
                     callback_reply: None,
@@ -741,15 +762,21 @@ fn handle_ingress_event(
                 ));
             };
 
-            let Some(inbound_event) = build_inbound_event(
-                config,
-                state,
-                payload,
-                &envelope,
-                event,
-                TRANSPORT_EVENTS_WEBHOOK,
-            )?
-            else {
+            let inbound_event = if let Some(notice) =
+                build_lifecycle_event(config, state, &envelope, event, TRANSPORT_EVENTS_WEBHOOK)?
+            {
+                Some(notice)
+            } else {
+                build_inbound_event(
+                    config,
+                    state,
+                    payload,
+                    &envelope,
+                    event,
+                    TRANSPORT_EVENTS_WEBHOOK,
+                )?
+            };
+            let Some(inbound_event) = inbound_event else {
                 return Ok(IngressCycle::Events {
                     events: Vec::new(),
                     callback_reply: None,
@@ -984,6 +1011,15 @@ fn build_socket_mode_event(
             let Some(event) = envelope.event.as_ref() else {
                 return Ok(None);
             };
+            if let Some(notice) = build_lifecycle_event(
+                config,
+                ingress_state,
+                &envelope,
+                event,
+                TRANSPORT_SOCKET_MODE,
+            )? {
+                return Ok(Some(notice));
+            }
             build_inbound_event(
                 config,
                 ingress_state,
@@ -997,6 +1033,85 @@ fn build_socket_mode_event(
     }
 }
 
+fn build_lifecycle_event(
+    config: &ChannelConfig,
+    ingress_state: Option<&IngressState>,
+    envelope: &SlackEventEnvelope,
+    event: &SlackEventPayload,
+    transport: &str,
+) -> Result<Option<InboundEventEnvelope>> {
+    let Some(api_app_id) = config.api_app_id.as_ref() else {
+        return Ok(None);
+    };
+    if !app_is_allowed(config, envelope.api_app_id.as_deref())
+        || !team_is_allowed(config, envelope.team_id.as_deref())
+    {
+        return Ok(None);
+    }
+    match event.event_type.as_str() {
+        "app_uninstalled" => {}
+        "tokens_revoked"
+            if event
+                .tokens
+                .as_ref()
+                .is_some_and(|tokens| !tokens.bot.is_empty()) => {}
+        _ => return Ok(None),
+    }
+    let Some(team_id) = envelope.team_id.as_ref() else {
+        return Ok(None);
+    };
+    // Lifecycle notices have no message timestamp; use the provider's event time.
+    let Some(event_time) = envelope.event_time else {
+        return Ok(None);
+    };
+    let event_id = envelope
+        .event_id
+        .clone()
+        .unwrap_or_else(|| format!("slack:{api_app_id}:{}:{event_time}", event.event_type));
+    Ok(Some(InboundEventEnvelope {
+        event_id: event_id.clone(),
+        platform: PLATFORM_SLACK.to_string(),
+        event_type: event.event_type.clone(),
+        received_at: received_at(Some(event_time), "")?,
+        conversation: InboundConversationRef {
+            id: team_id.clone(),
+            kind: "workspace".to_string(),
+            workspace_id: Some(team_id.clone()),
+            thread_id: None,
+            parent_message_id: None,
+            parent_conversation_id: None,
+        },
+        actor: InboundActor {
+            id: api_app_id.clone(),
+            is_bot: true,
+            display_name: None,
+            username: None,
+            metadata: BTreeMap::new(),
+        },
+        message: InboundMessage {
+            id: event_id,
+            content: String::new(),
+            content_type: "text/plain".to_string(),
+            reply_to_message_id: None,
+            attachments: Vec::new(),
+            metadata: BTreeMap::from([(
+                META_LIFECYCLE_EVENT.to_string(),
+                event.event_type.clone(),
+            )]),
+        },
+        account_id: ingress_state
+            .and_then(|state| state.metadata.get(META_BOT_USER_ID))
+            .cloned(),
+        activation: None,
+        metadata: BTreeMap::from([
+            (META_TRANSPORT.to_string(), transport.to_string()),
+            (META_EVENT_TYPE.to_string(), event.event_type.clone()),
+            (META_TEAM_ID.to_string(), team_id.clone()),
+            (META_API_APP_ID.to_string(), api_app_id.clone()),
+        ]),
+    }))
+}
+
 fn build_inbound_event(
     config: &ChannelConfig,
     ingress_state: Option<&IngressState>,
@@ -1005,6 +1120,12 @@ fn build_inbound_event(
     event: &SlackEventPayload,
     transport: &str,
 ) -> Result<Option<InboundEventEnvelope>> {
+    // Another app or team is ignored before any fallible mapping can reject it.
+    if !team_is_allowed(config, envelope.team_id.as_deref())
+        || !app_is_allowed(config, envelope.api_app_id.as_deref())
+    {
+        return Ok(None);
+    }
     if !supports_inbound_event(event) {
         return Ok(None);
     }
@@ -1092,10 +1213,6 @@ fn build_inbound_event(
         .filter(|id| !id.trim().is_empty())
     {
         event_metadata.insert(META_CLIENT_MSG_ID.to_string(), client_msg_id.to_string());
-    }
-
-    if !team_is_allowed(config, envelope.team_id.as_deref()) {
-        return Ok(None);
     }
 
     let inbound_event = InboundEventEnvelope {
@@ -1381,6 +1498,13 @@ fn received_at(event_time: Option<i64>, message_ts: &str) -> Result<String> {
     Ok(Timestamp::from_second(timestamp)
         .context("slack event timestamp is out of range")?
         .to_string())
+}
+
+fn app_is_allowed(config: &ChannelConfig, api_app_id: Option<&str>) -> bool {
+    config
+        .api_app_id
+        .as_deref()
+        .is_none_or(|configured| api_app_id == Some(configured))
 }
 
 fn team_is_allowed(config: &ChannelConfig, team_id: Option<&str>) -> bool {
@@ -1823,6 +1947,15 @@ struct SlackEventPayload {
     client_msg_id: Option<String>,
     #[serde(default)]
     files: Vec<SlackFile>,
+    #[serde(default)]
+    tokens: Option<SlackRevokedTokens>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackRevokedTokens {
+    // Only bot revocations stop the bot; user-token (`oauth`) entries are not read.
+    #[serde(default)]
+    bot: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1885,6 +2018,494 @@ mod tests {
             status: "running".to_string(),
             endpoint: None,
             metadata: BTreeMap::from([(META_BOT_USER_ID.to_string(), "UBOT123".to_string())]),
+        }
+    }
+
+    fn dedicated_app_config() -> ChannelConfig {
+        ChannelConfig {
+            api_app_id: Some("A123".to_string()),
+            bot_token_env: Some("SLACK_UNSET_DEDICATED_APP_TEST_TOKEN".to_string()),
+            ..authorized_channel_config()
+        }
+    }
+
+    fn app_mention_body() -> serde_json::Value {
+        serde_json::json!({
+            "type": "event_callback",
+            "team_id": "T123",
+            "api_app_id": "A123",
+            "event_id": "EvAppMention",
+            "event_time": 1712860000,
+            "event": {
+                "type": "app_mention",
+                "channel": "C123",
+                "user": "U123",
+                "text": "hello from slack",
+                "ts": "1712860000.100200"
+            }
+        })
+    }
+
+    fn webhook_event(
+        config: &ChannelConfig,
+        state: Option<&IngressState>,
+        body: &serde_json::Value,
+    ) -> Option<InboundEventEnvelope> {
+        match handle_ingress_event(config, state, &base_payload(&body.to_string()))
+            .expect("handle webhook event")
+        {
+            IngressCycle::Events {
+                mut events,
+                callback_reply,
+                ..
+            } => {
+                assert!(callback_reply.is_none());
+                assert!(events.len() <= 1);
+                events.pop()
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn another_apps_event_is_dropped_on_webhook_and_socket_mode() {
+        let config = dedicated_app_config();
+        let state = authenticated_ingress_state();
+        let mut body = app_mention_body();
+        body["api_app_id"] = serde_json::json!("A456");
+        assert!(webhook_event(&config, Some(&state), &body).is_none());
+        assert!(
+            build_socket_mode_event(&config, Some(&state), &socket_mode_event_envelope(body))
+                .expect("map socket event")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_event_without_app_id_is_dropped_on_webhook_and_socket_mode() {
+        let config = dedicated_app_config();
+        let state = authenticated_ingress_state();
+        let mut body = app_mention_body();
+        body.as_object_mut().unwrap().remove("api_app_id");
+        assert!(webhook_event(&config, Some(&state), &body).is_none());
+        assert!(
+            build_socket_mode_event(&config, Some(&state), &socket_mode_event_envelope(body))
+                .expect("map socket event")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn identity_mismatches_are_ignored_before_an_invalid_event_time_is_mapped() {
+        let state = authenticated_ingress_state();
+        let dedicated = dedicated_app_config();
+        let shared = ChannelConfig {
+            api_app_id: None,
+            ..dedicated_app_config()
+        };
+        let mut matching = app_mention_body();
+        matching["event_time"] = serde_json::json!(i64::MAX);
+
+        // A matching event with an out-of-range time is still rejected.
+        for config in [&dedicated, &shared] {
+            assert!(
+                handle_ingress_event(config, Some(&state), &base_payload(&matching.to_string()))
+                    .is_err()
+            );
+            assert!(
+                build_socket_mode_event(
+                    config,
+                    Some(&state),
+                    &socket_mode_event_envelope(matching.clone())
+                )
+                .is_err()
+            );
+        }
+
+        let mismatches = [
+            (&dedicated, "api_app_id", serde_json::json!("A456")),
+            (&dedicated, "api_app_id", serde_json::Value::Null),
+            (&dedicated, "team_id", serde_json::json!("T456")),
+            (&dedicated, "team_id", serde_json::Value::Null),
+            (&shared, "team_id", serde_json::json!("T456")),
+            (&shared, "team_id", serde_json::Value::Null),
+        ];
+        for (config, field, value) in mismatches {
+            let mut body = matching.clone();
+            body[field] = value;
+            assert!(
+                webhook_event(config, Some(&state), &body).is_none(),
+                "webhook mapped {field} mismatch"
+            );
+            assert!(
+                build_socket_mode_event(config, Some(&state), &socket_mode_event_envelope(body))
+                    .expect("an identity mismatch is ignored")
+                    .is_none(),
+                "socket mode mapped {field} mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn the_configured_apps_event_keeps_the_existing_mapping() {
+        let config = dedicated_app_config();
+        let shared = ChannelConfig {
+            api_app_id: None,
+            ..config.clone()
+        };
+        let state = authenticated_ingress_state();
+        let body = app_mention_body();
+        let dedicated = webhook_event(&config, Some(&state), &body).expect("dedicated event");
+        let existing = webhook_event(&shared, Some(&state), &body).expect("shared event");
+        assert_eq!(
+            serde_json::to_value(&dedicated).unwrap(),
+            serde_json::to_value(&existing).unwrap()
+        );
+        let socket = socket_mode_event_envelope(body);
+        assert_eq!(
+            serde_json::to_value(build_socket_mode_event(&config, Some(&state), &socket).unwrap())
+                .unwrap(),
+            serde_json::to_value(build_socket_mode_event(&shared, Some(&state), &socket).unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_app_id_preserves_events_from_any_app() {
+        let config = ChannelConfig {
+            api_app_id: None,
+            ..dedicated_app_config()
+        };
+        let state = authenticated_ingress_state();
+        for app_id in [Some("A123"), Some("A456"), None] {
+            let mut body = app_mention_body();
+            body["api_app_id"] = serde_json::json!(app_id);
+            assert!(webhook_event(&config, Some(&state), &body).is_some());
+            assert!(
+                build_socket_mode_event(&config, Some(&state), &socket_mode_event_envelope(body))
+                    .expect("map socket event")
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn a_dedicated_app_returns_the_challenge_after_signature_verification() {
+        let config = ChannelConfig {
+            signing_secret_env: Some("SLACK_UNSET_DEDICATED_APP_TEST_SECRET".to_string()),
+            ..dedicated_app_config()
+        };
+        let mut payload =
+            base_payload(r#"{"type":"url_verification","challenge":"challenge-token"}"#);
+        for verified in [true, false] {
+            payload.trust_verified = verified;
+            match handle_ingress_event(&config, None, &payload).expect("challenge response") {
+                IngressCycle::Events {
+                    events,
+                    callback_reply,
+                    ..
+                } => {
+                    assert!(events.is_empty());
+                    let reply = callback_reply.expect("callback reply");
+                    assert_eq!(reply.status, if verified { 200 } else { 403 });
+                    if verified {
+                        assert_eq!(reply.body, "challenge-token");
+                    }
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn configure_rejects_malformed_app_ids_and_reports_the_configured_app() {
+        for app_id in [
+            "",
+            " ",
+            " A123",
+            "A123 ",
+            "A 123",
+            "A\t123",
+            "A\n123",
+            "A\0123",
+            "a123",
+            "A-123",
+            "\u{00c1}123",
+            "\u{ff21}123",
+        ] {
+            let config = ChannelConfig {
+                api_app_id: Some(app_id.to_string()),
+                ..dedicated_app_config()
+            };
+            assert!(
+                configure(&config).is_err(),
+                "accepted malformed app ID: {app_id:?}"
+            );
+        }
+        let configured = configure(&dedicated_app_config()).expect("valid app ID");
+        assert_eq!(
+            configured.metadata.get(META_API_APP_ID).map(String::as_str),
+            Some("A123")
+        );
+        let shared = configure(&ChannelConfig {
+            api_app_id: None,
+            ..dedicated_app_config()
+        })
+        .unwrap();
+        assert!(!shared.metadata.contains_key(META_API_APP_ID));
+    }
+
+    fn lifecycle_body(event_type: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "event_callback",
+            "team_id": "T123",
+            "api_app_id": "A123",
+            "event_id": "EvLifecycle",
+            "event_time": 1712860000,
+            "event": { "type": event_type }
+        })
+    }
+
+    #[test]
+    fn app_uninstalled_reports_workspace_lifecycle_without_a_bot_identity() {
+        let config = dedicated_app_config();
+        let mut body = lifecycle_body("app_uninstalled");
+        for _ in 0..2 {
+            let notice = webhook_event(&config, None, &body).expect("uninstall notice");
+            assert_eq!(notice.event_id, "EvLifecycle");
+            assert_eq!(notice.event_type, "app_uninstalled");
+            assert_eq!(notice.received_at, "2024-04-11T18:26:40Z");
+            assert_eq!(notice.conversation.id, "T123");
+            assert_eq!(notice.conversation.kind, "workspace");
+            assert_eq!(notice.conversation.workspace_id.as_deref(), Some("T123"));
+            assert!(notice.conversation.thread_id.is_none());
+            assert!(notice.conversation.parent_message_id.is_none());
+            assert_eq!(notice.actor.id, "A123");
+            assert!(notice.actor.is_bot);
+            assert_eq!(notice.message.id, "EvLifecycle");
+            assert!(notice.message.content.is_empty());
+            assert_eq!(notice.message.content_type, "text/plain");
+            assert!(notice.message.attachments.is_empty());
+            assert_eq!(
+                notice.message.metadata,
+                BTreeMap::from([(
+                    META_LIFECYCLE_EVENT.to_string(),
+                    "app_uninstalled".to_string()
+                )])
+            );
+            assert_eq!(
+                notice.metadata,
+                BTreeMap::from([
+                    (
+                        META_TRANSPORT.to_string(),
+                        TRANSPORT_EVENTS_WEBHOOK.to_string()
+                    ),
+                    (META_EVENT_TYPE.to_string(), "app_uninstalled".to_string()),
+                    (META_TEAM_ID.to_string(), "T123".to_string()),
+                    (META_API_APP_ID.to_string(), "A123".to_string()),
+                ])
+            );
+            assert!(notice.activation.is_none());
+            assert!(notice.account_id.is_none());
+        }
+        body.as_object_mut().unwrap().remove("event_id");
+        let state = authenticated_ingress_state();
+        let notice = webhook_event(&config, Some(&state), &body).expect("fallback identity");
+        assert_eq!(notice.event_id, "slack:A123:app_uninstalled:1712860000");
+        assert_eq!(notice.message.id, notice.event_id);
+        assert_eq!(notice.account_id.as_deref(), Some("UBOT123"));
+    }
+
+    #[test]
+    fn tokens_revoked_reports_bot_revocations_and_ignores_user_only_revocations() {
+        let config = dedicated_app_config();
+        let mut body = lifecycle_body("tokens_revoked");
+        for tokens in [
+            serde_json::json!({"bot": ["UBOT123"]}),
+            serde_json::json!({"bot": ["UBOT123"], "oauth": ["U123"]}),
+        ] {
+            body["event"]["tokens"] = tokens;
+            let notice = webhook_event(&config, None, &body).expect("revoked bot notice");
+            assert_eq!(notice.event_type, "tokens_revoked");
+            assert_eq!(
+                notice.message.metadata[META_LIFECYCLE_EVENT],
+                "tokens_revoked"
+            );
+            assert!(notice.account_id.is_none());
+            assert!(notice.activation.is_none());
+        }
+        for tokens in [
+            serde_json::json!({"oauth": ["U123"]}),
+            serde_json::json!({"oauth": ["U123"], "bot": []}),
+            serde_json::json!({}),
+            serde_json::Value::Null,
+        ] {
+            body["event"]["tokens"] = tokens;
+            assert!(webhook_event(&config, None, &body).is_none());
+        }
+    }
+
+    #[test]
+    fn lifecycle_notices_require_a_configured_matching_app_and_allowed_team() {
+        for event_type in ["app_uninstalled", "tokens_revoked"] {
+            let mut body = lifecycle_body(event_type);
+            body["event"]["tokens"] = serde_json::json!({"bot": ["UBOT123"]});
+            for config in [
+                ChannelConfig {
+                    api_app_id: None,
+                    ..dedicated_app_config()
+                },
+                ChannelConfig {
+                    api_app_id: Some("A456".into()),
+                    ..dedicated_app_config()
+                },
+                ChannelConfig {
+                    allowed_team_ids: vec!["T456".into()],
+                    ..dedicated_app_config()
+                },
+            ] {
+                assert!(webhook_event(&config, None, &body).is_none());
+                assert!(
+                    build_socket_mode_event(
+                        &config,
+                        None,
+                        &socket_mode_event_envelope(body.clone())
+                    )
+                    .expect("map lifecycle notice")
+                    .is_none()
+                );
+            }
+            body.as_object_mut().unwrap().remove("api_app_id");
+            assert!(webhook_event(&dedicated_app_config(), None, &body).is_none());
+            assert!(
+                build_socket_mode_event(
+                    &dedicated_app_config(),
+                    None,
+                    &socket_mode_event_envelope(body)
+                )
+                .expect("map lifecycle notice")
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn socket_mode_maps_lifecycle_notices_like_the_webhook_without_checking_its_path() {
+        let config = ChannelConfig {
+            webhook_path: Some("/webhooks/slack/apps/R1".to_string()),
+            ..dedicated_app_config()
+        };
+        for event_type in ["app_uninstalled", "tokens_revoked"] {
+            let mut body = lifecycle_body(event_type);
+            body["event"]["tokens"] = serde_json::json!({"bot": ["UBOT123"], "oauth": []});
+            let mut payload = base_payload(&body.to_string());
+            payload.path = config.webhook_path.clone().unwrap();
+            let IngressCycle::Events {
+                mut events,
+                callback_reply,
+                ..
+            } = handle_ingress_event(&config, None, &payload).expect("webhook notice")
+            else {
+                panic!("expected webhook events");
+            };
+            assert!(callback_reply.is_none());
+            assert_eq!(events.len(), 1);
+            let mut webhook = events.pop().unwrap();
+            let socket = build_socket_mode_event(&config, None, &socket_mode_event_envelope(body))
+                .expect("socket notice")
+                .expect("accepted notice");
+            assert_eq!(socket.metadata[META_TRANSPORT], TRANSPORT_SOCKET_MODE);
+            webhook.metadata.insert(
+                META_TRANSPORT.to_string(),
+                TRANSPORT_SOCKET_MODE.to_string(),
+            );
+            assert_eq!(
+                serde_json::to_value(webhook).unwrap(),
+                serde_json::to_value(socket).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_mismatch_is_refused_only_for_a_dedicated_app() {
+        let state = authenticated_ingress_state();
+        for configured_path in ["/webhooks/slack/apps/R1", "webhooks/slack/apps/R1"] {
+            for path in [
+                "/webhooks/slack/apps/R1",
+                "webhooks/slack/apps/R1",
+                "/webhooks/slack/apps/R2",
+                "",
+            ] {
+                for dedicated in [true, false] {
+                    let config = ChannelConfig {
+                        api_app_id: dedicated.then(|| "A123".to_string()),
+                        webhook_path: Some(configured_path.to_string()),
+                        ..dedicated_app_config()
+                    };
+                    let mut payload = base_payload(&app_mention_body().to_string());
+                    payload.path = path.to_string();
+                    let IngressCycle::Events {
+                        events,
+                        callback_reply,
+                        ..
+                    } = handle_ingress_event(&config, Some(&state), &payload)
+                        .expect("path response")
+                    else {
+                        panic!("expected webhook events");
+                    };
+                    if dedicated && !path.ends_with("/R1") {
+                        assert!(events.is_empty());
+                        assert_eq!(callback_reply.expect("path refusal").status, 404);
+                        // The path refusal precedes signature verification.
+                        payload.trust_verified = false;
+                        let IngressCycle::Events {
+                            events,
+                            callback_reply,
+                            ..
+                        } = handle_ingress_event(&config, None, &payload).unwrap()
+                        else {
+                            panic!("expected path refusal");
+                        };
+                        assert!(events.is_empty());
+                        assert_eq!(callback_reply.unwrap().status, 404);
+                    } else {
+                        assert_eq!(events.len(), 1);
+                        assert!(callback_reply.is_none());
+                    }
+                }
+            }
+        }
+        let mut payload = base_payload(&app_mention_body().to_string());
+        payload.path = "/host-routed-path".to_string();
+        let IngressCycle::Events {
+            events,
+            callback_reply,
+            ..
+        } = handle_ingress_event(&dedicated_app_config(), Some(&state), &payload).unwrap()
+        else {
+            panic!("expected event without a configured path");
+        };
+        assert_eq!(events.len(), 1);
+        assert!(callback_reply.is_none());
+    }
+
+    #[test]
+    fn mentions_without_channel_type_report_channel_and_direct_messages_report_dm() {
+        let state = authenticated_ingress_state();
+        for app_id in [None, Some("A123".to_string())] {
+            let config = ChannelConfig {
+                api_app_id: app_id,
+                dm_policy: SlackDirectMessagePolicy::Open,
+                ..dedicated_app_config()
+            };
+            let mut body = app_mention_body();
+            let mention = webhook_event(&config, Some(&state), &body).expect("mention event");
+            assert_eq!(mention.conversation.kind, "channel");
+            body["event"]["type"] = serde_json::json!("message");
+            body["event"]["channel"] = serde_json::json!("D123");
+            body["event"]["channel_type"] = serde_json::json!("im");
+            let dm = webhook_event(&config, Some(&state), &body).expect("direct message event");
+            assert_eq!(dm.conversation.kind, "dm");
         }
     }
 
