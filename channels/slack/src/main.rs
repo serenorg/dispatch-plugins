@@ -58,6 +58,7 @@ const META_THREAD_TS: &str = "thread_ts";
 const META_DESTINATION_URL: &str = "destination_url";
 const META_ATTACHMENT_COUNT: &str = "attachment_count";
 const META_EVENT_TYPE: &str = "event_type";
+const META_LIFECYCLE_EVENT: &str = "lifecycle_event";
 const META_EVENT_SUBTYPE: &str = "event_subtype";
 const META_TRANSPORT: &str = "transport";
 const META_ENDPOINT_ID: &str = "endpoint_id";
@@ -753,15 +754,21 @@ fn handle_ingress_event(
                 ));
             };
 
-            let Some(inbound_event) = build_inbound_event(
-                config,
-                state,
-                payload,
-                &envelope,
-                event,
-                TRANSPORT_EVENTS_WEBHOOK,
-            )?
-            else {
+            let inbound_event = if let Some(notice) =
+                build_lifecycle_event(config, state, &envelope, event, TRANSPORT_EVENTS_WEBHOOK)?
+            {
+                Some(notice)
+            } else {
+                build_inbound_event(
+                    config,
+                    state,
+                    payload,
+                    &envelope,
+                    event,
+                    TRANSPORT_EVENTS_WEBHOOK,
+                )?
+            };
+            let Some(inbound_event) = inbound_event else {
                 return Ok(IngressCycle::Events {
                     events: Vec::new(),
                     callback_reply: None,
@@ -996,6 +1003,15 @@ fn build_socket_mode_event(
             let Some(event) = envelope.event.as_ref() else {
                 return Ok(None);
             };
+            if let Some(notice) = build_lifecycle_event(
+                config,
+                ingress_state,
+                &envelope,
+                event,
+                TRANSPORT_SOCKET_MODE,
+            )? {
+                return Ok(Some(notice));
+            }
             build_inbound_event(
                 config,
                 ingress_state,
@@ -1007,6 +1023,85 @@ fn build_socket_mode_event(
         }
         _ => Ok(None),
     }
+}
+
+fn build_lifecycle_event(
+    config: &ChannelConfig,
+    ingress_state: Option<&IngressState>,
+    envelope: &SlackEventEnvelope,
+    event: &SlackEventPayload,
+    transport: &str,
+) -> Result<Option<InboundEventEnvelope>> {
+    let Some(api_app_id) = config.api_app_id.as_ref() else {
+        return Ok(None);
+    };
+    if !app_is_allowed(config, envelope.api_app_id.as_deref())
+        || !team_is_allowed(config, envelope.team_id.as_deref())
+    {
+        return Ok(None);
+    }
+    match event.event_type.as_str() {
+        "app_uninstalled" => {}
+        "tokens_revoked"
+            if event
+                .tokens
+                .as_ref()
+                .is_some_and(|tokens| !tokens.bot.is_empty()) => {}
+        _ => return Ok(None),
+    }
+    let Some(team_id) = envelope.team_id.as_ref() else {
+        return Ok(None);
+    };
+    // Lifecycle notices have no message timestamp; use the provider's event time.
+    let Some(event_time) = envelope.event_time else {
+        return Ok(None);
+    };
+    let event_id = envelope
+        .event_id
+        .clone()
+        .unwrap_or_else(|| format!("slack:{api_app_id}:{}:{event_time}", event.event_type));
+    Ok(Some(InboundEventEnvelope {
+        event_id: event_id.clone(),
+        platform: PLATFORM_SLACK.to_string(),
+        event_type: event.event_type.clone(),
+        received_at: received_at(Some(event_time), "")?,
+        conversation: InboundConversationRef {
+            id: team_id.clone(),
+            kind: "workspace".to_string(),
+            workspace_id: Some(team_id.clone()),
+            thread_id: None,
+            parent_message_id: None,
+            parent_conversation_id: None,
+        },
+        actor: InboundActor {
+            id: api_app_id.clone(),
+            is_bot: true,
+            display_name: None,
+            username: None,
+            metadata: BTreeMap::new(),
+        },
+        message: InboundMessage {
+            id: event_id,
+            content: String::new(),
+            content_type: "text/plain".to_string(),
+            reply_to_message_id: None,
+            attachments: Vec::new(),
+            metadata: BTreeMap::from([(
+                META_LIFECYCLE_EVENT.to_string(),
+                event.event_type.clone(),
+            )]),
+        },
+        account_id: ingress_state
+            .and_then(|state| state.metadata.get(META_BOT_USER_ID))
+            .cloned(),
+        activation: None,
+        metadata: BTreeMap::from([
+            (META_TRANSPORT.to_string(), transport.to_string()),
+            (META_EVENT_TYPE.to_string(), event.event_type.clone()),
+            (META_TEAM_ID.to_string(), team_id.clone()),
+            (META_API_APP_ID.to_string(), api_app_id.clone()),
+        ]),
+    }))
 }
 
 fn build_inbound_event(
@@ -1844,6 +1939,18 @@ struct SlackEventPayload {
     client_msg_id: Option<String>,
     #[serde(default)]
     files: Vec<SlackFile>,
+    #[serde(default)]
+    tokens: Option<SlackRevokedTokens>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackRevokedTokens {
+    // Parsed for Slack's payload shape; user-token revocations do not stop the bot.
+    #[allow(dead_code)]
+    #[serde(default)]
+    oauth: Vec<String>,
+    #[serde(default)]
+    bot: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2080,6 +2187,177 @@ mod tests {
         })
         .unwrap();
         assert!(!shared.metadata.contains_key(META_API_APP_ID));
+    }
+
+    fn lifecycle_body(event_type: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "event_callback",
+            "team_id": "T123",
+            "api_app_id": "A123",
+            "event_id": "EvLifecycle",
+            "event_time": 1712860000,
+            "event": { "type": event_type }
+        })
+    }
+
+    #[test]
+    fn app_uninstalled_reports_workspace_lifecycle_without_a_bot_identity() {
+        let config = dedicated_app_config();
+        let mut body = lifecycle_body("app_uninstalled");
+        for _ in 0..2 {
+            let notice = webhook_event(&config, None, &body).expect("uninstall notice");
+            assert_eq!(notice.event_id, "EvLifecycle");
+            assert_eq!(notice.event_type, "app_uninstalled");
+            assert_eq!(notice.received_at, "2024-04-11T18:26:40Z");
+            assert_eq!(notice.conversation.id, "T123");
+            assert_eq!(notice.conversation.kind, "workspace");
+            assert_eq!(notice.conversation.workspace_id.as_deref(), Some("T123"));
+            assert!(notice.conversation.thread_id.is_none());
+            assert!(notice.conversation.parent_message_id.is_none());
+            assert_eq!(notice.actor.id, "A123");
+            assert!(notice.actor.is_bot);
+            assert_eq!(notice.message.id, "EvLifecycle");
+            assert!(notice.message.content.is_empty());
+            assert_eq!(notice.message.content_type, "text/plain");
+            assert!(notice.message.attachments.is_empty());
+            assert_eq!(
+                notice.message.metadata,
+                BTreeMap::from([(
+                    META_LIFECYCLE_EVENT.to_string(),
+                    "app_uninstalled".to_string()
+                )])
+            );
+            assert_eq!(
+                notice.metadata,
+                BTreeMap::from([
+                    (
+                        META_TRANSPORT.to_string(),
+                        TRANSPORT_EVENTS_WEBHOOK.to_string()
+                    ),
+                    (META_EVENT_TYPE.to_string(), "app_uninstalled".to_string()),
+                    (META_TEAM_ID.to_string(), "T123".to_string()),
+                    (META_API_APP_ID.to_string(), "A123".to_string()),
+                ])
+            );
+            assert!(notice.activation.is_none());
+            assert!(notice.account_id.is_none());
+        }
+        body.as_object_mut().unwrap().remove("event_id");
+        let state = authenticated_ingress_state();
+        let notice = webhook_event(&config, Some(&state), &body).expect("fallback identity");
+        assert_eq!(notice.event_id, "slack:A123:app_uninstalled:1712860000");
+        assert_eq!(notice.message.id, notice.event_id);
+        assert_eq!(notice.account_id.as_deref(), Some("UBOT123"));
+    }
+
+    #[test]
+    fn tokens_revoked_reports_bot_revocations_and_ignores_user_only_revocations() {
+        let config = dedicated_app_config();
+        let mut body = lifecycle_body("tokens_revoked");
+        for tokens in [
+            serde_json::json!({"bot": ["UBOT123"]}),
+            serde_json::json!({"bot": ["UBOT123"], "oauth": ["U123"]}),
+        ] {
+            body["event"]["tokens"] = tokens;
+            let notice = webhook_event(&config, None, &body).expect("revoked bot notice");
+            assert_eq!(notice.event_type, "tokens_revoked");
+            assert_eq!(
+                notice.message.metadata[META_LIFECYCLE_EVENT],
+                "tokens_revoked"
+            );
+            assert!(notice.account_id.is_none());
+            assert!(notice.activation.is_none());
+        }
+        for tokens in [
+            serde_json::json!({"oauth": ["U123"]}),
+            serde_json::json!({"oauth": ["U123"], "bot": []}),
+            serde_json::json!({}),
+            serde_json::Value::Null,
+        ] {
+            body["event"]["tokens"] = tokens;
+            assert!(webhook_event(&config, None, &body).is_none());
+        }
+    }
+
+    #[test]
+    fn lifecycle_notices_require_a_configured_matching_app_and_allowed_team() {
+        for event_type in ["app_uninstalled", "tokens_revoked"] {
+            let mut body = lifecycle_body(event_type);
+            body["event"]["tokens"] = serde_json::json!({"bot": ["UBOT123"]});
+            for config in [
+                ChannelConfig {
+                    api_app_id: None,
+                    ..dedicated_app_config()
+                },
+                ChannelConfig {
+                    api_app_id: Some("A456".into()),
+                    ..dedicated_app_config()
+                },
+                ChannelConfig {
+                    allowed_team_ids: vec!["T456".into()],
+                    ..dedicated_app_config()
+                },
+            ] {
+                assert!(webhook_event(&config, None, &body).is_none());
+                assert!(
+                    build_socket_mode_event(
+                        &config,
+                        None,
+                        &socket_mode_event_envelope(body.clone())
+                    )
+                    .expect("map lifecycle notice")
+                    .is_none()
+                );
+            }
+            body.as_object_mut().unwrap().remove("api_app_id");
+            assert!(webhook_event(&dedicated_app_config(), None, &body).is_none());
+            assert!(
+                build_socket_mode_event(
+                    &dedicated_app_config(),
+                    None,
+                    &socket_mode_event_envelope(body)
+                )
+                .expect("map lifecycle notice")
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn socket_mode_maps_lifecycle_notices_like_the_webhook_without_checking_its_path() {
+        let config = ChannelConfig {
+            webhook_path: Some("/webhooks/slack/apps/R1".to_string()),
+            ..dedicated_app_config()
+        };
+        for event_type in ["app_uninstalled", "tokens_revoked"] {
+            let mut body = lifecycle_body(event_type);
+            body["event"]["tokens"] = serde_json::json!({"bot": ["UBOT123"], "oauth": []});
+            let mut payload = base_payload(&body.to_string());
+            payload.path = config.webhook_path.clone().unwrap();
+            let IngressCycle::Events {
+                mut events,
+                callback_reply,
+                ..
+            } = handle_ingress_event(&config, None, &payload).expect("webhook notice")
+            else {
+                panic!("expected webhook events");
+            };
+            assert!(callback_reply.is_none());
+            assert_eq!(events.len(), 1);
+            let mut webhook = events.pop().unwrap();
+            let socket = build_socket_mode_event(&config, None, &socket_mode_event_envelope(body))
+                .expect("socket notice")
+                .expect("accepted notice");
+            assert_eq!(socket.metadata[META_TRANSPORT], TRANSPORT_SOCKET_MODE);
+            webhook.metadata.insert(
+                META_TRANSPORT.to_string(),
+                TRANSPORT_SOCKET_MODE.to_string(),
+            );
+            assert_eq!(
+                serde_json::to_value(webhook).unwrap(),
+                serde_json::to_value(socket).unwrap()
+            );
+        }
     }
 
     #[test]

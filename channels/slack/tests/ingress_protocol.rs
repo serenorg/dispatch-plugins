@@ -1685,3 +1685,83 @@ fn supervised_socket_mode_static_configuration_remains_terminal() {
     }
     server.join().expect("Slack configuration server");
 }
+
+fn signed_dedicated_app_request(config: Value, state: Value, body: Value, secret: &str) -> Value {
+    use hmac::{Hmac, KeyInit, Mac};
+    let body = body.to_string();
+    let timestamp = jiff::Timestamp::now().as_second().to_string();
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(format!("v0:{timestamp}:{body}").as_bytes());
+    let signature = format!("v0={}", hex::encode(mac.finalize().into_bytes()));
+    json!({
+        "protocol_version": 2,
+        "request": {
+            "kind": "ingress_event",
+            "config": config,
+            "state": state,
+            "payload": {
+                "endpoint_id": "slack-app-test",
+                "method": "POST",
+                "path": "/webhooks/slack/apps/R1",
+                "headers": {"X-Slack-Request-Timestamp": timestamp, "X-Slack-Signature": signature},
+                "query": {},
+                "body": body,
+                "trust_verified": false
+            }
+        }
+    })
+}
+
+#[test]
+fn app_uninstalled_with_a_configured_bot_token_makes_no_slack_api_call() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind Slack API listener");
+    listener.set_nonblocking(true).unwrap();
+    let secret = "dedicated-app-signing-secret";
+    let (response, events) = run_ingress_with_env(
+        signed_dedicated_app_request(
+            json!({
+                "api_app_id": "A1",
+                "allowed_team_ids": ["T123"],
+                "unrestricted_channel_access": true,
+                "webhook_path": "/webhooks/slack/apps/R1"
+            }),
+            Value::Null,
+            json!({
+                "type": "event_callback",
+                "api_app_id": "A1",
+                "team_id": "T123",
+                "event_id": "EvUninstalled",
+                "event_time": 1712860000,
+                "event": {"type": "app_uninstalled"}
+            }),
+            secret,
+        ),
+        BTreeMap::from([
+            ("SLACK_SIGNING_SECRET".to_string(), secret.to_string()),
+            (
+                "SLACK_BOT_TOKEN".to_string(),
+                "xoxb-already-revoked".to_string(),
+            ),
+            (
+                "SLACK_API_BASE_URL".to_string(),
+                format!("http://{}/api", listener.local_addr().unwrap()),
+            ),
+        ]),
+    );
+    assert_eq!(response["kind"], "ingress_events_received");
+    assert!(response["callback_reply"].is_null());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["event_type"], "app_uninstalled");
+    assert_eq!(
+        events[0]["message"]["metadata"]["lifecycle_event"],
+        "app_uninstalled"
+    );
+    assert_eq!(events[0]["conversation"]["workspace_id"], "T123");
+    assert_eq!(events[0]["metadata"]["api_app_id"], "A1");
+    assert!(events[0]["account_id"].is_null());
+    assert!(events[0]["activation"].is_null());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
