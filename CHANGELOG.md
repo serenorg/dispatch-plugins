@@ -4,6 +4,10 @@ All notable changes to Dispatch Plugins are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Slack dedicated-app connections can configure `api_app_id` to refuse other apps' events over webhooks and Socket Mode, enforce their configured webhook path, and report app uninstall and bot-token revocation notices without a bot identity or reaction. Connections without `api_app_id`, including the shared Seren Slack app, keep their existing behavior.
+
 ## [0.8.0] - 2026-10-15
 
 ### Added
