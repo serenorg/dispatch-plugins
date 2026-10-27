@@ -763,7 +763,7 @@ fn handle_ingress_event(
             };
 
             let inbound_event = if let Some(notice) =
-                build_lifecycle_event(config, state, &envelope, event, TRANSPORT_EVENTS_WEBHOOK)?
+                build_lifecycle_event(config, &envelope, event, TRANSPORT_EVENTS_WEBHOOK)?
             {
                 Some(notice)
             } else {
@@ -1011,13 +1011,9 @@ fn build_socket_mode_event(
             let Some(event) = envelope.event.as_ref() else {
                 return Ok(None);
             };
-            if let Some(notice) = build_lifecycle_event(
-                config,
-                ingress_state,
-                &envelope,
-                event,
-                TRANSPORT_SOCKET_MODE,
-            )? {
+            if let Some(notice) =
+                build_lifecycle_event(config, &envelope, event, TRANSPORT_SOCKET_MODE)?
+            {
                 return Ok(Some(notice));
             }
             build_inbound_event(
@@ -1035,7 +1031,6 @@ fn build_socket_mode_event(
 
 fn build_lifecycle_event(
     config: &ChannelConfig,
-    ingress_state: Option<&IngressState>,
     envelope: &SlackEventEnvelope,
     event: &SlackEventPayload,
     transport: &str,
@@ -1099,9 +1094,8 @@ fn build_lifecycle_event(
                 event.event_type.clone(),
             )]),
         },
-        account_id: ingress_state
-            .and_then(|state| state.metadata.get(META_BOT_USER_ID))
-            .cloned(),
+        // Saved bot identity must not change lifecycle content across retries.
+        account_id: None,
         activation: None,
         metadata: BTreeMap::from([
             (META_TRANSPORT.to_string(), transport.to_string()),
@@ -2313,7 +2307,54 @@ mod tests {
         let notice = webhook_event(&config, Some(&state), &body).expect("fallback identity");
         assert_eq!(notice.event_id, "slack:A123:app_uninstalled:1712860000");
         assert_eq!(notice.message.id, notice.event_id);
-        assert_eq!(notice.account_id.as_deref(), Some("UBOT123"));
+        assert!(notice.account_id.is_none());
+    }
+
+    #[test]
+    fn lifecycle_content_is_independent_of_ingress_bot_identity() {
+        let config = dedicated_app_config();
+        let state = authenticated_ingress_state();
+        let mut another_bot = state.clone();
+        another_bot
+            .metadata
+            .insert(META_BOT_USER_ID.to_string(), "UOTHERBOT".to_string());
+        let mut no_bot = state.clone();
+        no_bot.metadata.remove(META_BOT_USER_ID);
+
+        for event_type in ["app_uninstalled", "tokens_revoked"] {
+            let mut body = lifecycle_body(event_type);
+            body["event"]["tokens"] = serde_json::json!({"bot": ["UBOT123"]});
+            let webhook = webhook_event(&config, None, &body).expect("webhook notice");
+            let socket_envelope = socket_mode_event_envelope(body.clone());
+            let socket = build_socket_mode_event(&config, None, &socket_envelope)
+                .expect("socket mapping")
+                .expect("socket notice");
+            let webhook_content =
+                dispatch_channel_protocol::canonical_channel_event_content_bytes(&webhook)
+                    .expect("canonical webhook content");
+            let socket_content =
+                dispatch_channel_protocol::canonical_channel_event_content_bytes(&socket)
+                    .expect("canonical socket content");
+
+            for ingress_state in [None, Some(&state), Some(&another_bot), Some(&no_bot)] {
+                let webhook = webhook_event(&config, ingress_state, &body).expect("webhook retry");
+                let socket = build_socket_mode_event(&config, ingress_state, &socket_envelope)
+                    .expect("socket retry mapping")
+                    .expect("socket retry");
+                assert!(webhook.account_id.is_none());
+                assert!(socket.account_id.is_none());
+                assert_eq!(
+                    dispatch_channel_protocol::canonical_channel_event_content_bytes(&webhook)
+                        .expect("canonical webhook retry"),
+                    webhook_content
+                );
+                assert_eq!(
+                    dispatch_channel_protocol::canonical_channel_event_content_bytes(&socket)
+                        .expect("canonical socket retry"),
+                    socket_content
+                );
+            }
+        }
     }
 
     #[test]

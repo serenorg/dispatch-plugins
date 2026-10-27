@@ -196,6 +196,10 @@ webhook_path = "/webhooks/slack/apps/R1"
 
 Subscribe dedicated apps to `app_uninstalled` and `tokens_revoked`. Matching notices carry `message.metadata.lifecycle_event`, `conversation.workspace_id`, and event `metadata.api_app_id`. They need no bot user ID or working bot token to map, have no activation, and add no reaction. User-only token revocations are ignored. Without `api_app_id`, both notice types remain ignored.
 
+Workspace lifecycle notices omit `account_id`. Their app and workspace identity comes from the notice itself, so a retried notice has the same content whatever bot identity the host has saved.
+
+Webhook hosts may submit signed `ingress_event` requests without a successful `start_ingress` call, including when startup's bot-identity lookup fails. Ordinary message mapping still requires a bot identity in ingress state. Socket Mode continues to use its supervised startup flow.
+
 Slack sends no `channel_type` with `app_mention`, so those events report `conversation.kind` as `channel`, including mentions in private channels. Direct messages (`message.im`) report `dm`.
 
 ## Dispatch usage
