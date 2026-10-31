@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use channel_slack::api_base_url;
 use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -10,7 +11,6 @@ use std::{
 };
 use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
 
-const DEFAULT_API_BASE: &str = "https://slack.com/api";
 const REACTION_TIMEOUT: Duration = Duration::from_secs(2);
 const MIN_SLACK_RETRY_AFTER: Duration = Duration::from_secs(1);
 const MAX_SLACK_RETRY_AFTER: Duration = Duration::from_secs(60);
@@ -161,7 +161,7 @@ impl SlackClient {
             .with_context(|| format!("{bot_token_env} is required for the slack channel"))?;
         Ok(Self {
             bot_token,
-            base_url: slack_api_base_url(),
+            base_url: api_base_url(),
         })
     }
 
@@ -520,7 +520,7 @@ impl SlackSocketModeClient {
             .with_context(|| format!("{app_token_env} is required for Slack Socket Mode"))?;
         Ok(Self {
             app_token,
-            base_url: slack_api_base_url(),
+            base_url: api_base_url(),
         })
     }
 
@@ -916,10 +916,6 @@ fn websocket_timeout_window(timeout_secs: u16) -> Duration {
 
 fn remaining_websocket_timeout(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
-}
-
-fn slack_api_base_url() -> String {
-    std::env::var("SLACK_API_BASE_URL").unwrap_or_else(|_| DEFAULT_API_BASE.to_string())
 }
 
 #[cfg(test)]
