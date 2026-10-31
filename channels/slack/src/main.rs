@@ -101,6 +101,12 @@ fn channel_target_denied(reason: impl Into<String>) -> anyhow::Error {
 }
 
 fn main() -> Result<()> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--apps")
+    {
+        return channel_slack::apps::run().map_err(|_| anyhow!("Slack app operation failed"));
+    }
     let stdout_lock = Arc::new(Mutex::new(()));
     let mut ingress_worker: Option<IngressWorker> = None;
 

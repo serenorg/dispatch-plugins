@@ -1,0 +1,80 @@
+[
+  {
+    "name": "verify",
+    "input": {
+      "command": {
+        "kind": "verify"
+      },
+      "credentials": null,
+      "configuration": null
+    },
+    "canonical_json": "{\"command\":{\"kind\":\"verify\"},\"configuration\":null,\"credentials\":null}",
+    "input_sha256": "882df063bd6b6c6e2c666a6c81575c465a7817fb9d5b9da13e87dbaa58f2f7f2"
+  },
+  {
+    "name": "manifest_unicode",
+    "input": {
+      "configuration": null,
+      "credentials": null,
+      "command": {
+        "events_url": null,
+        "callback_url": "https://core.example/callback?x=1&y=2",
+        "options": {
+          "private_channels": true,
+          "direct_messages": false
+        },
+        "identity": {
+          "description": "Café 🧭 / team",
+          "display_name": "employee",
+          "name": "Équipe",
+          "background_color": "#abc"
+        },
+        "kind": "manifest"
+      }
+    },
+    "canonical_json": "{\"command\":{\"callback_url\":\"https://core.example/callback?x=1&y=2\",\"events_url\":null,\"identity\":{\"background_color\":\"#abc\",\"description\":\"Café 🧭 / team\",\"display_name\":\"employee\",\"name\":\"Équipe\"},\"kind\":\"manifest\",\"options\":{\"direct_messages\":false,\"private_channels\":true}},\"configuration\":null,\"credentials\":null}",
+    "input_sha256": "89e5cbae1a2e6f870dff553deb1f971c7e698d7f45c7c60cfcab415680b343d3"
+  },
+  {
+    "name": "channel_order",
+    "input": {
+      "command": {
+        "kind": "inspect_channels",
+        "channels": [
+          "CSECOND",
+          "CFIRST"
+        ]
+      },
+      "configuration": null,
+      "credentials": null
+    },
+    "canonical_json": "{\"command\":{\"channels\":[\"CSECOND\",\"CFIRST\"],\"kind\":\"inspect_channels\"},\"configuration\":null,\"credentials\":null}",
+    "input_sha256": "07a83c1e6687e877c6b2bec1b8a885e10aff65635fa4b767f628cb56badf0903"
+  },
+  {
+    "name": "channel_order_reversed",
+    "input": {
+      "command": {
+        "kind": "inspect_channels",
+        "channels": [
+          "CFIRST",
+          "CSECOND"
+        ]
+      },
+      "configuration": null,
+      "credentials": null
+    },
+    "canonical_json": "{\"command\":{\"channels\":[\"CFIRST\",\"CSECOND\"],\"kind\":\"inspect_channels\"},\"configuration\":null,\"credentials\":null}",
+    "input_sha256": "147ff0c26ec51d45c5b3511e86930b5fec31ce0cf13c4a6e09e1704e05204de0"
+  },
+  {
+    "name": "omitted_optional_fields",
+    "input": {
+      "command": {
+        "kind": "verify"
+      }
+    },
+    "canonical_json": "{\"command\":{\"kind\":\"verify\"}}",
+    "input_sha256": "1157fc67f32dbe1e90d2b3a266934854b7f501767e3f2aa45fb034b271c9136d"
+  }
+]
