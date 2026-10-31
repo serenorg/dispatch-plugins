@@ -18,15 +18,20 @@ struct Plugin {
 
 impl Plugin {
     fn start(api: &str) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_channel-slack"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_channel-slack"));
+        command
             .arg("--apps")
             .env_clear()
             .env("SLACK_API_BASE_URL", api)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        command.env(
+            "SystemRoot",
+            std::env::var_os("SystemRoot").expect("Windows socket operations require SystemRoot"),
+        );
+        let mut child = command.spawn().unwrap();
         let input = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (sent, output) = mpsc::channel();
@@ -53,7 +58,15 @@ impl Plugin {
     }
 
     fn next(&self) -> Value {
-        self.output.recv_timeout(Duration::from_secs(5)).unwrap()
+        let frame = self.output.recv_timeout(Duration::from_secs(5)).unwrap();
+        eprintln!(
+            "adapter frame: id={} method={} checkpoint={} terminal={}",
+            frame["id"],
+            frame["method"],
+            frame["params"]["disposition"],
+            frame["result"]["disposition"]
+        );
+        frame
     }
 
     fn acknowledge(&mut self, request: &Value, control: &str) {
@@ -104,9 +117,28 @@ impl Drop for Plugin {
     }
 }
 
-fn provider(
-    replies: Vec<(&'static str, Value)>,
-) -> (String, Receiver<String>, thread::JoinHandle<()>) {
+struct ProviderTask(Option<thread::JoinHandle<()>>);
+
+impl ProviderTask {
+    fn join(mut self) -> thread::Result<()> {
+        self.0.take().unwrap().join()
+    }
+}
+
+impl Drop for ProviderTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            let outcome = if task.join().is_ok() {
+                "completed"
+            } else {
+                "failed"
+            };
+            eprintln!("local provider worker: {outcome}");
+        }
+    }
+}
+
+fn provider(replies: Vec<(&'static str, Value)>) -> (String, Receiver<String>, ProviderTask) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
     let (sent, requests) = mpsc::channel();
@@ -126,6 +158,7 @@ fn provider(
                     Err(e) => panic!("expected local provider request: {e}"),
                 }
             };
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
@@ -157,7 +190,7 @@ fn provider(
             write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
         }
     });
-    (address, requests, task)
+    (address, requests, ProviderTask(Some(task)))
 }
 
 fn request() -> Value {
