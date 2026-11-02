@@ -2977,7 +2977,8 @@ fn send_discord_session_heartbeat(
 
 fn close_discord_websocket_for_stop(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
     let close = CloseFrame {
-        code: CloseCode::Normal,
+        // Preserve the session so a replacement can resume missed gateway events.
+        code: CloseCode::Restart,
         reason: "stopping".into(),
     };
     let _ = socket.close(Some(close));
@@ -5795,6 +5796,118 @@ mod tests {
             None,
         );
         (socket, server)
+    }
+
+    #[test]
+    fn gateway_shutdown_resumes_a_message_received_while_disconnected() {
+        let config = scoped_config();
+        let policy = DiscordPolicy::from_config(&config).unwrap();
+        let identity = bot_identity();
+        let lookup = MapChannelLookup::channel(ALLOWED_CHANNEL, ALLOWED_GUILD);
+        let context = DiscordIngressContext {
+            config: &config,
+            policy: &policy,
+            identity: &identity,
+            lookup: &lookup,
+        };
+        let (mut socket, peer) = loopback_websocket();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut provider =
+            WebSocket::from_raw_socket(peer, tungstenite::protocol::Role::Server, None);
+        let mut session = DiscordGatewaySession::from_state(None);
+        let ready = json!({"op":0,"s":42,"t":"READY","d":{
+            "user":{"id":BOT_ACCOUNT_ID}, "session_id":"rollout-session",
+            "resume_gateway_url":"wss://resume.discord.gg"
+        }});
+        handle_discord_gateway_text(
+            &context,
+            &mut socket,
+            &ready.to_string(),
+            &mut session,
+            "token",
+        )
+        .unwrap();
+        let confirmed = session.to_state("running");
+        close_discord_websocket_for_stop(&mut socket);
+        let Message::Close(Some(close)) = provider.read().unwrap() else {
+            panic!("stop must close the gateway connection");
+        };
+        // Discord invalidates sessions closed with 1000 or 1001.
+        let session_valid = !matches!(close.code, CloseCode::Normal | CloseCode::Away);
+        drop(socket);
+        drop(provider);
+
+        // This event did not exist until both ends of the old connection closed.
+        let pending = json!({"op":0,"s":43,"t":"MESSAGE_CREATE","d":{
+            "id":"rollout-message", "channel_id":ALLOWED_CHANNEL,
+            "guild_id":ALLOWED_GUILD, "content":"message while disconnected",
+            "timestamp":"2026-11-02T22:00:00Z", "type":0,
+            "author":{"id":"member-1","username":"member"},
+            "mentions":[{"id":BOT_ACCOUNT_ID,"username":"dispatch","bot":true}]
+        }});
+        let mut resumed = DiscordGatewaySession::from_state(Some(&confirmed));
+        let (mut replacement, peer) = loopback_websocket();
+        configure_websocket_read_timeout(replacement.get_mut(), Duration::from_secs(2)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut provider =
+            WebSocket::from_raw_socket(peer, tungstenite::protocol::Role::Server, None);
+        provider
+            .send(Message::Text(
+                json!({"op":10,"d":{"heartbeat_interval":45000}})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
+        let hello = replacement.read().unwrap().into_text().unwrap();
+        handle_discord_gateway_text(
+            &context,
+            &mut replacement,
+            hello.as_str(),
+            &mut resumed,
+            "token",
+        )
+        .unwrap();
+        let resume: Value =
+            serde_json::from_str(provider.read().unwrap().into_text().unwrap().as_str()).unwrap();
+        assert_eq!(resume["op"], 6);
+        assert_eq!(resume["d"]["session_id"], "rollout-session");
+        assert_eq!(resume["d"]["seq"], 42);
+        let replay = if session_valid {
+            pending
+        } else {
+            json!({"op":9,"d":false})
+        };
+        provider
+            .send(Message::Text(replay.to_string().into()))
+            .unwrap();
+        let received = replacement.read().unwrap().into_text().unwrap();
+        let Some(DiscordGatewayAction::Event(event)) = handle_discord_gateway_text(
+            &context,
+            &mut replacement,
+            received.as_str(),
+            &mut resumed,
+            "token",
+        )
+        .unwrap() else {
+            panic!("a message received while disconnected must be replayed on resume");
+        };
+        assert_eq!(event.event_id, "rollout-message");
+        assert_eq!(event.message.content, "message while disconnected");
+        assert_eq!(event.conversation.id, ALLOWED_CHANNEL);
+        assert_eq!(event.account_id.as_deref(), Some(BOT_ACCOUNT_ID));
+        assert_eq!(resumed.last_sequence, Some(43));
+        let replayed = handle_discord_gateway_text(
+            &context,
+            &mut replacement,
+            received.as_str(),
+            &mut resumed,
+            "token",
+        )
+        .unwrap();
+        let Some(DiscordGatewayAction::Event(replayed)) = replayed else {
+            panic!("provider replay must preserve the event identity for host deduplication");
+        };
+        assert_eq!(replayed.event_id, event.event_id);
     }
 
     #[test]
