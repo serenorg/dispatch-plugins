@@ -35,17 +35,30 @@ impl Drop for OfflineProvider {
 }
 
 pub(super) fn offline() -> OfflineProvider {
+    offline_with_budget(Duration::from_millis(100))
+}
+
+/// A no-call provider whose budget still admits a consuming call, so host decisions are reached.
+pub(super) fn offline_with_budget(budget: Duration) -> OfflineProvider {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let provider = Provider::for_tests(
         &format!("http://{}", listener.local_addr().unwrap()),
-        Duration::from_millis(100),
+        budget,
     );
     OfflineProvider { provider, listener }
 }
 
 pub(super) fn script(
     responses: Vec<(&'static str, u16, Value)>,
+) -> (Provider, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+    script_with_budget(responses, Duration::from_secs(60))
+}
+
+/// Same owned loopback provider with an explicit cumulative provider budget.
+pub(super) fn script_with_budget(
+    responses: Vec<(&'static str, u16, Value)>,
+    budget: Duration,
 ) -> (Provider, mpsc::Receiver<String>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -103,7 +116,7 @@ pub(super) fn script(
         }
     });
     (
-        Provider::for_tests(&format!("http://{address}"), Duration::from_secs(60)),
+        Provider::for_tests(&format!("http://{address}"), budget),
         received,
         task,
     )

@@ -180,6 +180,8 @@ impl AppIcon {
     }
 }
 
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// One bounded provider attempt. Retry ownership belongs to the durable operation runner.
 pub struct Provider {
     agent: ureq::Agent,
@@ -284,7 +286,16 @@ impl Provider {
         if remaining.is_zero() {
             return Err(AppError::Unavailable {});
         }
-        Ok(remaining.min(Duration::from_secs(30)))
+        Ok(remaining.min(CALL_TIMEOUT))
+    }
+
+    /// Admits a consuming call only while the whole per-call window remains, because a
+    /// shortened call could only be recorded as an unknown outcome. Performs no I/O.
+    pub fn consuming_window(&self) -> AppResult<()> {
+        if self.deadline.saturating_duration_since(Instant::now()) < CALL_TIMEOUT {
+            return Err(AppError::Continue {});
+        }
+        Ok(())
     }
 
     pub fn validate_manifest(&self, token: &str, manifest: &Value) -> AppResult<()> {

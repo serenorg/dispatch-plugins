@@ -233,6 +233,37 @@ fn step(
     application: Option<&AppCredentials>,
     call: impl FnOnce() -> AppResult<Value>,
 ) -> AppResult<Value> {
+    dispatch_step(host, checkpoint, name, application, || Ok(()), call)
+}
+
+/// Consuming calls are dispatched only while the whole per-call provider window remains.
+fn provider_step(
+    provider: &Provider,
+    host: &mut impl OperationHost,
+    checkpoint: &mut Checkpoint,
+    name: Step,
+    application: Option<&AppCredentials>,
+    call: impl FnOnce() -> AppResult<Value>,
+) -> AppResult<Value> {
+    let ready = || {
+        if name.repeatable() {
+            Ok(())
+        } else {
+            provider.consuming_window()
+        }
+    };
+    dispatch_step(host, checkpoint, name, application, ready, call)
+}
+
+/// `ready` performs no provider I/O, so its refusal always means the call was not sent.
+fn dispatch_step(
+    host: &mut impl OperationHost,
+    checkpoint: &mut Checkpoint,
+    name: Step,
+    application: Option<&AppCredentials>,
+    ready: impl Fn() -> AppResult<()>,
+    call: impl FnOnce() -> AppResult<Value>,
+) -> AppResult<Value> {
     if let Some(credentials) = application {
         if !matches!(name, Step::Update | Step::UpdateWithRotatedToken) {
             return Err(AppError::invalid("application_progress"));
@@ -244,6 +275,8 @@ fn step(
         Some(StepState::InFlight { .. }) if !name.repeatable() => {
             return Err(AppError::RecoveryRequired {});
         }
+        // A saved definitive answer stays the answer, even on the final attempt.
+        Some(StepState::Failed { error, .. }) if !transient(error) => return Err(error.clone()),
         Some(StepState::InFlight { attempt } | StepState::Failed { attempt, .. }) => {
             attempt.saturating_add(1)
         }
@@ -252,16 +285,16 @@ fn step(
     if attempt > MAX_ATTEMPTS {
         return Err(AppError::RetryExhausted {});
     }
-    if let Some(StepState::Failed { error, .. }) = checkpoint.steps.get(&name)
-        && !transient(error)
-    {
-        return Err(error.clone());
-    }
+    ready()?;
     let mut next = checkpoint.clone();
     next.steps.insert(name, StepState::InFlight { attempt });
     next.last_failure = None;
     // A failed CAS acknowledgement must prevent the provider call.
     host.checkpoint(&next, &Disposition::Running {}, None, None)?;
+    // Acknowledgement latency may consume the window. The unsent intent is then dropped:
+    // the caller's retry write saves the pre-intent state, and if that write fails the
+    // acknowledged intent stays and fences the step.
+    ready()?;
     *checkpoint = next;
     match call() {
         Ok(receipt) => {
@@ -573,7 +606,7 @@ fn execute_inner(
                 return Err(AppError::invalid("code"));
             }
             let credentials = credentials(input)?;
-            let receipt = step(host, checkpoint, Step::Exchange, None, || {
+            let receipt = provider_step(provider, host, checkpoint, Step::Exchange, None, || {
                 provider.exchange_receipt(credentials, code, callback_url)
             })?;
             let grant = checked_grant(receipt)?;
@@ -664,7 +697,9 @@ fn execute_inner(
                 {
                     return Err(error);
                 }
-                Err(error) if definitive_refusal(&error) => {
+                // Any explicit non-transient refusal leaves the token for auth.revoke;
+                // an unknown or exhausted uninstall never authorizes that fallback.
+                Err(AppError::Provider { .. }) => {
                     let token = bot_token(credentials)?;
                     step(host, checkpoint, Step::Revoke, None, || {
                         removal(provider.revoke(token))
@@ -829,7 +864,7 @@ fn configured_step(
         };
     // A rejected expired token may be rotated once; its raw receipt is saved before reuse.
     if !checkpoint.steps.contains_key(&Step::Rotate) {
-        let result = step(host, checkpoint, original, application, || {
+        let result = provider_step(provider, host, checkpoint, original, application, || {
             call(&configuration.configuration_token)
         });
         match result {
@@ -838,9 +873,10 @@ fn configured_step(
                 if configuration_expired(&error) && configuration.refresh_token.is_some() =>
             {
                 let refresh = configuration.refresh_token.as_deref().unwrap();
-                let receipt = step(host, checkpoint, Step::Rotate, None, || {
-                    provider.rotate_receipt(refresh)
-                })?;
+                let receipt =
+                    provider_step(provider, host, checkpoint, Step::Rotate, None, || {
+                        provider.rotate_receipt(refresh)
+                    })?;
                 Provider::rotated_configuration(&receipt)
                     .map_err(|_| AppError::RecoveryRequired {})?;
             }
@@ -856,13 +892,13 @@ fn configured_step(
             .as_ref()
             .and_then(|c| c.refresh_token.as_deref())
             .ok_or_else(|| AppError::invalid("refresh_token"))?;
-        let receipt = step(host, checkpoint, Step::Rotate, None, || {
+        let receipt = provider_step(provider, host, checkpoint, Step::Rotate, None, || {
             provider.rotate_receipt(refresh)
         })?;
         Provider::rotated_configuration(&receipt).map_err(|_| AppError::RecoveryRequired {})?;
     }
     let configuration = current_configuration(input, checkpoint)?;
-    step(host, checkpoint, rotated, application, || {
+    provider_step(provider, host, checkpoint, rotated, application, || {
         call(&configuration.configuration_token)
     })
 }
@@ -961,6 +997,13 @@ mod tests {
         progress: Vec<LogicalProgress>,
         refuse_application_adoption: bool,
         completed: Option<OperationResult>,
+        delay_intent: Option<(Step, std::time::Duration)>,
+        stop_on_intent: Option<Step>,
+    }
+
+    fn new_intent(saved: &Checkpoint, written: &Checkpoint, name: Step) -> bool {
+        matches!(written.steps.get(&name), Some(StepState::InFlight { .. }))
+            && !matches!(saved.steps.get(&name), Some(StepState::InFlight { .. }))
     }
 
     impl OperationHost for Store {
@@ -975,6 +1018,15 @@ mod tests {
             if self.fail_at == Some(self.writes) {
                 return Err(AppError::StorageUnavailable {});
             }
+            if let Some((name, delay)) = self.delay_intent
+                && new_intent(&self.saved, checkpoint, name)
+            {
+                self.delay_intent = None;
+                std::thread::sleep(delay);
+            }
+            let stops_at_intent = self
+                .stop_on_intent
+                .is_some_and(|name| new_intent(&self.saved, checkpoint, name));
             if self.refuse_application_adoption
                 && matches!(progress, Some(LogicalProgress::Application { .. }))
             {
@@ -1010,6 +1062,10 @@ mod tests {
             }
             if stops {
                 self.stop_on_receipt = None;
+                return Err(AppError::Stopped {});
+            }
+            if stops_at_intent {
+                self.stop_on_intent = None;
                 return Err(AppError::Stopped {});
             }
             Ok(())
@@ -1891,6 +1947,307 @@ mod tests {
         assert!(store.saved.result.is_none());
         task.join().unwrap();
         assert_eq!(requests.try_iter().count(), 0);
+    }
+
+    #[test]
+    fn uninstall_revokes_after_any_explicit_refusal_including_after_restart() {
+        let input = AppInput {
+            credentials: Some(installed()),
+            configuration: None,
+            command: AppCommand::Uninstall {},
+        };
+        let (provider, requests, task) = super::super::test_support::script(vec![(
+            "apps.uninstall",
+            200,
+            json!({"ok":false,"error":"bad_client_secret"}),
+        )]);
+        let mut checkpoint = Checkpoint::default();
+        // The revocation intent write fails after the refusal is saved.
+        let mut store = Store {
+            fail_at: Some(3),
+            ..Store::default()
+        };
+        assert_eq!(
+            execute(&provider, &input, &mut checkpoint, &mut store),
+            Err(AppError::StorageUnavailable {})
+        );
+        task.join().unwrap();
+        assert_eq!(requests.try_iter().count(), 1);
+        assert!(!store.saved.steps.contains_key(&Step::Revoke));
+        let (provider, requests, task) =
+            super::super::test_support::script(vec![("auth.revoke", 200, json!({"ok":true}))]);
+        let mut restored =
+            serde_json::from_slice(&serde_json::to_vec(&store.saved).unwrap()).unwrap();
+        let result = execute(&provider, &input, &mut restored, &mut store).unwrap();
+        assert_eq!(result["kind"], "credentials_revoked");
+        task.join().unwrap();
+        let requests = requests.try_iter().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /auth.revoke HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn a_saved_definitive_answer_survives_the_final_attempt() {
+        let mut store = Store::default();
+        let mut checkpoint = Checkpoint::default();
+        for _ in 1..MAX_ATTEMPTS {
+            assert_eq!(
+                step(&mut store, &mut checkpoint, Step::Update, None, || Err(
+                    AppError::Unavailable {}
+                )),
+                Err(AppError::Unavailable {})
+            );
+        }
+        let expired = AppError::Provider {
+            code: "token_expired".into(),
+        };
+        assert_eq!(
+            step(&mut store, &mut checkpoint, Step::Update, None, || Err(
+                expired.clone()
+            )),
+            Err(expired.clone())
+        );
+        let mut restored =
+            serde_json::from_slice(&serde_json::to_vec(&store.saved).unwrap()).unwrap();
+        let calls = Cell::new(0);
+        assert_eq!(
+            step(&mut store, &mut restored, Step::Update, None, || {
+                calls.set(calls.get() + 1);
+                Ok(Value::Null)
+            }),
+            Err(expired)
+        );
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn consuming_calls_continue_in_a_fresh_window_instead_of_starting_short() {
+        let create = AppInput {
+            credentials: None,
+            configuration: Some(configuration()),
+            command: AppCommand::Apply {
+                identity: identity(),
+                options: AppOptions::default(),
+                callback_url: "https://core.example/callback".into(),
+                events_url: None,
+                icon: None,
+            },
+        };
+        let cases = [
+            (
+                create,
+                ("apps.manifest.validate", 200, json!({"ok":true})),
+                Step::Create,
+                vec![(
+                    "apps.manifest.create",
+                    200,
+                    json!({"ok":true,"app_id":"A1","credentials":{"client_id":"1.2","client_secret":"0123456789abcdef","signing_secret":"abcdef0123456789"}}),
+                )],
+                "application",
+            ),
+            (
+                events_input(),
+                (
+                    "apps.manifest.update",
+                    200,
+                    json!({"ok":false,"error":"token_expired"}),
+                ),
+                Step::Rotate,
+                vec![
+                    (
+                        "tooling.tokens.rotate",
+                        200,
+                        json!({"ok":true,"token":"xoxe-new-token","refresh_token":"xoxe-new-refresh"}),
+                    ),
+                    ("apps.manifest.update", 200, json!({"ok":true})),
+                ],
+                "events_configured",
+            ),
+        ];
+        for (input, first, consuming, resumed, kind) in cases {
+            // The first call fits; the consuming call would not keep its full window.
+            let (provider, requests, task) = super::super::test_support::script_with_budget(
+                vec![first],
+                std::time::Duration::from_secs(20),
+            );
+            let mut checkpoint = Checkpoint::default();
+            let mut store = Store::default();
+            assert_eq!(
+                execute(&provider, &input, &mut checkpoint, &mut store),
+                Err(AppError::Continue {})
+            );
+            assert_eq!(
+                store.dispositions.last(),
+                Some(&Disposition::Retry { after_seconds: 1 })
+            );
+            assert!(!store.saved.steps.contains_key(&consuming));
+            assert!(!store.saved.recovery_required);
+            task.join().unwrap();
+            assert_eq!(requests.try_iter().count(), 1);
+            let expected = resumed.iter().map(|(path, _, _)| *path).collect::<Vec<_>>();
+            let (provider, requests, task) = super::super::test_support::script(resumed);
+            let mut restored =
+                serde_json::from_slice(&serde_json::to_vec(&store.saved).unwrap()).unwrap();
+            let result = execute(&provider, &input, &mut restored, &mut store).unwrap();
+            assert_eq!(result["kind"], kind);
+            task.join().unwrap();
+            let requests = requests.try_iter().collect::<Vec<_>>();
+            assert_eq!(requests.len(), expected.len());
+            for (request, path) in requests.iter().zip(expected) {
+                assert!(request.starts_with(&format!("POST /{path} HTTP/1.1\r\n")));
+            }
+        }
+    }
+
+    fn new_apply_input() -> AppInput {
+        AppInput {
+            credentials: None,
+            configuration: Some(configuration()),
+            command: AppCommand::Apply {
+                identity: identity(),
+                options: AppOptions::default(),
+                callback_url: "https://core.example/callback".into(),
+                events_url: None,
+                icon: None,
+            },
+        }
+    }
+
+    #[test]
+    fn slow_intent_acknowledgement_drops_the_unsent_create_or_keeps_it_fenced() {
+        let created = (
+            "apps.manifest.create",
+            200,
+            json!({"ok":true,"app_id":"A1","credentials":{"client_id":"1.2","client_secret":"0123456789abcdef","signing_secret":"abcdef0123456789"}}),
+        );
+        for retry_write_fails in [false, true] {
+            // The window admits the intent; the acknowledgement then consumes the margin.
+            let (provider, requests, task) = super::super::test_support::script_with_budget(
+                vec![("apps.manifest.validate", 200, json!({"ok":true}))],
+                std::time::Duration::from_secs(31),
+            );
+            let mut checkpoint = Checkpoint::default();
+            let mut store = Store {
+                delay_intent: Some((Step::Create, std::time::Duration::from_millis(1500))),
+                // Writes: validate intent, validate receipt, create intent, retry.
+                fail_at: retry_write_fails.then_some(4),
+                ..Store::default()
+            };
+            let outcome = execute(&provider, &new_apply_input(), &mut checkpoint, &mut store);
+            task.join().unwrap();
+            assert_eq!(requests.try_iter().count(), 1);
+            assert!(store.delay_intent.is_none());
+            if retry_write_fails {
+                assert_eq!(outcome, Err(AppError::StorageUnavailable {}));
+                assert!(matches!(
+                    store.saved.steps.get(&Step::Create),
+                    Some(StepState::InFlight { .. })
+                ));
+                let writes = store.writes;
+                let mut restored =
+                    serde_json::from_slice(&serde_json::to_vec(&store.saved).unwrap()).unwrap();
+                assert_eq!(
+                    execute(
+                        &super::super::test_support::offline(),
+                        &new_apply_input(),
+                        &mut restored,
+                        &mut store
+                    ),
+                    Err(AppError::RecoveryRequired {})
+                );
+                assert_eq!(store.writes, writes);
+                continue;
+            }
+            assert_eq!(outcome, Err(AppError::Continue {}));
+            assert_eq!(
+                store.dispositions,
+                [
+                    Disposition::Running {},
+                    Disposition::Running {},
+                    Disposition::Running {},
+                    Disposition::Retry { after_seconds: 1 },
+                ]
+            );
+            assert!(!store.saved.steps.contains_key(&Step::Create));
+            assert!(!store.saved.recovery_required);
+            let (provider, requests, task) =
+                super::super::test_support::script(vec![created.clone()]);
+            let mut restored =
+                serde_json::from_slice(&serde_json::to_vec(&store.saved).unwrap()).unwrap();
+            let result = execute(&provider, &new_apply_input(), &mut restored, &mut store).unwrap();
+            assert_eq!(result["kind"], "application");
+            task.join().unwrap();
+            let requests = requests.try_iter().collect::<Vec<_>>();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("POST /apps.manifest.create HTTP/1.1\r\n"));
+        }
+    }
+
+    #[test]
+    fn host_stop_at_a_consuming_intent_sends_nothing_and_fences_the_step() {
+        let exchange = AppInput {
+            credentials: Some(installed()),
+            configuration: None,
+            command: AppCommand::Exchange {
+                code: "one-use-code".into(),
+                callback_url: "https://core.example/callback".into(),
+                options: AppOptions::default(),
+                expected_team_id: Some("T1".into()),
+            },
+        };
+        let mut checkpoint = Checkpoint::default();
+        let mut store = Store {
+            stop_on_intent: Some(Step::Exchange),
+            ..Store::default()
+        };
+        // The budget admits the call, so only the host's stop can prevent it.
+        let provider =
+            super::super::test_support::offline_with_budget(std::time::Duration::from_secs(60));
+        assert_eq!(
+            execute(&provider, &exchange, &mut checkpoint, &mut store),
+            Err(AppError::Stopped {})
+        );
+        drop(provider);
+        assert_eq!(store.dispositions, [Disposition::Running {}]);
+        assert!(matches!(
+            store.saved.steps.get(&Step::Exchange),
+            Some(StepState::InFlight { .. })
+        ));
+        let writes = store.writes;
+        let mut restored =
+            serde_json::from_slice(&serde_json::to_vec(&store.saved).unwrap()).unwrap();
+        assert_eq!(
+            execute(
+                &super::super::test_support::offline(),
+                &exchange,
+                &mut restored,
+                &mut store
+            ),
+            Err(AppError::RecoveryRequired {})
+        );
+        assert_eq!(store.writes, writes);
+
+        let (provider, requests, task) = super::super::test_support::script(vec![(
+            "apps.manifest.validate",
+            200,
+            json!({"ok":true}),
+        )]);
+        let mut checkpoint = Checkpoint::default();
+        let mut store = Store {
+            stop_on_intent: Some(Step::Create),
+            ..Store::default()
+        };
+        assert_eq!(
+            execute(&provider, &new_apply_input(), &mut checkpoint, &mut store),
+            Err(AppError::Stopped {})
+        );
+        task.join().unwrap();
+        assert_eq!(requests.try_iter().count(), 1);
+        assert_eq!(store.dispositions.last(), Some(&Disposition::Running {}));
+        assert!(matches!(
+            store.saved.steps.get(&Step::Create),
+            Some(StepState::InFlight { .. })
+        ));
     }
 
     #[test]
