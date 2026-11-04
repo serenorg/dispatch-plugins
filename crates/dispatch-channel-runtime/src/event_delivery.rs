@@ -206,6 +206,11 @@ fn replay_pending_locked(
     let recovery = locked(&sender.recovery, "recovery")?.take();
     let pending = read_pending(path)?;
     let accepted = reconcile_recovery(path, recovery.as_ref(), pending.as_ref())?;
+    // Reconciliation may have re-chained the pending original onto host recovery.
+    let pending = match pending {
+        Some(_) => read_pending(path)?,
+        None => None,
+    };
     let Some(request) = pending else {
         return Ok(None);
     };
@@ -342,6 +347,29 @@ fn reconcile_recovery(
                     || request.previous_acceptance.as_ref() == Some(&recovery.acceptance)
             }) =>
         {
+            true
+        }
+        // Heads further apart while a pending original continues from the
+        // local head: the host never accepted it, because another writer moved
+        // the host's record on. Chain the same batch, events in order, onto the
+        // host's acceptance. Some events may already have reached the host
+        // through that writer; re-sending them is harmless because the host
+        // matches receipts by event ID. The re-chained original is persisted
+        // before the host record is adopted, so a crash between the two leaves
+        // a pending original the arm above adopts on restart.
+        Some(current)
+            if pending.is_some_and(|request| {
+                request.previous_acceptance.as_ref() == Some(&current.acceptance)
+            }) =>
+        {
+            if let Some(request) = pending {
+                let rechained = ChannelEventRequest::new(
+                    request.batch.clone(),
+                    Some(recovery.acceptance.clone()),
+                )
+                .map_err(journal_error)?;
+                persist(path, &rechained)?;
+            }
             true
         }
         Some(_) => {
@@ -901,16 +929,164 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn event(id: String) -> Value {
+        serde_json::json!({
+            "event_id": id, "platform": "test", "event_type": "message",
+            "received_at": "2026-11-04T00:00:00Z",
+            "conversation": {"id": "conversation", "kind": "direct"},
+            "actor": {"id": "actor", "is_bot": false},
+            "message": {"id": id, "content": "", "content_type": "text/plain", "attachments": []}
+        })
+    }
+
+    fn event_batch(value: &str) -> ChannelEventBatch {
+        serde_json::from_value(serde_json::json!({
+            "events": [event(format!("{value}-1")), event(format!("{value}-2"))],
+            "state": {"mode": "polling", "status": "connected", "metadata": {"cursor": value}}
+        }))
+        .unwrap()
+    }
+
     #[test]
-    fn distant_host_recovery_refuses_a_pending_original_that_does_not_chain() {
+    fn distant_host_recovery_rechains_a_pending_original_from_the_local_head() {
         let root = directory();
         let path = root.join("unchained.journal");
         let stdout_lock = Arc::new(Mutex::new(()));
         let host = chain(&["1", "2", "3"]);
         let local = chain(&["a", "b"]);
         write_accepted(&path, &accepted_frame(&local[1])).unwrap();
+        let batch = event_batch("c");
         let pending =
-            ChannelEventRequest::new(cursor_batch("c"), Some(local[1].acceptance().unwrap()))
+            ChannelEventRequest::new(batch.clone(), Some(local[1].acceptance().unwrap())).unwrap();
+        persist(&path, &pending).unwrap();
+        let recovery = accepted_frame(&host[2]);
+        configure_event_storage(&stdout_lock, &storage(&path, Some(recovery))).unwrap();
+        let lock = Arc::clone(&stdout_lock);
+        let (result, sent) = with_host(&stdout_lock, move || replay_pending_event_batch(&lock), 2);
+        result.unwrap();
+        let rechained =
+            ChannelEventRequest::new(batch.clone(), Some(host[2].acceptance().unwrap())).unwrap();
+        assert_eq!(sent, vec![rechained.clone()], "sent once, chained to 3");
+        assert_eq!(
+            sent[0].batch.events, batch.events,
+            "same events, same order"
+        );
+        assert_eq!(read_accepted(&path).unwrap().unwrap().request, rechained);
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn distant_host_recovery_rechain_survives_a_crash_before_its_receipt() {
+        let root = directory();
+        let path = root.join("rechain-crash.journal");
+        let stdout_lock = Arc::new(Mutex::new(()));
+        let host = chain(&["1", "2", "3"]);
+        let local = chain(&["a", "b"]);
+        write_accepted(&path, &accepted_frame(&local[1])).unwrap();
+        let pending =
+            ChannelEventRequest::new(event_batch("c"), Some(local[1].acceptance().unwrap()))
+                .unwrap();
+        persist(&path, &pending).unwrap();
+        let recovery = accepted_frame(&host[2]);
+        configure_event_storage(&stdout_lock, &storage(&path, Some(recovery.clone()))).unwrap();
+        // The process stops before any receipt arrives.
+        assert!(replay_pending_event_batch_until(&stdout_lock, &|| true).is_err());
+        let rechained = read_pending(&path).unwrap().expect("re-chained original");
+        assert_eq!(
+            rechained.previous_acceptance,
+            Some(host[2].acceptance().unwrap())
+        );
+        assert_eq!(rechained.batch, pending.batch);
+        assert_eq!(read_accepted(&path).unwrap(), Some(recovery.clone()));
+        // A restart with the same host record re-sends the re-chained original once.
+        configure_event_storage(&stdout_lock, &storage(&path, Some(recovery))).unwrap();
+        let lock = Arc::clone(&stdout_lock);
+        let (result, sent) = with_host(&stdout_lock, move || replay_pending_event_batch(&lock), 2);
+        result.unwrap();
+        assert_eq!(sent, vec![rechained]);
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rechain_written_before_host_record_is_adopted_recovers_on_restart() {
+        let root = directory();
+        let path = root.join("rechain-torn.journal");
+        let stdout_lock = Arc::new(Mutex::new(()));
+        let host = chain(&["1", "2", "3"]);
+        let local = chain(&["a", "b"]);
+        // The re-chained original was persisted, but the host record was not yet adopted.
+        write_accepted(&path, &accepted_frame(&local[1])).unwrap();
+        let rechained =
+            ChannelEventRequest::new(event_batch("c"), Some(host[2].acceptance().unwrap()))
+                .unwrap();
+        persist(&path, &rechained).unwrap();
+        configure_event_storage(
+            &stdout_lock,
+            &storage(&path, Some(accepted_frame(&host[2]))),
+        )
+        .unwrap();
+        let lock = Arc::clone(&stdout_lock);
+        let (result, sent) = with_host(&stdout_lock, move || replay_pending_event_batch(&lock), 2);
+        result.unwrap();
+        assert_eq!(sent, vec![rechained.clone()]);
+        assert_eq!(read_accepted(&path).unwrap().unwrap().request, rechained);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restart_after_rechained_acceptance_clears_pending_without_resending() {
+        let root = directory();
+        let path = root.join("rechain-accepted.journal");
+        let stdout_lock = Arc::new(Mutex::new(()));
+        let host = chain(&["1", "2", "3"]);
+        // The host record was adopted and the re-chained original accepted, but
+        // the process stopped before recording that receipt locally.
+        write_accepted(&path, &accepted_frame(&host[2])).unwrap();
+        let rechained =
+            ChannelEventRequest::new(event_batch("c"), Some(host[2].acceptance().unwrap()))
+                .unwrap();
+        persist(&path, &rechained).unwrap();
+        let recovery = accepted_frame(&rechained);
+        configure_event_storage(&stdout_lock, &storage(&path, Some(recovery.clone()))).unwrap();
+        // Any emitted original would fail the receipt wait.
+        close_event_input(&stdout_lock);
+        replay_pending_event_batch(&stdout_lock).unwrap();
+        assert!(!path.exists());
+        assert_eq!(read_accepted(&path).unwrap(), Some(recovery));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn distant_host_recovery_of_the_pending_original_itself_clears_it() {
+        let root = directory();
+        let path = root.join("own.journal");
+        let stdout_lock = Arc::new(Mutex::new(()));
+        let host = chain(&["1", "2", "3"]);
+        let local = chain(&["a", "b"]);
+        write_accepted(&path, &accepted_frame(&local[1])).unwrap();
+        persist(&path, &host[2]).unwrap();
+        let recovery = accepted_frame(&host[2]);
+        configure_event_storage(&stdout_lock, &storage(&path, Some(recovery.clone()))).unwrap();
+        close_event_input(&stdout_lock);
+        replay_pending_event_batch(&stdout_lock).unwrap();
+        assert!(!path.exists());
+        assert_eq!(read_accepted(&path).unwrap(), Some(recovery));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn distant_host_recovery_refuses_a_pending_original_from_another_head() {
+        let root = directory();
+        let path = root.join("foreign.journal");
+        let stdout_lock = Arc::new(Mutex::new(()));
+        let host = chain(&["1", "2", "3"]);
+        let local = chain(&["a", "b"]);
+        write_accepted(&path, &accepted_frame(&local[1])).unwrap();
+        // Neither the local head nor the host record is this original's predecessor.
+        let pending =
+            ChannelEventRequest::new(event_batch("c"), Some(local[0].acceptance().unwrap()))
                 .unwrap();
         persist(&path, &pending).unwrap();
         configure_event_storage(
@@ -928,6 +1104,36 @@ mod tests {
         assert_eq!(
             read_accepted(&path).unwrap(),
             Some(accepted_frame(&local[1]))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn one_step_host_recovery_still_refuses_a_different_pending_original() {
+        let root = directory();
+        let path = root.join("one-step.journal");
+        let stdout_lock = Arc::new(Mutex::new(()));
+        let host = chain(&["1", "2"]);
+        write_accepted(&path, &accepted_frame(&host[0])).unwrap();
+        let pending =
+            ChannelEventRequest::new(event_batch("x"), Some(host[0].acceptance().unwrap()))
+                .unwrap();
+        persist(&path, &pending).unwrap();
+        configure_event_storage(
+            &stdout_lock,
+            &storage(&path, Some(accepted_frame(&host[1]))),
+        )
+        .unwrap();
+        let error = replay_pending_event_batch(&stdout_lock).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("host recovery conflicts with pending original")
+        );
+        assert_eq!(read_pending(&path).unwrap(), Some(pending));
+        assert_eq!(
+            read_accepted(&path).unwrap(),
+            Some(accepted_frame(&host[0]))
         );
         fs::remove_dir_all(root).unwrap();
     }
