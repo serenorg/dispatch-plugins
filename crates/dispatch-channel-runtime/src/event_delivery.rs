@@ -334,6 +334,16 @@ fn reconcile_recovery(
         {
             false
         }
+        // Heads further apart: the host's record is durable, and a local head
+        // with no unchained pending original holds no work it could lose.
+        Some(_)
+            if pending.is_none_or(|request| {
+                request == &recovery.request
+                    || request.previous_acceptance.as_ref() == Some(&recovery.acceptance)
+            }) =>
+        {
+            true
+        }
         Some(_) => {
             return Err(RuntimeError::Journal(
                 "host recovery conflicts with local accepted head".to_string(),
@@ -811,6 +821,113 @@ mod tests {
         assert_eq!(
             next[0].previous_acceptance,
             Some(third.acceptance().unwrap())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn chain(values: &[&str]) -> Vec<ChannelEventRequest> {
+        let mut requests: Vec<ChannelEventRequest> = Vec::new();
+        for value in values {
+            let previous = requests.last().map(|request| request.acceptance().unwrap());
+            requests.push(ChannelEventRequest::new(cursor_batch(value), previous).unwrap());
+        }
+        requests
+    }
+
+    #[test]
+    fn distant_host_recovery_with_nothing_pending_is_adopted() {
+        let root = directory();
+        let path = root.join("distant.journal");
+        let stdout_lock = Arc::new(Mutex::new(()));
+        let host = chain(&["1", "2", "3", "4"]);
+        let local = chain(&["a", "b"]);
+        write_accepted(&path, &accepted_frame(&local[1])).unwrap();
+        let recovery = accepted_frame(&host[3]);
+        configure_event_storage(&stdout_lock, &storage(&path, Some(recovery.clone()))).unwrap();
+        replay_pending_event_batch(&stdout_lock).unwrap();
+        assert_eq!(read_accepted(&path).unwrap(), Some(recovery));
+        let lock = Arc::clone(&stdout_lock);
+        let (result, next) = with_host(
+            &stdout_lock,
+            move || deliver_channel_event_batch(&lock, cursor_batch("5")),
+            1,
+        );
+        result.unwrap();
+        assert_eq!(
+            next[0].previous_acceptance,
+            Some(host[3].acceptance().unwrap())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn distant_host_recovery_behind_local_with_nothing_pending_is_adopted() {
+        let root = directory();
+        let path = root.join("behind.journal");
+        let stdout_lock = Arc::new(Mutex::new(()));
+        let requests = chain(&["1", "2", "3", "4"]);
+        write_accepted(&path, &accepted_frame(&requests[3])).unwrap();
+        let recovery = accepted_frame(&requests[1]);
+        configure_event_storage(&stdout_lock, &storage(&path, Some(recovery.clone()))).unwrap();
+        replay_pending_event_batch(&stdout_lock).unwrap();
+        assert_eq!(read_accepted(&path).unwrap(), Some(recovery));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn distant_host_recovery_replays_a_pending_original_chained_onto_it() {
+        let root = directory();
+        let path = root.join("chained.journal");
+        let stdout_lock = Arc::new(Mutex::new(()));
+        let host = chain(&["1", "2", "3"]);
+        let local = chain(&["a", "b"]);
+        write_accepted(&path, &accepted_frame(&local[1])).unwrap();
+        let pending =
+            ChannelEventRequest::new(cursor_batch("4"), Some(host[2].acceptance().unwrap()))
+                .unwrap();
+        persist(&path, &pending).unwrap();
+        configure_event_storage(
+            &stdout_lock,
+            &storage(&path, Some(accepted_frame(&host[2]))),
+        )
+        .unwrap();
+        let lock = Arc::clone(&stdout_lock);
+        let (result, replayed) =
+            with_host(&stdout_lock, move || replay_pending_event_batch(&lock), 1);
+        result.unwrap();
+        assert_eq!(replayed, vec![pending.clone()]);
+        assert_eq!(read_accepted(&path).unwrap().unwrap().request, pending);
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn distant_host_recovery_refuses_a_pending_original_that_does_not_chain() {
+        let root = directory();
+        let path = root.join("unchained.journal");
+        let stdout_lock = Arc::new(Mutex::new(()));
+        let host = chain(&["1", "2", "3"]);
+        let local = chain(&["a", "b"]);
+        write_accepted(&path, &accepted_frame(&local[1])).unwrap();
+        let pending =
+            ChannelEventRequest::new(cursor_batch("c"), Some(local[1].acceptance().unwrap()))
+                .unwrap();
+        persist(&path, &pending).unwrap();
+        configure_event_storage(
+            &stdout_lock,
+            &storage(&path, Some(accepted_frame(&host[2]))),
+        )
+        .unwrap();
+        let error = replay_pending_event_batch(&stdout_lock).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("host recovery conflicts with local accepted head")
+        );
+        assert_eq!(read_pending(&path).unwrap(), Some(pending));
+        assert_eq!(
+            read_accepted(&path).unwrap(),
+            Some(accepted_frame(&local[1]))
         );
         fs::remove_dir_all(root).unwrap();
     }
