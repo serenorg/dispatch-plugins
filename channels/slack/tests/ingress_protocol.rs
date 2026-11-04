@@ -527,6 +527,7 @@ fn open_test_socket(
     );
 }
 
+#[allow(clippy::result_large_err)]
 fn accept_test_socket(
     listener: &TcpListener,
     expected_path: &str,
